@@ -224,6 +224,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     findutils \
     ca-certificates \
     protobuf \
+    protobuf-libs \
     libnl3 \
     libnl3-cli \
     && dnf clean all
