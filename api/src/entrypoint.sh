@@ -177,9 +177,12 @@ if [ "$SANDBOX_USE_CGROUPV2" = "true" ]; then
     NSJAIL_CGROUP_ARGS=(--use_cgroupv2)
 fi
 
-NSJAIL="/sandbox-rootfs/lib64/ld-linux-x86-64.so.2 \
-  --library-path /usr/lib/x86_64-linux-gnu:/usr/lib \
-  /usr/sbin/nsjail"
+NSJAIL=(
+  /sandbox-rootfs/lib64/ld-linux-x86-64.so.2
+  --library-path
+  /sandbox-rootfs/lib/x86_64-linux-gnu:/sandbox-rootfs/usr/lib/x86_64-linux-gnu:/sandbox-rootfs/usr/lib
+  /sandbox-rootfs/usr/sbin/nsjail
+)
 
 echo "DEBUG: running NsJail command:"
 echo "$NSJAIL --config ${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}"
