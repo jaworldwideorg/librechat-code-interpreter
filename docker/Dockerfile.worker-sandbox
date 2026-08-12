@@ -225,6 +225,13 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     ca-certificates \
     && dnf clean all
 
+# Direct NsJail execution mode (KVM_ENABLED=false)
+# The worker invokes NsJail directly from the host container.
+COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
+COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+
+RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
+
 # Install Bun runtime (for the worker process on the host side)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
