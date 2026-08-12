@@ -181,12 +181,15 @@ NSJAIL="/sandbox-rootfs/lib64/ld-linux-x86-64.so.2 \
   --library-path /usr/lib/x86_64-linux-gnu:/usr/lib \
   /usr/sbin/nsjail"
 
+echo "DEBUG: running NsJail command:"
+echo "$NSJAIL --config ${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}"
+
 if timeout 10 $NSJAIL --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
     "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" \
     --user "65534:${SMOKE_OUTSIDE_UID}:1" --group "65534:${SMOKE_OUTSIDE_GID}:1" \
     -s /usr/bin:/bin -s /usr/lib:/lib -s /usr/lib64:/lib64 \
     -B "$SMOKE_DIR:/mnt/data" \
-    -- /bin/sh -c 'printf "%s\n" sandbox_ok > /mnt/data/smoke.txt && test "$(cat /mnt/data/smoke.txt)" = sandbox_ok' > /dev/null 2>&1; then
+    -- /bin/sh -c 'printf "%s\n" sandbox_ok > /mnt/data/smoke.txt && test "$(cat /mnt/data/smoke.txt)" = sandbox_ok'; then
     echo "NsJail smoke test passed"
 else
     echo "FATAL: NsJail smoke test failed — sandbox cannot start"
