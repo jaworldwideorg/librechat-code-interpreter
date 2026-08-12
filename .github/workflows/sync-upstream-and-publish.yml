@@ -96,7 +96,8 @@ jobs:
           - image: librechat/code-interpreter/worker-sandbox
             cache_scope: code-interpreter-worker-sandbox
             dockerfile: docker/Dockerfile.worker-sandbox
-            target: worker-sandbox-true
+            target: worker-sandbox-false
+
     steps:
       - uses: actions/checkout@v7.0.1
         with:
