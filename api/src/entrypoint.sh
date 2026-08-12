@@ -177,7 +177,11 @@ if [ "$SANDBOX_USE_CGROUPV2" = "true" ]; then
     NSJAIL_CGROUP_ARGS=(--use_cgroupv2)
 fi
 
-if timeout 10 /usr/sbin/nsjail --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
+NSJAIL="/sandbox-rootfs/lib64/ld-linux-x86-64.so.2 \
+  --library-path /usr/lib/x86_64-linux-gnu:/usr/lib \
+  /usr/sbin/nsjail"
+
+if timeout 10 $NSJAIL --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
     "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" \
     --user "65534:${SMOKE_OUTSIDE_UID}:1" --group "65534:${SMOKE_OUTSIDE_GID}:1" \
     -s /usr/bin:/bin -s /usr/lib:/lib -s /usr/lib64:/lib64 \
