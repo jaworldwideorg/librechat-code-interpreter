@@ -223,6 +223,9 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     gawk \
     findutils \
     ca-certificates \
+    protobuf \
+    libnl3 \
+    libnl3-cli \
     && dnf clean all
 
 # Direct NsJail execution mode (KVM_ENABLED=false)
