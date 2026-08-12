@@ -103,7 +103,6 @@ jobs:
           - image: librechat/code-interpreter/package-init
             cache_scope: code-interpreter-package-init
             dockerfile: docker/Dockerfile.package-init
-            target: production
 
     steps:
       - uses: actions/checkout@v7.0.1
