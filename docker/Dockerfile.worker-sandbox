@@ -1,26 +1,27 @@
-# Combined Worker-Sandbox Dockerfile (MicroVM)
-# Boots the sandbox server inside a libkrun microVM with its own kernel,
-# alongside the worker process managed by supervisor.sh.
-# Only requires /dev/kvm on the host — no privileged mode, no capabilities.
+# Combined Worker-Sandbox Dockerfile
 #
-# Architecture within this container:
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │  Worker-Sandbox Container (Fedora 43, libkrun)                          │
-# │                                                                         │
-# │  ┌─────────────────┐        ┌──────────────────────────────────────────┐│
-# │  │  Worker Process │ ──────▶│  libkrun MicroVM (own kernel)            ││
-# │  │  (job processor)│ :2000  │  └─ NsJail Sandbox (code execution)     ││
-# │  │  Port 3113      │        │                                          ││
-# │  │  (health)       │        │                                          ││
-# │  └─────────────────┘        └──────────────────────────────────────────┘│
-# └──────────────────────────────────────────────────────────────────────────┘
+# Supports:
 #
-# Scale this as a unit - PYTHON_CONCURRENCY = sandbox capacity
+#   KVM_ENABLED=true
+#     Fedora worker
+#       -> libkrun MicroVM
+#         -> Debian sandbox rootfs
+#           -> NsJail
+#
+#   KVM_ENABLED=false
+#     Fedora worker
+#       -> direct sandbox process
+#         -> Fedora-built NsJail
+#         -> Debian sandbox rootfs
+#
+# The direct path needs a Fedora-built NsJail because the outer worker
+# container is Fedora 43. The MicroVM/rootfs path keeps a Debian-built
+# NsJail because the sandbox root filesystem is Debian Bookworm.
 
 # ============================================================================
-# Stage 1: Build NsJail from source
+# Stage 1a: Build NsJail for the Debian sandbox rootfs
 # ============================================================================
-FROM buildpack-deps:bookworm AS nsjail-builder
+FROM buildpack-deps:bookworm AS nsjail-builder-debian
 
 WORKDIR /nsjail
 
@@ -42,15 +43,48 @@ RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
 RUN make -j$(nproc)
 
 COPY api/src/spec-guard.c /tmp/spec-guard.c
-RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
+RUN gcc -O2 -static \
+    -o /usr/local/bin/spec-guard \
+    /tmp/spec-guard.c \
     && chmod 0111 /usr/local/bin/spec-guard
 
+
 # ============================================================================
-# Stage 1b: Build language runtime packages for the baked KVM root disk
+# Stage 1b: Build NsJail for the Fedora outer worker
 #
-# Mirrors docker/Dockerfile.package-init, but populates /pkgs at image-build
-# time so the combined worker can boot without a long-lived /host-packages
-# virtio-fs mount.
+# Required for KVM_ENABLED=false/direct mode.
+# Building it on Fedora avoids Debian/Fedora protobuf ABI mismatches.
+# ============================================================================
+FROM fedora:43 AS nsjail-builder-fedora
+
+WORKDIR /nsjail
+
+RUN dnf install -y \
+    git \
+    gcc \
+    gcc-c++ \
+    make \
+    bison \
+    flex \
+    protobuf-devel \
+    protobuf-compiler \
+    libnl3-devel \
+    pkgconf-pkg-config \
+    && dnf clean all
+
+RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
+    && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
+    && git submodule update --init --recursive
+
+RUN make -j$(nproc)
+
+# Fail the build immediately if the Fedora-built NsJail has unresolved deps.
+RUN ldd /nsjail/nsjail \
+    && ! ldd /nsjail/nsjail | grep -q "not found"
+
+
+# ============================================================================
+# Stage 1c: Build language runtime packages for the baked KVM root disk
 # ============================================================================
 FROM buildpack-deps:bookworm AS package-builder
 
@@ -62,45 +96,81 @@ COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
 
 RUN apt-install \
-    curl unzip wget ca-certificates \
-    build-essential libssl-dev libffi-dev libsqlite3-dev \
-    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
-    tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
-    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+    curl \
+    unzip \
+    wget \
+    ca-certificates \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    libsqlite3-dev \
+    zlib1g-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libncurses5-dev \
+    tk-dev \
+    xz-utils \
+    libcurl4-openssl-dev \
+    libfontconfig1-dev \
+    libudunits2-dev \
+    libpng-dev \
+    libxml2-dev \
+    libcairo2-dev \
     libfreetype6-dev
 
 RUN mkdir -p /pkgs
 
 COPY docker/package-init.sh /package-init.sh
 COPY javascript-packages.txt /javascript-packages.txt
-RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
+
+RUN chmod +x /package-init.sh \
+    && FORCE_REBUILD=true /package-init.sh
+
 
 # ============================================================================
 # Stage 2: Build worker
 # ============================================================================
 FROM oven/bun:1.3.14 AS worker-builder
+
 WORKDIR /app
+
 COPY service/package.json service/bun.lock ./
 RUN bun install --frozen-lockfile
+
 COPY service/src ./src
 COPY shared /shared
 COPY service/tsconfig.json ./
-RUN bun build ./src/worker-server.ts --minify --outdir .build --target bun --external '@opentelemetry/*'
+
+RUN bun build ./src/worker-server.ts \
+    --minify \
+    --outdir .build \
+    --target bun \
+    --external '@opentelemetry/*'
+
 
 # ============================================================================
 # Stage 3: Build sandbox API
 # ============================================================================
 FROM oven/bun:1.3.14 AS sandbox-builder
+
 WORKDIR /app
+
 COPY api/package.json ./
 RUN bun install --frozen-lockfile
+
 COPY api/src ./src
 COPY shared /shared
 COPY api/tsconfig.json ./
-RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*'
+
+RUN bun build ./src/index.ts \
+    --minify \
+    --outdir .build \
+    --target bun \
+    --external '@opentelemetry/*'
+
 
 # ============================================================================
-# Stage 4: Build sandbox rootfs (full OS layer for the microVM guest)
+# Stage 4: Build Debian sandbox rootfs
 # ============================================================================
 FROM oven/bun:1.3.14-debian AS sandbox-rootfs
 
@@ -129,87 +199,112 @@ RUN apt-install \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
 
-# Restore the standard Debian `awk` -> `mawk` symlink. See api/Dockerfile
-# for the full rationale; in short, mawk's binary ships in slim base
-# images (Priority: required) but its postinst's update-alternatives
-# step is skipped, so bare `awk` doesn't resolve. Identical security
-# surface to sed/tr/coreutils.
+# Restore standard Debian awk -> mawk symlink.
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
 
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
+    && locale-gen
 
-COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
-COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+# IMPORTANT:
+# This rootfs is Debian, therefore use the Debian-built NsJail.
+COPY --from=nsjail-builder-debian /nsjail/nsjail /usr/sbin/nsjail
+COPY --from=nsjail-builder-debian /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+
 RUN chmod +x /usr/sbin/nsjail
 
 WORKDIR /sandbox_api
 
 COPY api/package.json ./
 RUN bun install --frozen-lockfile --production
+
 COPY --from=sandbox-builder /app/.build ./.build
 COPY api/config ./config
 COPY api/src/entrypoint.sh ./entrypoint.sh
+
 RUN chmod +x ./entrypoint.sh
 
 RUN mkdir -p /pkgs /tmp/sandbox
 
+# Strip setuid/setgid bits.
 RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
-RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
-         /usr/bin/perl* /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
-         /usr/local/bin/apt-install \
-         /usr/sbin/adduser /usr/sbin/useradd /usr/sbin/usermod \
-         /usr/sbin/groupadd /usr/sbin/groupmod \
-         /usr/bin/su \
-         /usr/bin/chfn /usr/bin/chsh /usr/bin/gpasswd /usr/bin/newgrp \
-         /usr/bin/passwd /usr/bin/sg \
-         /usr/bin/chage /usr/bin/expiry /usr/sbin/unix_chkpwd \
+
+# Remove tools that should not be available from inside the sandbox rootfs.
+RUN rm -f \
+    /usr/bin/nsenter \
+    /usr/bin/unshare \
+    /usr/bin/chroot \
+    /usr/sbin/chroot \
+    /usr/bin/perl* \
+    /usr/bin/apt \
+    /usr/bin/apt-get \
+    /usr/bin/dpkg \
+    /usr/local/bin/apt-install \
+    /usr/sbin/adduser \
+    /usr/sbin/useradd \
+    /usr/sbin/usermod \
+    /usr/sbin/groupadd \
+    /usr/sbin/groupmod \
+    /usr/bin/su \
+    /usr/bin/chfn \
+    /usr/bin/chsh \
+    /usr/bin/gpasswd \
+    /usr/bin/newgrp \
+    /usr/bin/passwd \
+    /usr/bin/sg \
+    /usr/bin/chage \
+    /usr/bin/expiry \
+    /usr/sbin/unix_chkpwd \
     2>/dev/null || true
 
+
 # ============================================================================
-# Stage 5: Build the Rust launcher binary (Fedora for libkrun ABI)
+# Stage 5: Build Rust launcher binary
 # ============================================================================
 FROM fedora:43 AS launcher-builder
 
 RUN dnf install -y \
-    rust cargo \
+    rust \
+    cargo \
     libkrun-devel \
     gcc \
     && dnf clean all
 
 WORKDIR /launcher
+
 COPY launcher/Cargo.toml launcher/build.rs ./
 COPY launcher/src/ ./src/
 
 RUN cargo build --release
 
+
 # ============================================================================
-# Stage 5b: Build the read-only ext4 guest root disk
+# Stage 5b: Build read-only ext4 guest root disk
 # ============================================================================
 FROM debian:bookworm AS worker-sandbox-rootfs-image
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    e2fsprogs \
-    coreutils \
-    gawk \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        e2fsprogs \
+        coreutils \
+        gawk \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=sandbox-rootfs / /sandbox-rootfs/
 COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
 COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
 
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN sed -i \
+    '/^cgroup_mem_swap_max/d' \
+    /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+
 RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
-    && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
+    && /usr/local/bin/build-rootfs-image.sh \
+        /sandbox-rootfs \
+        /sandbox-rootfs.img
+
 
 # ============================================================================
-# Stage 6: Shared combined worker host (Fedora for libkrun runtime)
-#
-# Final targets:
-#   - worker-sandbox-baked: KVM default; packages live in a read-only ext4
-#                           block root, so no package virtio-fs mount is needed
-#   - worker-sandbox-legacy: directory root plus /host-packages for legacy KVM
-#                            deployments and KVM_ENABLED=false direct mode
-#   - worker-sandbox-{true,false}: Compose aliases selected by KVM_ENABLED
+# Stage 6: Shared worker host
 # ============================================================================
 FROM fedora:43 AS worker-sandbox-base
 
@@ -224,64 +319,105 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     findutils \
     ca-certificates \
     protobuf \
-    protobuf-libs \
     libnl3 \
-    libnl3-cli \
     && dnf clean all
 
-# Direct NsJail execution mode (KVM_ENABLED=false)
-# The worker invokes NsJail directly from the host container.
-COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
-COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+# --------------------------------------------------------------------------
+# Direct NsJail execution support
+#
+# IMPORTANT:
+# This outer container is Fedora, therefore this must be the Fedora-built
+# NsJail binary, NOT the Debian-built binary used inside sandbox-rootfs.
+# --------------------------------------------------------------------------
+COPY --from=nsjail-builder-fedora /nsjail/nsjail /usr/sbin/nsjail
 
-RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
+# spec-guard is statically linked, so the Debian-built copy is safe here.
+COPY --from=nsjail-builder-debian /usr/local/bin/spec-guard /usr/local/bin/spec-guard
 
-# Install Bun runtime (for the worker process on the host side)
+RUN chmod +x \
+    /usr/sbin/nsjail \
+    /usr/local/bin/spec-guard
+
+# Fail image creation rather than discovering a broken dynamic link at runtime.
+RUN echo "Checking Fedora NsJail runtime dependencies..." \
+    && ldd /usr/sbin/nsjail \
+    && ! ldd /usr/sbin/nsjail | grep -q "not found"
+
+# Install Bun for the worker process.
 RUN curl -fsSL https://bun.sh/install | bash
+
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# --- Launcher (runs on host, boots microVM) ---
-COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
+# --- Launcher ---
+COPY --from=launcher-builder \
+    /launcher/target/release/sandbox-launcher \
+    /usr/local/bin/launcher
 
-# --- Launcher entrypoint (DNS resolution + socat relay before VM boot) ---
+# --- Launcher/direct-mode entrypoints ---
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
-RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh
+
+RUN chmod +x \
+    /usr/local/bin/launcher-entrypoint.sh \
+    /usr/local/bin/start-direct-sandbox.sh
 
 # --- Worker ---
 WORKDIR /worker
+
 COPY service/package.json service/bun.lock ./
 RUN bun install --frozen-lockfile --production
+
 COPY --from=worker-builder /app/.build ./.build
 COPY --from=worker-builder /app/src ./src
-COPY --from=worker-builder /app/src/matplotlib.py /app/src/matplotlib-async.py ./
+COPY --from=worker-builder \
+    /app/src/matplotlib.py \
+    /app/src/matplotlib-async.py \
+    ./
 
 # --- Supervisor ---
 COPY docker/supervisor.sh /supervisor.sh
 RUN chmod +x /supervisor.sh
 
 WORKDIR /
+
 EXPOSE 2000 3113
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:3113/health || exit 1
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=5s \
+    --start-period=30s \
+    --retries=3 \
+    CMD curl -f http://localhost:3113/health || exit 1
 
 CMD ["/supervisor.sh"]
 
-# Legacy directory-root target. Keep this for deployments that intentionally
-# mount packages at /host-packages, and for the KVM_ENABLED=false direct path.
+
+# ============================================================================
+# Direct/legacy target
+#
+# Used by:
+#   KVM_ENABLED=false
+#
+# /host-packages is expected to be populated externally by package-init.
+# ============================================================================
 FROM worker-sandbox-base AS worker-sandbox-legacy
 
 COPY --from=sandbox-rootfs / /sandbox-rootfs/
 
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+RUN sed -i \
+    '/^cgroup_mem_swap_max/d' \
+    /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
     && mkdir -p /host-packages
 
-# KVM production default. The package tree is part of the read-only block root,
-# avoiding host file-descriptor retention from package lookups over virtio-fs.
+
+# ============================================================================
+# KVM baked target
+# ============================================================================
 FROM worker-sandbox-base AS worker-sandbox-baked
 
-COPY --from=worker-sandbox-rootfs-image /sandbox-rootfs.img /sandbox-rootfs.img
+COPY --from=worker-sandbox-rootfs-image \
+    /sandbox-rootfs.img \
+    /sandbox-rootfs.img
 
 ENV LAUNCHER_ROOT_DISK=/sandbox-rootfs.img \
     LAUNCHER_ROOT_DISK_READ_ONLY=true \
@@ -289,9 +425,12 @@ ENV LAUNCHER_ROOT_DISK=/sandbox-rootfs.img \
     LAUNCHER_ROOT_FSTYPE=ext4 \
     LAUNCHER_ROOT_OPTIONS=ro
 
-# Compose derives these aliases from KVM_ENABLED so the direct path keeps
-# selecting the directory-root image without duplicating the baked rootfs.
+
+# ============================================================================
+# Compose aliases
+# ============================================================================
 FROM worker-sandbox-baked AS worker-sandbox-true
+
 FROM worker-sandbox-legacy AS worker-sandbox-false
 
 FROM worker-sandbox-true AS worker-sandbox-default
