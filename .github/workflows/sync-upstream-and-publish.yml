@@ -3,6 +3,9 @@ name: Sync upstream and publish images
 on:
   schedule:
     - cron: '17 3 * * *'
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       force_publish:
@@ -37,7 +40,7 @@ jobs:
       - name: Fetch and merge upstream changes
         id: sync
         env:
-          FORCE_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_publish }}
+          FORCE_PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_publish) }}
         run: |
           set -euo pipefail
 
