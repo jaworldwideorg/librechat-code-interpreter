@@ -23,6 +23,7 @@ import { jobsSubmitted } from '../metrics';
 import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
+import { createUploadSessionRegistrar } from './upload-session';
 import { prepareSandboxJobSecurity } from '../sandbox-egress';
 import logger from '../logger';
 
@@ -431,9 +432,6 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
           reject(err instanceof Error ? err : new Error(String(err)));
           return;
         }
-        connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
-        logger.info(`[${INSTANCE_ID}] Upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
-
         const putHeaders: Record<string, string> = {
           'Content-Type': mimeType,
           /* file-server URL-decodes this header before storing metadata.
@@ -444,26 +442,35 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
         if (readOnly) {
           putHeaders['X-Read-Only'] = 'true';
         }
-        axios.put<t.UploadResult>(
-          `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}`,
-          file,
-          {
-            headers: internalServiceHeaders(putHeaders),
-            maxBodyLength: planFileSize,
-            maxContentLength: planFileSize,
-            signal: abortController.signal,
-          }
-        )
+        connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL)
+          .then(() => {
+            logger.info(`[${INSTANCE_ID}] Upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
+            return axios.put<t.UploadResult>(
+              `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}`,
+              file,
+              {
+                headers: internalServiceHeaders(putHeaders),
+                maxBodyLength: planFileSize,
+                maxContentLength: planFileSize,
+                signal: abortController.signal,
+              },
+            );
+          })
           .then(response => {
             clearTimeout(uploadTimeout);
             resolve(response.data);
           })
           .catch(error => {
             clearTimeout(uploadTimeout);
+            file.resume();
             reject(error);
           });
       });
 
+      /* Busboy may take additional event-loop turns to drain the multipart
+       * body before `finish` aggregates this promise. Mark early failures as
+       * observed while preserving the original promise for Promise.all. */
+      void uploadPromise.catch(() => undefined);
       uploadPromises.push(uploadPromise);
     });
 
@@ -541,7 +548,6 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     let uploadId: string | undefined;
     let uploadVersionRaw: string | undefined;
     let readOnly = false;
-    let sessionKeySet = false;
     let hasResponded = false;
     let filesLimitReached = false;
     /* `SessionKeyResolutionError.status` spans 400 | 500 — 400 is a
@@ -552,6 +558,14 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
      * 500 we see and convert it into a single 500 batch response on
      * `bb.on('finish')`. */
     let serverError: SessionKeyResolutionError | undefined;
+    /* Redis registration is also a batch-level dependency fault. Keep file
+     * promises fulfilled while Busboy drains, then surface one 500. */
+    let sessionRegistrationError: Error | undefined;
+
+    const ensureSessionRegistered = createUploadSessionRegistrar((sessionKey) => {
+      logger.info(`[${INSTANCE_ID}] Batch upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
+      return connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
+    });
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
     /* See note on the single-upload busboy above for why preservePath is set. */
@@ -599,6 +613,13 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
         const uploadTimeout = setTimeout(() => {
           abortController.abort('timeout');
           file.resume();
+          /* If Redis is still pending, make that shared registration barrier
+           * fail before any file promise settles. This prevents Busboy from
+           * finishing with a 400 while a later Redis rejection arrives too
+           * late to be surfaced as the batch-level dependency failure. */
+          if (ensureSessionRegistered.rejectPending(
+            new Error('Upload session registration timed out'),
+          )) return;
           resolve({ status: 'error', filename, error: 'Upload timeout' });
         }, UPLOAD_TIMEOUT_MS);
 
@@ -635,12 +656,6 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
           resolve({ status: 'error', filename, error: message });
           return;
         }
-        if (!sessionKeySet) {
-          connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
-          sessionKeySet = true;
-          logger.info(`[${INSTANCE_ID}] Batch upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
-        }
-
         const putHeaders: Record<string, string> = {
           'Content-Type': mimeType,
           /* file-server URL-decodes this header before storing metadata.
@@ -651,7 +666,26 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
         if (readOnly) {
           putHeaders['X-Read-Only'] = 'true';
         }
-        axios.put<t.UploadResult>(
+        const failSessionRegistration = (error: unknown): void => {
+          clearTimeout(uploadTimeout);
+          file.resume();
+          const normalizedError = error instanceof Error ? error : new Error(String(error));
+          sessionRegistrationError ??= normalizedError;
+          resolve({ status: 'error', filename, error: 'Failed to register upload session' });
+        };
+        const resolveUploadFailure = (error: unknown): void => {
+          clearTimeout(uploadTimeout);
+          if (abortController.signal.aborted) {
+            const reason = abortController.signal.reason === 'timeout' ? 'Upload timeout' : 'File size limit exceeded';
+            resolve({ status: 'error', filename, error: reason });
+            return;
+          }
+          file.resume();
+          const message = error instanceof Error ? error.message : 'Unknown upload error';
+          logger.error(`[${INSTANCE_ID}] Batch upload file failed: ${filename} | Session: ${session_id}`, { error: message });
+          resolve({ status: 'error', filename, error: message });
+        };
+        const forwardFile = (): Promise<void> => axios.put<t.UploadResult>(
           `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}`,
           file,
           {
@@ -659,23 +693,15 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
             maxBodyLength: planFileSize,
             maxContentLength: planFileSize,
             signal: abortController.signal,
-          }
-        )
-          .then(response => {
-            clearTimeout(uploadTimeout);
-            resolve({ status: 'success', filename: response.data.filename, fileId: response.data.fileId });
-          })
-          .catch(error => {
-            clearTimeout(uploadTimeout);
-            if (abortController.signal.aborted) {
-              const reason = abortController.signal.reason === 'timeout' ? 'Upload timeout' : 'File size limit exceeded';
-              resolve({ status: 'error', filename, error: reason });
-              return;
-            }
-            const message = error instanceof Error ? error.message : 'Unknown upload error';
-            logger.error(`[${INSTANCE_ID}] Batch upload file failed: ${filename} | Session: ${session_id}`, { error: message });
-            resolve({ status: 'error', filename, error: message });
-          });
+          },
+        ).then(response => {
+          clearTimeout(uploadTimeout);
+          resolve({ status: 'success', filename: response.data.filename, fileId: response.data.fileId });
+        }, resolveUploadFailure);
+
+        void ensureSessionRegistered(sessionKey)
+          .then(forwardFile, failSessionRegistration)
+          .catch(failSessionRegistration);
       });
 
       uploadPromises.push(uploadPromise);
@@ -701,6 +727,15 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
       try {
         const results = await Promise.all(uploadPromises);
 
+        if (sessionRegistrationError) {
+          logger.error(
+            `[${INSTANCE_ID}] Batch upload session registration failed for session ${session_id}:`,
+            sessionRegistrationError,
+          );
+          res.status(500).json({ error: 'Error registering upload session' });
+          return;
+        }
+
         /* If sessionKey resolution faulted with a 500 status (server
          * misconfiguration — see `serverError` declaration above),
          * surface the fault as a single batch-level 500 instead of
@@ -721,9 +756,9 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
           return;
         }
 
-        /* SessionKey was set inline in the per-file handler under
-         * `sessionKeySet`. No batch-level fallback needed: if zero files
-         * succeeded, no session was created. */
+        /* SessionKey was set inline in the per-file handler through
+         * `ensureSessionRegistered`. No batch-level fallback is needed when
+         * no valid file reaches the forwarding step. */
 
         let succeeded = 0;
         let failed = 0;
