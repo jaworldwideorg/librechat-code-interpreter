@@ -5,8 +5,9 @@ import { setMaxListeners } from 'events';
 import type { CommonRedisOptions } from 'ioredis';
 import type * as tls from 'tls';
 import type * as t from './types';
-import { Jobs, Queues } from './enum';
+import { Jobs } from './enum';
 import { env } from './config';
+import { queueNamesForExecutionProfile } from './execution-profile';
 import logger from './logger';
 import { redisKeepAliveOptions } from './redis-options';
 import { bullmqQueueJobs, registerBullmqQueueMetricsCollector } from './metrics';
@@ -54,16 +55,22 @@ const connection = new IORedis({
 
 // Global queues - no INSTANCE_ID prefix
 // This enables horizontal scaling where any worker can process any job
-const pyQueue = new Queue<t.JobData, t.JobResult, Jobs.execute>(Queues.python, { connection });
-const otherQueue = new Queue<t.JobData, t.JobResult, Jobs.execute>(Queues.other, { connection });
+// while the execution-profile prefix prevents HTTP and Lambda workers from
+// consuming each other's jobs when they share Redis.
+const queueNames = queueNamesForExecutionProfile(
+  env.EXECUTION_PROFILE,
+  env.EXECUTION_PROFILE_SOURCE,
+);
+const pyQueue = new Queue<t.JobData, t.JobResult, Jobs.execute>(queueNames.python, { connection });
+const otherQueue = new Queue<t.JobData, t.JobResult, Jobs.execute>(queueNames.other, { connection });
 
-const pyQueueEvents = new QueueEvents(Queues.python, { connection });
-const otherQueueEvents = new QueueEvents(Queues.other, { connection });
+const pyQueueEvents = new QueueEvents(queueNames.python, { connection });
+const otherQueueEvents = new QueueEvents(queueNames.other, { connection });
 
 const queueMetricStates = ['waiting', 'active', 'delayed'] as const;
 const queueMetricSources = [
-  { name: Queues.python, queue: pyQueue },
-  { name: Queues.other, queue: otherQueue },
+  { name: queueNames.python, queue: pyQueue },
+  { name: queueNames.other, queue: otherQueue },
 ] as const;
 const QUEUE_METRICS_TIMEOUT_MS = 1000;
 
@@ -109,4 +116,4 @@ registerBullmqQueueMetricsCollector(async () => {
  * BullMQ coordination objects. */
 setMaxListeners(0, pyQueue, otherQueue, pyQueueEvents, otherQueueEvents);
 
-export { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection };
+export { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, queueNames, connection };

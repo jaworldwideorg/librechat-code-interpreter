@@ -3,6 +3,10 @@ dotenv.config();
 import { nanoid } from 'nanoid';
 import type * as t from './types';
 import { Languages } from './enum';
+import {
+  resolveExecutionProfile,
+  resolveExecutionProfileSource,
+} from './execution-profile';
 
 export const languageConfig: Record<Languages | string, t.LanguageConfig | undefined> = {
   [Languages.bash]: { language: 'bash', version: '5.2.0', fileName: 'script.sh' },
@@ -259,6 +263,9 @@ export function resolveRuntimeSessionMode(
   );
 }
 
+const sandboxBackend = resolveSandboxBackend(process.env.CODEAPI_SANDBOX_BACKEND);
+const runtimeSessionMode = resolveRuntimeSessionMode(process.env.CODEAPI_RUNTIME_SESSION_MODE);
+
 export const env = {
   PORT: process.env.SERVICE_PORT ?? 3112,
   LOCAL_MODE: process.env.LOCAL_MODE === 'true',
@@ -344,7 +351,7 @@ export const env = {
    *   (current Kubernetes/libkrun sandbox-runner).
    * - `lambda-microvm`: AWS Lambda MicroVM backend.
    */
-  SANDBOX_BACKEND: resolveSandboxBackend(process.env.CODEAPI_SANDBOX_BACKEND),
+  SANDBOX_BACKEND: sandboxBackend,
   /**
    * Runtime session affinity for stateful sandbox backends.
    * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.
@@ -353,7 +360,20 @@ export const env = {
    * - `strict`: same serialized session semantics, and a session hint is
    *   required instead of degrading requests without one to stateless.
    */
-  RUNTIME_SESSION_MODE: resolveRuntimeSessionMode(process.env.CODEAPI_RUNTIME_SESSION_MODE),
+  RUNTIME_SESSION_MODE: runtimeSessionMode,
+  /**
+   * Deployment identity used by trusted callers to route each agent to the
+   * intended execution stack. `default` is HTTP/stateless; `stateful` is
+   * Lambda MicroVM with session affinity. The startup policy rejects mixed
+   * tuples so an endpoint cannot claim one profile while running the other.
+   */
+  EXECUTION_PROFILE: resolveExecutionProfile(
+    process.env.CODEAPI_EXECUTION_PROFILE,
+    runtimeSessionMode,
+  ),
+  EXECUTION_PROFILE_SOURCE: resolveExecutionProfileSource(
+    process.env.CODEAPI_EXECUTION_PROFILE,
+  ),
   RUNTIME_SESSION_LOCK_WAIT_MS: configuredNumber(
     process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS,
     15_000,

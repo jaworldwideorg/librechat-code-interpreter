@@ -21,6 +21,7 @@ import programmaticRouter from './service/programmatic-router';
 import { connection } from './queue';
 import { metricsHandler } from './metrics';
 import { httpMetricsMiddleware } from './middleware/httpMetrics';
+import { executionProfileMiddleware } from './middleware/execution-profile';
 import { traceHttpRequest } from './telemetry';
 import { env } from './config';
 import logger from './logger';
@@ -32,6 +33,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(traceHttpRequest('codeapi.api.request'));
 app.use(httpMetricsMiddleware);
+app.use(executionProfileMiddleware);
 
 const v1 = Router();
 

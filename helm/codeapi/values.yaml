@@ -22,6 +22,12 @@ internalServiceAuth:
 
 hardenedSandboxMode: true
 
+# Stable identity advertised by this API/worker deployment. Leave empty for a
+# backwards-compatible inferred profile. Set explicitly to `default` or
+# `stateful` when deploying both stacks against shared Redis; explicit
+# `stateful` selects isolated BullMQ queues.
+executionProfile: ""
+
 otel:
   enabled: false
   # OTLP/HTTP collector endpoint, e.g. "http://opentelemetry-collector.observability:4318".
