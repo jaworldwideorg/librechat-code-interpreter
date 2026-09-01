@@ -113,6 +113,12 @@ FORCE_REBUILD=1 ./build-packages.sh
 docker build --target sandbox-runner-baked -f api/Dockerfile .
 ```
 
+The bundled Noto font families cover Latin, Arabic, Cyrillic, Indic, CJK, and
+emoji text. Tesseract includes orientation detection plus English, Spanish,
+Portuguese, Arabic, Simplified Chinese, French, Hindi, and Russian recognition.
+Legacy Word, Excel, and RTF inspection is available through Antiword, Catdoc,
+and UnRTF.
+
 Browser engines and TeX distributions are intentionally not part of the
 baseline because of their substantial image and attack-surface cost.
 

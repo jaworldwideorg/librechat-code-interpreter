@@ -96,6 +96,13 @@ RUN apt-get update && \
     libfontconfig1 \
     fonts-dejavu \
     fonts-liberation \
+    fonts-noto-core \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    fonts-noto-extra \
+    fonts-noto-mono \
+    libharfbuzz0b \
+    libfribidi0 \
     librsvg2-bin \
     imagemagick \
     libvips-tools \
@@ -105,6 +112,26 @@ RUN apt-get update && \
     pandoc \
     tesseract-ocr \
     tesseract-ocr-eng \
+    tesseract-ocr-spa \
+    tesseract-ocr-por \
+    tesseract-ocr-ara \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-fra \
+    tesseract-ocr-hin \
+    tesseract-ocr-rus \
+    tesseract-ocr-osd \
+    sqlite3 \
+    libxml2-utils \
+    xmlstarlet \
+    ripgrep \
+    tree \
+    diffutils \
+    patch \
+    uchardet \
+    icu-devtools \
+    antiword \
+    catdoc \
+    unrtf \
     ffmpeg \
     graphviz \
     libcairo2 \
@@ -135,7 +162,13 @@ RUN apt-get update && \
 
 RUN command -v file jq zip unzip 7z xz tar pdfinfo pdftotext pdftoppm pdffonts pdfimages \
         qpdf gs mutool fc-list rsvg-convert convert identify vips libreoffice pandoc \
-        tesseract ffmpeg ffprobe dot >/dev/null
+        tesseract sqlite3 xmllint xmlstarlet rg tree diff patch uchardet icuinfo \
+        antiword catdoc unrtf ffmpeg ffprobe dot >/dev/null \
+    && tesseract --list-langs 2>/dev/null | grep -Eq '(^|[[:space:]])eng($|[[:space:]])' \
+    && for lang in spa por ara chi_sim fra hin rus osd; do \
+         tesseract --list-langs 2>/dev/null | grep -qx "$lang" || exit 1; \
+       done \
+    && fc-list | grep -q 'Noto'
 
 # Restore the standard Debian `awk` -> `mawk` symlink. mawk is Priority:
 # required so its binary is in /usr/bin already, but slim base images skip
@@ -148,7 +181,13 @@ RUN command -v file jq zip unzip 7z xz tar pdfinfo pdftotext pdftoppm pdffonts p
 # in its minimal build.
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
 
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+RUN sed -i -E \
+        '/^(# )?(en_US|es_ES|pt_BR|ar_SA|zh_CN|fr_FR|hi_IN|ru_RU)(\.UTF-8)? UTF-8$/s/^# //' \
+        /etc/locale.gen \
+    && locale-gen \
+    && for locale_name in en_US es_ES pt_BR ar_SA zh_CN fr_FR hi_IN ru_RU; do \
+         locale -a | grep -qi "^${locale_name}\.utf8$" || exit 1; \
+       done
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
