@@ -178,6 +178,10 @@ install_python_packages() {
         sympy \
         wordcloud \
         pypdf2 \
+        pypdf \
+        pymupdf \
+        pikepdf \
+        pdfplumber \
         python-docx \
         imageio \
         seaborn \
@@ -202,13 +206,21 @@ install_python_packages() {
         opencv-python-headless \
         svglib \
         cairosvg \
+        weasyprint \
+        python-magic \
+        lxml \
+        defusedxml \
+        odfpy \
+        markdown \
+        jinja2 \
         exifread \
         hachoir \
         python-barcode \
         qrcode \
         fonttools \
         pytesseract \
-        pdfminer \
+        ocrmypdf \
+        graphviz \
         vsdx \
         rasterio \
         rioxarray \
@@ -221,6 +233,12 @@ install_python_packages() {
         python_packages_installed=true
     else
         echo "ERROR: Python package installation failed"
+        return 1
+    fi
+
+    if ! docker exec "$CONTAINER_NAME" "${pkg_dest}/bin/python3" -c \
+        "import bz2, ctypes, defusedxml, graphviz, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib"; then
+        echo "ERROR: Python dependency verification failed"
         return 1
     fi
 
@@ -513,11 +531,12 @@ main() {
     docker exec "$CONTAINER_NAME" bash -c "
         apt-get update && apt-get install -y --no-install-recommends \
             curl unzip wget ca-certificates \
-            build-essential libssl-dev libffi-dev libsqlite3-dev \
-            zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+            build-essential pkg-config libssl-dev libffi-dev libsqlite3-dev \
+            zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev liblzma-dev \
+            libgdbm-dev libnss3-dev uuid-dev libmagic-dev libqpdf-dev \
             tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
-            libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-            libfreetype6-dev \
+            libudunits2-dev libpng-dev libxml2-dev libcairo2-dev libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev libfreetype6-dev libjpeg-dev libopenjp2-7-dev \
         && rm -rf /var/lib/apt/lists/*
     "
 

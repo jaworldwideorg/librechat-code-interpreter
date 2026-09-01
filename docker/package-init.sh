@@ -93,6 +93,9 @@ packages_ready() {
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/chdb" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/statsmodels" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/rasterio" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/pypdf" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/pymupdf" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/weasyprint" ] &&
     [ -f "/pkgs/node/${NODE_VERSION}/.package-installed" ] &&
     js_packages_ready "/pkgs/node/${NODE_VERSION}" &&
     [ -f "/pkgs/bun/${BUN_VERSION}/.package-installed" ] &&
@@ -199,6 +202,10 @@ if [ -f "$PIP_PATH" ]; then
         sympy \
         wordcloud \
         pypdf2 \
+        pypdf \
+        pymupdf \
+        pikepdf \
+        pdfplumber \
         python-docx \
         imageio \
         seaborn \
@@ -223,13 +230,21 @@ if [ -f "$PIP_PATH" ]; then
         opencv-python-headless \
         svglib \
         cairosvg \
+        weasyprint \
+        python-magic \
+        lxml \
+        defusedxml \
+        odfpy \
+        markdown \
+        jinja2 \
         exifread \
         hachoir \
         python-barcode \
         qrcode \
         fonttools \
         pytesseract \
-        pdfminer \
+        ocrmypdf \
+        graphviz \
         vsdx \
         rasterio \
         rioxarray \
@@ -243,6 +258,13 @@ if [ -f "$PIP_PATH" ]; then
         INSTALL_FAILED=true
     else
         PYTHON_PACKAGES_INSTALLED=true
+    fi
+
+    if [ "$PYTHON_PACKAGES_INSTALLED" = true ] && ! "$PKG_DEST/bin/python3" -c \
+        "import bz2, ctypes, defusedxml, graphviz, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib"; then
+        echo "ERROR: Python dependency verification failed"
+        PYTHON_PACKAGES_INSTALLED=false
+        INSTALL_FAILED=true
     fi
 
     "$PIP_PATH" install --upgrade six 2>/dev/null || true

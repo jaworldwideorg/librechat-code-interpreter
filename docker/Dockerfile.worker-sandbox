@@ -101,6 +101,7 @@ RUN apt-install \
     wget \
     ca-certificates \
     build-essential \
+    pkg-config \
     libssl-dev \
     libffi-dev \
     libsqlite3-dev \
@@ -108,6 +109,12 @@ RUN apt-install \
     libbz2-dev \
     libreadline-dev \
     libncurses5-dev \
+    liblzma-dev \
+    libgdbm-dev \
+    libnss3-dev \
+    uuid-dev \
+    libmagic-dev \
+    libqpdf-dev \
     tk-dev \
     xz-utils \
     libcurl4-openssl-dev \
@@ -116,7 +123,11 @@ RUN apt-install \
     libpng-dev \
     libxml2-dev \
     libcairo2-dev \
-    libfreetype6-dev
+    libpango1.0-dev \
+    libgdk-pixbuf-2.0-dev \
+    libfreetype6-dev \
+    libjpeg-dev \
+    libopenjp2-7-dev
 
 RUN mkdir -p /pkgs
 
@@ -187,17 +198,61 @@ RUN apt-install \
     procps \
     iptables \
     bc \
+    file \
+    libmagic1 \
     jq \
+    zip \
+    unzip \
+    p7zip-full \
+    xz-utils \
+    tar \
     poppler-utils \
+    qpdf \
+    ghostscript \
+    mupdf-tools \
+    fontconfig \
+    libfontconfig1 \
     fonts-dejavu \
     fonts-liberation \
+    librsvg2-bin \
+    imagemagick \
+    libvips-tools \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
+    pandoc \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    ffmpeg \
+    graphviz \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    shared-mime-info \
+    libssl3 \
+    zlib1g \
+    libbz2-1.0 \
+    libsqlite3-0 \
+    liblzma5 \
+    libreadline8 \
+    libgdbm6 \
+    libgdbm-compat4 \
+    libncursesw6 \
+    libuuid1 \
+    tk8.6 \
     libnl-route-3-200 \
     libprotobuf32 \
     libffi8 \
     ca-certificates \
+    && fc-cache -f \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+RUN command -v file jq zip unzip 7z xz tar pdfinfo pdftotext pdftoppm pdffonts pdfimages \
+        qpdf gs mutool fc-list rsvg-convert convert identify vips libreoffice pandoc \
+        tesseract ffmpeg ffprobe dot >/dev/null
 
 # Restore standard Debian awk -> mawk symlink.
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk

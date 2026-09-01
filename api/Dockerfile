@@ -51,11 +51,12 @@ RUN chmod +x /usr/local/bin/apt-install
 
 RUN apt-install \
     curl unzip wget ca-certificates \
-    build-essential libssl-dev libffi-dev libsqlite3-dev \
-    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+    build-essential pkg-config libssl-dev libffi-dev libsqlite3-dev \
+    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev liblzma-dev \
+    libgdbm-dev libnss3-dev uuid-dev libmagic-dev libqpdf-dev \
     tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
-    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-    libfreetype6-dev
+    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev libpango1.0-dev \
+    libgdk-pixbuf-2.0-dev libfreetype6-dev libjpeg-dev libopenjp2-7-dev
 
 RUN mkdir -p /pkgs
 
@@ -80,18 +81,61 @@ RUN apt-get update && \
     iptables \
     bc \
     file \
+    libmagic1 \
     jq \
+    zip \
+    unzip \
+    p7zip-full \
+    xz-utils \
+    tar \
     poppler-utils \
+    qpdf \
+    ghostscript \
+    mupdf-tools \
+    fontconfig \
+    libfontconfig1 \
     fonts-dejavu \
     fonts-liberation \
+    librsvg2-bin \
+    imagemagick \
+    libvips-tools \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
+    pandoc \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    ffmpeg \
+    graphviz \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    shared-mime-info \
+    libssl3 \
+    zlib1g \
+    libbz2-1.0 \
+    libsqlite3-0 \
+    liblzma5 \
+    libreadline8 \
+    libgdbm6 \
+    libgdbm-compat4 \
+    libncursesw6 \
+    libuuid1 \
+    tk8.6 \
     libnl-route-3-200 \
     libprotobuf32 \
     libffi8 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+RUN command -v file jq zip unzip 7z xz tar pdfinfo pdftotext pdftoppm pdffonts pdfimages \
+        qpdf gs mutool fc-list rsvg-convert convert identify vips libreoffice pandoc \
+        tesseract ffmpeg ffprobe dot >/dev/null
 
 # Restore the standard Debian `awk` -> `mawk` symlink. mawk is Priority:
 # required so its binary is in /usr/bin already, but slim base images skip

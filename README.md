@@ -101,6 +101,21 @@ descriptors in the launcher.
 Setting `KVM_ENABLED=false` still selects the directory-root target and the
 host package mount automatically for direct NsJail development.
 
+The sandbox image includes a document-processing toolchain for inspecting and
+rendering PDF, Office, image, SVG, OCR, archive, media, and Graphviz outputs.
+Language package builds also install the corresponding Python libraries,
+including PyMuPDF, pypdf, pikepdf, pdfplumber, WeasyPrint, python-magic,
+OCRmyPDF, lxml, and defusedxml. Rebuild both the package tree and sandbox image
+after changing these dependencies:
+
+```bash
+FORCE_REBUILD=1 ./build-packages.sh
+docker build --target sandbox-runner-baked -f api/Dockerfile .
+```
+
+Browser engines and TeX distributions are intentionally not part of the
+baseline because of their substantial image and attack-surface cost.
+
 Local Docker Compose files set `CODEAPI_INTERNAL_SERVICE_TOKEN` to a shared
 development value by default. Production deployments must override it with a
 strong secret; when it is unset, file object routes and Tool Call Server
