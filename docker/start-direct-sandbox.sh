@@ -92,6 +92,10 @@ exec unshare --mount bash -c '
         exit 1
     }
 
+    # Fedora may cache commands under /usr/sbin before the Debian /usr bind.
+    # Clear those stale paths so subsequent commands resolve in the new tree.
+    hash -r
+
     # Keep the live outer-container /etc (especially Docker resolv.conf),
     # but expose the Debian configuration consumed by binaries in ROOTFS/usr.
     for etc_path in alternatives fonts ImageMagick-7 libreoffice; do

@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 bash -n "${repo_root}/docker/start-direct-sandbox.sh"
+grep -Fq '    hash -r' "${repo_root}/docker/start-direct-sandbox.sh"
 
 runtime_packages=(
   file libmagic1 jq zip unzip p7zip-full xz-utils tar
