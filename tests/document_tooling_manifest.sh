@@ -18,6 +18,7 @@ runtime_packages=(
   icu-devtools antiword catdoc unrtf ffmpeg graphviz
   libcairo2 libpango-1.0-0 libpangoft2-1.0-0 libgdk-pixbuf-2.0-0
   shared-mime-info
+  libblas3 liblapack3
 )
 
 python_packages=(
@@ -34,6 +35,26 @@ for dockerfile in api/Dockerfile docker/Dockerfile.worker-sandbox; do
       exit 1
     }
   done
+done
+
+for required_mount in /etc/alternatives /etc/fonts /etc/ImageMagick-7 /etc/libreoffice /var/cache/fontconfig; do
+  grep -Fq "src: \"${required_mount}\"" "${repo_root}/api/config/sandbox.cfg" || {
+    echo "Missing NsJail document resource mount: ${required_mount}" >&2
+    exit 1
+  }
+done
+
+grep -Fq 'mount_safe -o bind,ro "$ROOTFS/usr" /usr' "${repo_root}/docker/start-direct-sandbox.sh"
+grep -Fq 'for etc_path in alternatives fonts ImageMagick-7 libreoffice' "${repo_root}/docker/start-direct-sandbox.sh"
+grep -Fq '"$ROOTFS/etc/ld.so.cache" /etc/ld.so.cache' "${repo_root}/docker/start-direct-sandbox.sh"
+if grep -Fq 'mount_safe -o bind,ro "$ROOTFS/etc" /etc' "${repo_root}/docker/start-direct-sandbox.sh"; then
+  echo "Direct mode must preserve the outer container's live /etc and DNS configuration" >&2
+  exit 1
+fi
+
+for dockerfile in api/Dockerfile docker/Dockerfile.worker-sandbox; do
+  grep -Fq 'verify-document-tooling --system' "${repo_root}/${dockerfile}"
+  grep -Fq 'verify-document-tooling --python' "${repo_root}/${dockerfile}"
 done
 
 for dockerfile in api/Dockerfile docker/Dockerfile.worker-sandbox; do

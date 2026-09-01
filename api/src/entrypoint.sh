@@ -198,7 +198,7 @@ if timeout 10 "${NSJAIL[@]}" \
     -s /usr/lib:/lib \
     -s /usr/lib64:/lib64 \
     -B "$SMOKE_DIR:/mnt/data" \
-    -- /bin/sh -c 'printf "%s\n" sandbox_ok > /mnt/data/smoke.txt && test "$(cat /mnt/data/smoke.txt)" = sandbox_ok'; then
+    -- /bin/sh -c '/usr/local/bin/verify-document-tooling --readiness && printf "%s\n" sandbox_ok > /mnt/data/smoke.txt && test "$(cat /mnt/data/smoke.txt)" = sandbox_ok'; then
     echo "NsJail smoke test passed"
 else
     echo "FATAL: NsJail smoke test failed — sandbox cannot start"

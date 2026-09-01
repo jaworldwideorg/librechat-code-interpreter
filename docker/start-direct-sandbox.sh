@@ -87,25 +87,33 @@ exec unshare --mount bash -c '
     # Mount Debian sandbox userspace
     #
 
-    mount_safe -o bind,ro "$ROOTFS/usr/sbin" /usr/sbin || {
-        echo "FATAL: cannot bind /usr/sbin"
+    mount_safe -o bind,ro "$ROOTFS/usr" /usr || {
+        echo "FATAL: cannot bind /usr"
         exit 1
     }
 
-    mount_safe -o bind,ro "$ROOTFS/usr/lib" /usr/lib || {
-        echo "FATAL: cannot bind /usr/lib"
-        exit 1
-    }
+    # Keep the outer container's live /etc (especially Docker's resolv.conf),
+    # but expose the Debian configuration consumed by binaries in ROOTFS/usr.
+    for etc_path in alternatives fonts ImageMagick-7 libreoffice; do
+        if [ -e "$ROOTFS/etc/$etc_path" ]; then
+            mkdir -p "/etc/$etc_path"
+            mount_safe -o bind,ro "$ROOTFS/etc/$etc_path" "/etc/$etc_path" || {
+                echo "FATAL: cannot bind /etc/$etc_path"
+                exit 1
+            }
+        fi
+    done
 
-
-    if [ -d "$ROOTFS/usr/lib64" ] && ! [ -L "$ROOTFS/usr/lib64" ]; then
-        mount_safe -o bind,ro "$ROOTFS/usr/lib64" /usr/lib64 2>/dev/null || \
-            echo "[sandbox] WARNING: could not bind /usr/lib64"
+    if [ -f "$ROOTFS/etc/ld.so.cache" ]; then
+        mount_safe -o bind,ro "$ROOTFS/etc/ld.so.cache" /etc/ld.so.cache || {
+            echo "FATAL: cannot bind /etc/ld.so.cache"
+            exit 1
+        }
     fi
 
-
-    mount_safe -o bind,ro "$ROOTFS/usr/local" /usr/local || {
-        echo "FATAL: cannot bind /usr/local"
+    mkdir -p /var/cache/fontconfig
+    mount_safe -o bind,ro "$ROOTFS/var/cache/fontconfig" /var/cache/fontconfig || {
+        echo "FATAL: cannot bind /var/cache/fontconfig"
         exit 1
     }
 
@@ -124,13 +132,6 @@ exec unshare --mount bash -c '
         mount_safe --bind /host-packages /pkgs 2>/dev/null || \
             echo "WARNING: could not bind /host-packages"
     fi
-
-
-    mount_safe -o bind,ro "$ROOTFS/usr/bin" /usr/bin || {
-        echo "FATAL: cannot bind /usr/bin"
-        exit 1
-    }
-
 
     multiarch_libdir=$(find /usr/lib -maxdepth 1 -type d -name "*-linux-gnu" -print -quit)
 

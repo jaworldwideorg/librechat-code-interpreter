@@ -149,6 +149,8 @@ RUN apt-get update && \
     libgdbm-compat4 \
     libncursesw6 \
     libuuid1 \
+    libblas3 \
+    liblapack3 \
     tk8.6 \
     libnl-route-3-200 \
     libprotobuf32 \
@@ -159,16 +161,6 @@ RUN apt-get update && \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
-
-RUN command -v file jq zip unzip 7z xz tar pdfinfo pdftotext pdftoppm pdffonts pdfimages \
-        qpdf gs mutool fc-list rsvg-convert convert identify vips libreoffice pandoc \
-        tesseract sqlite3 xmllint xmlstarlet rg tree diff patch uchardet icuinfo \
-        antiword catdoc unrtf ffmpeg ffprobe dot >/dev/null \
-    && tesseract --list-langs 2>/dev/null | grep -Eq '(^|[[:space:]])eng($|[[:space:]])' \
-    && for lang in spa por ara chi_sim fra hin rus osd; do \
-         tesseract --list-langs 2>/dev/null | grep -qx "$lang" || exit 1; \
-       done \
-    && fc-list | grep -q 'Noto'
 
 # Restore the standard Debian `awk` -> `mawk` symlink. mawk is Priority:
 # required so its binary is in /usr/bin already, but slim base images skip
@@ -227,6 +219,10 @@ RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
          /usr/bin/passwd /usr/bin/sg \
          /usr/bin/chage /usr/bin/expiry /usr/sbin/unix_chkpwd \
     2>/dev/null || true
+
+COPY docker/verify-document-tooling.sh /usr/local/bin/verify-document-tooling
+RUN chmod 0555 /usr/local/bin/verify-document-tooling \
+    && /usr/local/bin/verify-document-tooling --system
 
 COPY api/src/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
@@ -319,6 +315,7 @@ COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
 
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
 RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
+    && chroot /sandbox-rootfs /usr/local/bin/verify-document-tooling --python \
     && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
 
 FROM sandbox-runner-base AS sandbox-runner-baked

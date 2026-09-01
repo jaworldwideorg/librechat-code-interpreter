@@ -34,6 +34,9 @@ jobs:
       - name: Sandbox-runner liveness checks
         run: tests/sandbox_runner_healthcheck.sh
 
+      - name: Document-tooling package and mount checks
+        run: tests/document_tooling_manifest.sh
+
       - name: Validate sandbox Dockerfiles
         run: |
           docker buildx build --check -f api/Dockerfile .

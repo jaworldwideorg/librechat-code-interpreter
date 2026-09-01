@@ -119,6 +119,11 @@ Portuguese, Arabic, Simplified Chinese, French, Hindi, and Russian recognition.
 Legacy Word, Excel, and RTF inspection is available through Antiword, Catdoc,
 and UnRTF.
 
+The image build performs functional document-tooling checks rather than only
+checking binary presence. The sandbox startup probe also verifies that NsJail
+can see the fonts, Fontconfig configuration, Tesseract data, Pandoc resources,
+Ghostscript initialization files, and FFmpeg shared libraries.
+
 Browser engines and TeX distributions are intentionally not part of the
 baseline because of their substantial image and attack-surface cost.
 
