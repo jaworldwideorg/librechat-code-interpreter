@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+bash -n "${repo_root}/docker/start-direct-sandbox.sh"
+
 runtime_packages=(
   file libmagic1 jq zip unzip p7zip-full xz-utils tar
   poppler-utils qpdf ghostscript mupdf-tools

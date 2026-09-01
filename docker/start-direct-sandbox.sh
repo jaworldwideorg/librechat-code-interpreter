@@ -92,7 +92,7 @@ exec unshare --mount bash -c '
         exit 1
     }
 
-    # Keep the outer container's live /etc (especially Docker's resolv.conf),
+    # Keep the live outer-container /etc (especially Docker resolv.conf),
     # but expose the Debian configuration consumed by binaries in ROOTFS/usr.
     for etc_path in alternatives fonts ImageMagick-7 libreoffice; do
         if [ -e "$ROOTFS/etc/$etc_path" ]; then
