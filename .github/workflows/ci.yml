@@ -37,6 +37,9 @@ jobs:
       - name: Document-tooling package and mount checks
         run: tests/document_tooling_manifest.sh
 
+      - name: Bridge pairing rollout safety
+        run: tests/bridge_pairing_rollout.sh
+
       - name: Validate sandbox Dockerfiles
         run: |
           docker buildx build --check -f api/Dockerfile .
@@ -158,12 +161,17 @@ jobs:
           shellcheck scripts/build-lambda-microvm-artifact.sh
 
       - name: Validate runner Dockerfile
-        run: >-
-          docker buildx build --check
-          --platform linux/arm64
-          --target lambda-microvm-runner
-          -f api/Dockerfile
-          .
+        run: |
+          docker buildx build --check \
+            --platform linux/arm64 \
+            --target lambda-microvm-runner \
+            -f api/Dockerfile \
+            .
+          docker buildx build --check \
+            --platform linux/arm64 \
+            --target lambda-microvm-app-host \
+            -f api/Dockerfile \
+            .
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:

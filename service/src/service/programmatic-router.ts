@@ -2,11 +2,15 @@ import axios from 'axios';
 import { nanoid } from 'nanoid';
 import { Router } from 'express';
 import type { Response } from 'express';
-import type { Queue, QueueEvents } from 'bullmq';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
 import { executionLimiter } from '../middleware/limits';
-import { pyQueue, pyQueueEvents, otherQueue, otherQueueEvents, connection } from '../queue';
+import {
+  pyQueue,
+  pyQueueEvents,
+  connection,
+  getExecutionQueueBinding,
+} from '../queue';
 import { createProgrammaticPayload, extractPendingFromStdout } from '../preamble';
 import { findBashToolNameCollision } from '../preamble-bash';
 import type { LCTool } from '../preamble';
@@ -25,6 +29,8 @@ import {
 } from '../metrics';
 import { Jobs } from '../enum';
 import { env, jobCompletionWaitTimeoutMs } from '../config';
+import { resolveQueuedSandboxBackend } from '../execution-profile';
+import { publicExecutionFailure } from '../utils';
 import {
   normalizeEgressGatewayUrl,
   normalizeProgrammaticTimeoutMs,
@@ -34,8 +40,17 @@ import {
 } from '../sandbox-egress';
 import { findUnregisteredToolCall } from '../tool-scope';
 import { summarizeRequestedFiles } from '../execution-log';
+import { clearSessionOwnership, recordSessionOwnership } from '../session-ownership';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
-import { buildReplayExecutionState } from './programmatic-state';
+import {
+  buildReplayExecutionState,
+  resolveReplayStateSandboxBackend,
+} from './programmatic-state';
+import {
+  BridgeWorkerSelectionError,
+  CODEAPI_BRIDGE_WORKER_HEADER,
+  resolveBridgeWorkerSelection,
+} from '../bridge/selection';
 import logger from '../logger';
 import {
   type ExecutionState,
@@ -328,19 +343,6 @@ async function waitForExecutionState(
 // Replay mode helpers
 // ---------------------------------------------------------------------------
 
-interface QueueBinding {
-  queue: Queue<t.JobData, t.JobResult, Jobs.execute>;
-  events: QueueEvents;
-  language: 'python' | 'bash';
-}
-
-function pickQueue(language: 'python' | 'bash'): QueueBinding {
-  if (language === 'bash') {
-    return { queue: otherQueue, events: otherQueueEvents, language: 'bash' };
-  }
-  return { queue: pyQueue, events: pyQueueEvents, language: 'python' };
-}
-
 function buildReplayPayload(
   req: t.AuthenticatedRequest,
   state: ExecutionState,
@@ -396,7 +398,21 @@ async function runReplayIteration(
     });
   }
 
-  const { queue, events, language } = pickQueue(state.language ?? 'python');
+  const replayBackend =
+    state.sandboxBackend ??
+    (state.bridgeWorkerId != null
+      ? 'remote-bridge'
+      : resolveQueuedSandboxBackend(
+          env.EXECUTION_PROFILE,
+          env.SANDBOX_BACKEND,
+          env.EXECUTION_PROFILE_SOURCE,
+        ));
+  const { queue, events, language } = getExecutionQueueBinding(
+    state.language ?? 'python',
+    replayBackend,
+    state.executionProfile ?? env.EXECUTION_PROFILE,
+    state.executionProfileSource ?? env.EXECUTION_PROFILE_SOURCE,
+  );
   const job = await queue.add(Jobs.execute, {
     code: state.userCode ?? '',
     userId,
@@ -407,7 +423,9 @@ async function runReplayIteration(
     executionId: state.execution_id,
     tenantId: state.tenantId,
     canonicalUserId: state.canonicalUserId,
-    executionProfile: env.EXECUTION_PROFILE,
+    executionProfile: state.executionProfile ?? env.EXECUTION_PROFILE,
+    sandboxBackend: replayBackend,
+    ...(state.bridgeWorkerId != null ? { bridgeWorkerId: state.bridgeWorkerId } : {}),
     runtimeSessionMode: 'stateless',
     runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
     executionManifestClaims: sandboxSecurity.executionManifestClaims,
@@ -439,9 +457,10 @@ async function handleReplayInitial(
   params: {
     apiKeyId: string;
     userId: string;
+    bridgeWorkerId?: string;
   },
 ): Promise<void> {
-  const { apiKeyId, userId } = params;
+  const { apiKeyId, userId, bridgeWorkerId } = params;
   const {
     code,
     tools,
@@ -544,7 +563,7 @@ async function handleReplayInitial(
     code.includes('import matplotlib') || code.includes('import seaborn')
   );
 
-  await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
+  await recordSessionOwnership(connection, session_id, sessionKey);
 
   const state = buildReplayExecutionState({
     executionId: execution_id,
@@ -560,6 +579,15 @@ async function handleReplayInitial(
     isPyPlot,
     timeout,
     language,
+    bridgeWorkerId,
+    executionProfile: env.EXECUTION_PROFILE,
+    executionProfileSource: env.EXECUTION_PROFILE_SOURCE,
+    sandboxBackend: resolveReplayStateSandboxBackend({
+      executionProfile: env.EXECUTION_PROFILE,
+      executionProfileSource: env.EXECUTION_PROFILE_SOURCE,
+      apiSandboxBackend: env.SANDBOX_BACKEND,
+      bridgeWorkerId,
+    }),
   });
   /** Replay mode persists the full request (`userCode` + `tools` + `files`)
    * inside `ExecutionState` so continuations can re-enqueue without the
@@ -578,7 +606,7 @@ async function handleReplayInitial(
         bytes: err.bytes,
         cap: err.cap,
       });
-      await connection.del(`session:${session_id}`).catch(() => {});
+      await clearSessionOwnership(connection, session_id).catch(() => {});
       ptcReplayStateOversize.inc();
       res.status(413).json({
         error: `Request too large: serialized execution state is ${err.bytes} bytes (max ${err.cap}). Reduce the size of "code", "tools", or "files".`,
@@ -832,7 +860,8 @@ async function runAndRespond(
     logger.error('Replay iteration failed', { execution_id: state.execution_id, err });
     await cleanupExecution(state.execution_id, 'replay');
     if (!isDisconnected()) {
-      const message = (err as Error).message;
+      const publicFailure = publicExecutionFailure(err);
+      const message = publicFailure?.body.message ?? (err as Error).message;
       res.status(200).json({
         status: 'error',
         error: message !== '' ? message : 'Sandbox execution failed',
@@ -1023,6 +1052,26 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
   } = req.body as t.ProgrammaticRequestBody;
   const rawBody = req.body as Record<string, unknown>;
   const requestedLanguage: unknown = rawBody.language ?? rawBody.lang;
+  let bridgeWorkerId: string | undefined;
+  if (continuation_token == null || continuation_token === '') {
+    try {
+      const bridgeSelection = resolveBridgeWorkerSelection({
+        backend: env.SANDBOX_BACKEND,
+        configuredWorkerId: env.BRIDGE_WORKER_ID,
+        dynamicWorkers: env.BRIDGE_DYNAMIC_WORKERS,
+        requestedWorkerId: req.header(CODEAPI_BRIDGE_WORKER_HEADER),
+        trustedWorkerId: principal.codeWorkerId,
+      });
+      bridgeWorkerId = bridgeSelection?.explicit === true
+        ? bridgeSelection.workerId
+        : undefined;
+    } catch (error) {
+      if (error instanceof BridgeWorkerSelectionError) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      throw error;
+    }
+  }
 
   if (
     requestedLanguage !== undefined &&
@@ -1079,9 +1128,9 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
       });
     }
     if (env.PTC_MODE === 'replay') {
-      return await handleReplayInitial(req, res, { apiKeyId, userId });
+      return await handleReplayInitial(req, res, { apiKeyId, userId, bridgeWorkerId });
     }
-    return await handleBlocking(req, res, { apiKeyId, userId });
+    return await handleBlocking(req, res, { apiKeyId, userId, bridgeWorkerId });
   } catch (err) {
     logger.error(`[${INSTANCE_ID}] Programmatic routing error:`, err);
     if (!res.headersSent) {
@@ -1099,9 +1148,9 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
 async function handleBlocking(
   req: t.AuthenticatedRequest,
   res: Response,
-  params: { apiKeyId: string; userId: string },
+  params: { apiKeyId: string; userId: string; bridgeWorkerId?: string },
 ): Promise<void | ReturnType<typeof res.status>> {
-  const { apiKeyId, userId } = params;
+  const { apiKeyId, userId, bridgeWorkerId } = params;
   const {
     code,
     tools,
@@ -1267,7 +1316,12 @@ async function handleBlocking(
   const execution_id = nanoid();
   const identity = getExecutionIdentity(req, userId);
 
-  connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
+  /* Awaited: a partial registration (cache key written, durable record
+   * refused — a Redis ACL scoped to `session:*` would do it) would let the
+   * job write files that become undeletable once `SESSION_CACHE_TTL`
+   * lapses. The caller turns a rejection into a 500 before anything is
+   * enqueued. */
+  await recordSessionOwnership(connection, session_id, sessionKey);
 
   const executionState: ExecutionState = {
     execution_id,
@@ -1282,6 +1336,7 @@ async function handleBlocking(
     principalSource: identity.principalSource,
     authContextHash: identity.authContextHash,
     apiKeyId,
+    bridgeWorkerId,
     startTime: Date.now(),
     lastActivity: Date.now(),
     mode: 'blocking',
@@ -1378,6 +1433,12 @@ async function handleBlocking(
       tenantId: identity.storageNamespace,
       canonicalUserId: identity.canonicalUserId,
       executionProfile: env.EXECUTION_PROFILE,
+      sandboxBackend: resolveQueuedSandboxBackend(
+        env.EXECUTION_PROFILE,
+        env.SANDBOX_BACKEND,
+        env.EXECUTION_PROFILE_SOURCE,
+      ),
+      ...(bridgeWorkerId != null ? { bridgeWorkerId } : {}),
       runtimeSessionMode: 'stateless',
       runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
       executionManifestClaims: sandboxSecurity.executionManifestClaims,

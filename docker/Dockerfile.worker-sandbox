@@ -11,12 +11,11 @@
 #   KVM_ENABLED=false
 #     Fedora worker
 #       -> direct sandbox process
-#         -> Debian NsJail via explicit Debian loader
-#         -> Debian sandbox rootfs
+#         -> static rootfs setup helper
+#           -> Debian userspace and NsJail
 #
-# The direct path needs a Fedora-built NsJail because the outer worker
-# container is Fedora 43. The MicroVM/rootfs path keeps a Debian-built
-# NsJail because the sandbox root filesystem is Debian Bookworm.
+# Direct mode atomically switches from the Fedora host userspace to the Debian
+# sandbox rootfs before starting the Debian-built NsJail.
 
 # ============================================================================
 # Stage 1a: Build NsJail for the Debian sandbox rootfs
@@ -43,48 +42,14 @@ RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
 RUN make -j$(nproc)
 
 COPY api/src/spec-guard.c /tmp/spec-guard.c
-RUN gcc -O2 -static \
-    -o /usr/local/bin/spec-guard \
-    /tmp/spec-guard.c \
-    && chmod 0111 /usr/local/bin/spec-guard
+COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
+RUN gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-rootfs-setup /tmp/rootfs-setup.c \
+    && chmod 0111 /usr/local/bin/spec-guard /usr/local/bin/sandbox-rootfs-setup
 
 
 # ============================================================================
-# Stage 1b: Build NsJail for the Fedora outer worker
-#
-# Required for KVM_ENABLED=false/direct mode.
-# Building it on Fedora avoids Debian/Fedora protobuf ABI mismatches.
-# ============================================================================
-FROM fedora:43 AS nsjail-builder-fedora
-
-WORKDIR /nsjail
-
-RUN dnf install -y \
-    git \
-    gcc \
-    gcc-c++ \
-    make \
-    bison \
-    flex \
-    protobuf-devel \
-    protobuf-compiler \
-    libnl3-devel \
-    pkgconf-pkg-config \
-    && dnf clean all
-
-RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
-    && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
-    && git submodule update --init --recursive
-
-RUN make -j$(nproc)
-
-# Fail the build immediately if the Fedora-built NsJail has unresolved deps.
-RUN ldd /nsjail/nsjail \
-    && ! ldd /nsjail/nsjail | grep -q "not found"
-
-
-# ============================================================================
-# Stage 1c: Build language runtime packages for the baked KVM root disk
+# Stage 1b: Build language runtime packages for the baked KVM root disk
 # ============================================================================
 FROM buildpack-deps:bookworm AS package-builder
 
@@ -132,6 +97,7 @@ RUN apt-install \
 RUN mkdir -p /pkgs
 
 COPY docker/package-init.sh /package-init.sh
+COPY python-packages.txt /python-packages.txt
 COPY javascript-packages.txt /javascript-packages.txt
 
 RUN chmod +x /package-init.sh \
@@ -149,6 +115,7 @@ COPY service/package.json service/bun.lock ./
 RUN bun install --frozen-lockfile
 
 COPY service/src ./src
+COPY packages/code/src /packages/code/src
 COPY shared /shared
 COPY service/tsconfig.json ./
 
@@ -250,6 +217,10 @@ RUN apt-install \
     antiword \
     catdoc \
     unrtf \
+    libimage-exiftool-perl \
+    mediainfo \
+    pst-utils \
+    djvulibre-bin \
     ffmpeg \
     graphviz \
     libcairo2 \
@@ -319,7 +290,6 @@ RUN rm -f \
     /usr/bin/unshare \
     /usr/bin/chroot \
     /usr/sbin/chroot \
-    /usr/bin/perl* \
     /usr/bin/apt \
     /usr/bin/apt-get \
     /usr/bin/dpkg \
@@ -408,40 +378,18 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     gawk \
     findutils \
     ca-certificates \
-    protobuf \
-    libnl3 \
     && dnf clean all
-
-# --------------------------------------------------------------------------
-# Direct NsJail execution support
-#
-# IMPORTANT:
-# This outer container is Fedora, therefore this must be the Fedora-built
-# NsJail binary, NOT the Debian-built binary used inside sandbox-rootfs.
-# --------------------------------------------------------------------------
-COPY --from=nsjail-builder-fedora /nsjail/nsjail /usr/sbin/nsjail
-
-# spec-guard is statically linked, so the Debian-built copy is safe here.
-COPY --from=nsjail-builder-debian /usr/local/bin/spec-guard /usr/local/bin/spec-guard
-
-RUN chmod +x \
-    /usr/sbin/nsjail \
-    /usr/local/bin/spec-guard
-
-# Fail image creation rather than discovering a broken dynamic link at runtime.
-RUN echo "Checking Fedora NsJail runtime dependencies..." \
-    && ldd /usr/sbin/nsjail \
-    && ! ldd /usr/sbin/nsjail | grep -q "not found"
 
 # Install Bun for the worker process.
 RUN curl -fsSL https://bun.sh/install | bash
 
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# --- Launcher ---
+# --- Launcher (runs on host, boots microVM) ---
 COPY --from=launcher-builder \
     /launcher/target/release/sandbox-launcher \
     /usr/local/bin/launcher
+COPY --from=nsjail-builder-debian /usr/local/bin/sandbox-rootfs-setup /sandbox-rootfs-setup
 
 # --- Launcher/direct-mode entrypoints ---
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
@@ -496,20 +444,6 @@ COPY --from=sandbox-rootfs / /sandbox-rootfs/
 
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
     && mkdir -p /host-packages
-
-# Direct-mode NsJail launcher.
-# /usr/sbin and /usr/lib are replaced by the Debian sandbox rootfs in the
-# child mount namespace, so invoke the Debian NsJail explicitly with its
-# matching dynamic loader and libraries.
-RUN printf '%s\n' \
-    '#!/bin/sh' \
-    'exec /sandbox-rootfs/lib64/ld-linux-x86-64.so.2 \' \
-    '  --library-path /sandbox-rootfs/lib/x86_64-linux-gnu:/sandbox-rootfs/usr/lib/x86_64-linux-gnu \' \
-    '  /sandbox-rootfs/usr/sbin/nsjail "$@"' \
-    > /opt/nsjail-direct \
-    && chmod 0555 /opt/nsjail-direct
-
-ENV NSJAIL_PATH=/opt/nsjail-direct
 
 # ============================================================================
 # KVM baked target

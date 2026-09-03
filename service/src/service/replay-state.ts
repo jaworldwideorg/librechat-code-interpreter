@@ -24,6 +24,11 @@ import { nanoid } from 'nanoid';
 import type { Redis } from 'ioredis';
 import type * as t from '../types';
 import type { LCTool } from '../preamble';
+import type {
+  ExecutionProfile,
+  ExecutionProfileSource,
+  SandboxBackendName,
+} from '../execution-profile';
 import { connection } from '../queue';
 import { env } from '../config';
 import { internalServiceHeaders } from '../internal-service-auth';
@@ -60,13 +65,13 @@ export const REPLAY_LOCK_TTL_MS = Math.max(10 * 60 * 1000, env.JOB_TIMEOUT * 2 +
  * Redis hash and the `_ptc_history.json` injected into the sandbox bounded
  * regardless of how pathological a single tool result is. Scaled
  * proportionally with `MAX_EXECUTION_STATE_BYTES` (ratio 1:2 vs exec_state). */
-export const MAX_TOOL_RESULT_BYTES = 5_000_000;
+export const MAX_TOOL_RESULT_BYTES = env.PTC_MAX_TOOL_RESULT_BYTES;
 
 /** Aggregate cap across ALL results persisted for a single execution. Scaled
  * proportionally with `MAX_EXECUTION_STATE_BYTES` (ratio 4:1 vs exec_state)
  * so a long replay flow can accumulate ~8 saturating tool results before
  * being asked to break work into a fresh execution. */
-export const MAX_TOOL_HISTORY_TOTAL_BYTES = 40_000_000;
+export const MAX_TOOL_HISTORY_TOTAL_BYTES = env.PTC_MAX_TOOL_HISTORY_TOTAL_BYTES;
 
 /** Maximum number of keys `scanKeys` will return in a single call. The janitor
  * runs every `STALE_CLEANUP_INTERVAL` and processes whatever this yields; if
@@ -109,6 +114,14 @@ export interface ExecutionState {
    *  after one `EXECUTION_STATE_TTL` window post a trusted-source
    *  apiKeyId invariant. */
   apiKeyId?: string;
+  /** Authenticated worker selection retained across every replay iteration. */
+  bridgeWorkerId?: string;
+  /** Original queue/backend target retained across replay continuations. */
+  sandboxBackend?: SandboxBackendName;
+  /** Original producer profile retained so continuations use the same queue. */
+  executionProfile?: ExecutionProfile;
+  /** Original profile source retained because inferred profiles use legacy queues. */
+  executionProfileSource?: ExecutionProfileSource;
   startTime: number;
   /**
    * Wall-clock ms of the last interaction that advanced this execution (initial

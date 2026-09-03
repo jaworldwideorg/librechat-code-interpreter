@@ -37,6 +37,16 @@ export interface SandboxExecuteContext {
   deadlineAtMs?: number;
   tenantId?: string;
   canonicalUserId?: string;
+  /** Trusted API-selected outbound worker. Presence requires a tenant-bound credential. */
+  bridgeWorkerId?: string;
+  /** Stable identifier for this queued iteration, used to derive an idempotent
+   * stateless launch token. PTC replay reuses one executionId across every
+   * iteration, so the executionId alone cannot separate them; the request body
+   * can, but it is rebuilt with a fresh egress grant and manifest on every job
+   * attempt, so hashing it would break RunMicrovm idempotency when BullMQ
+   * reprocesses a stalled job. The queued job id is distinct per iteration and
+   * stable across attempts of the same job. */
+  queuedJobId?: string;
   /** Absent ⇒ stateless execution (no runtime session affinity). */
   runtimeSessionId?: string;
   runtimeSessionMode: t.RuntimeSessionMode;
@@ -56,13 +66,18 @@ export type SandboxRawResponse = t.ExecuteResponse & {
 };
 
 export interface SandboxBackend {
-  readonly name: 'http' | 'lambda-microvm';
+  readonly name: 'http' | 'lambda-microvm' | 'remote-bridge';
   execute(req: SandboxTransportRequest, ctx: SandboxExecuteContext): Promise<SandboxRawResponse>;
   shutdown?(): Promise<void>;
 }
 
 export type SandboxBackendErrorCode =
   | 'RUNTIME_SESSION_BUSY'
+  | 'BRIDGE_WORKER_OFFLINE'
+  | 'BRIDGE_WORKER_UNAUTHORIZED'
+  | 'BRIDGE_WORKER_BUSY'
+  | 'BRIDGE_EXECUTION_FAILED'
+  | 'BRIDGE_DEADLINE_EXCEEDED'
   | 'MICROVM_LAUNCH_FAILED'
   | 'MICROVM_LAUNCH_THROTTLED'
   | 'MICROVM_UNHEALTHY'

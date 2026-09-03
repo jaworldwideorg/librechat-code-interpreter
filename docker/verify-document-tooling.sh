@@ -18,7 +18,8 @@ check_resources() {
         pdfinfo pdftotext pdftoppm pdffonts pdfimages qpdf gs mutool \
         fc-match rsvg-convert magick convert identify vips libreoffice pandoc \
         tesseract sqlite3 xmllint xmlstarlet rg tree diff patch uchardet icuinfo \
-        antiword catdoc unrtf ffmpeg ffprobe dot
+        antiword catdoc unrtf exiftool mediainfo readpst cjb2 ddjvu \
+        ffmpeg ffprobe dot
 
     test -r /etc/fonts/fonts.conf
     test -d /usr/share/fonts
@@ -98,6 +99,12 @@ if [ "$mode" = "--system" ]; then
     identify "$work_dir/vector.png" | grep -q PNG
     magick "$work_dir/vector.png" "$work_dir/vector.webp"
     test -s "$work_dir/vector.webp"
+    exiftool -FileType "$work_dir/vector.webp" | grep -q WEBP
+
+    printf '%s\n' 'P1' '2 2' '0 1' '1 0' > "$work_dir/monochrome.pbm"
+    cjb2 "$work_dir/monochrome.pbm" "$work_dir/document.djvu"
+    ddjvu -format=ppm "$work_dir/document.djvu" "$work_dir/document.ppm"
+    test -s "$work_dir/document.ppm"
 
     printf '%s\n' 'digraph G { input -> output }' | dot -Tsvg > "$work_dir/graph.svg"
     test -s "$work_dir/graph.svg"
@@ -111,6 +118,8 @@ if [ "$mode" = "--system" ]; then
         "$work_dir/tone.wav"
     ffprobe -v error -show_entries format=duration -of default=nw=1 "$work_dir/tone.wav" \
         | grep -q '^duration='
+    mediainfo --Output=JSON "$work_dir/tone.wav" | jq -e '.media.track | length > 0' >/dev/null
+    readpst -V >/dev/null
 
     exit 0
 fi
@@ -120,7 +129,12 @@ if [ "$mode" = "--python" ]; then
     test -n "$python_bin"
     python_dir="$(dirname "$python_bin")"
 
-    "$python_bin" -c 'import magic, ocrmypdf, pikepdf, pymupdf, weasyprint'
+    "$python_bin" -c 'import csvkit, ebooklib, extract_msg, importlib.util, magic, ocrmypdf, pikepdf, pymupdf, pypdf, weasyprint; assert importlib.util.find_spec("PyPDF2") is None'
+    "$python_bin" -c \
+        'from ebooklib import epub; book = epub.EpubBook(); book.set_identifier("ja"); book.set_title("JA Worldwide"); book.set_language("en"); chapter = epub.EpubHtml(title="Document", file_name="document.xhtml"); chapter.content = "<h1>JA Worldwide</h1>"; book.add_item(chapter); book.spine = ["nav", chapter]; epub.write_epub("'"$work_dir"'/document.epub", book)'
+    test -s "$work_dir/document.epub"
+    printf '%s\n' 'name,value' 'JA Worldwide,1' > "$work_dir/table.csv"
+    "$python_dir/csvcut" -c name "$work_dir/table.csv" | grep -q 'JA Worldwide'
     "$python_bin" -c \
         'from weasyprint import HTML; HTML(string="<h1>JA Worldwide</h1><p>Español العربية 中文 हिन्दी Русский</p>").write_pdf("'"$work_dir"'/weasyprint.pdf")'
     test -s "$work_dir/weasyprint.pdf"

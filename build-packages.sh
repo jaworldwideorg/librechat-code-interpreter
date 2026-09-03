@@ -31,6 +31,24 @@ NODE_VERSION="${NODE_VERSION:-24.15.0}"
 BUN_VERSION="${BUN_VERSION:-1.3.14}"
 PACKAGES_DIR="./data/pkgs"
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
+PYTHON_PACKAGE_MANIFEST="${PYTHON_PACKAGE_MANIFEST:-${SCRIPT_DIR}/python-packages.txt}"
+
+load_python_packages() {
+    if [ ! -f "$PYTHON_PACKAGE_MANIFEST" ]; then
+        echo "Missing Python package manifest: $PYTHON_PACKAGE_MANIFEST"
+        exit 1
+    fi
+
+    PYTHON_PACKAGES=()
+    while IFS= read -r package_spec || [ -n "$package_spec" ]; do
+        [[ "$package_spec" =~ ^[[:space:]]*(#|$) ]] && continue
+        PYTHON_PACKAGES+=("$package_spec")
+    done < "$PYTHON_PACKAGE_MANIFEST"
+    if [ "${#PYTHON_PACKAGES[@]}" -eq 0 ]; then
+        echo "Python package manifest is empty: $PYTHON_PACKAGE_MANIFEST"
+        exit 1
+    fi
+}
 
 load_js_packages() {
     if [ ! -f "$JS_PACKAGE_MANIFEST" ]; then
@@ -67,6 +85,12 @@ if should_load_js_packages; then
     load_js_packages
 else
     JS_PACKAGES=()
+fi
+
+if [ "${SKIP_PYTHON:-}" != "1" ] && [ "${SKIP_PYTHON_PACKAGES:-}" != "1" ]; then
+    load_python_packages
+else
+    PYTHON_PACKAGES=()
 fi
 
 ARCH=$(uname -m)
@@ -153,91 +177,25 @@ install_python_packages() {
         return 0
     fi
 
-    local pip_path="/pkgs/python/${PYTHON_VERSION}/bin/pip3"
+    local pkg_dest="/pkgs/python/${PYTHON_VERSION}"
+    local pip_path="${pkg_dest}/bin/pip3"
 
     echo "=============================================="
     echo "  Installing Python packages"
     echo "=============================================="
 
-    # MarkItDown 0.1.x initializes Magika/ONNX at import time; the aarch64
-    # onnxruntime wheel segfaults under NsJail. 0.0.2 still supports PPTX via
-    # python-pptx without that native dependency.
     local python_packages_installed=false
-    if docker exec "$CONTAINER_NAME" "$pip_path" install \
-        openpyxl \
-        matplotlib \
-        numpy \
-        pandas \
-        lifelines \
-        scipy \
-        statsmodels \
-        pillow \
-        scikit-learn \
-        scikit-image \
-        networkx \
-        sympy \
-        wordcloud \
-        pypdf2 \
-        pypdf \
-        pymupdf \
-        pikepdf \
-        pdfplumber \
-        python-docx \
-        imageio \
-        seaborn \
-        plotly \
-        beautifulsoup4 \
-        tabulate \
-        xlrd \
-        numba \
-        patsy \
-        numexpr \
-        pyarrow \
-        chdb==4.1.6 \
-        markitdown==0.0.2 \
-        python-pptx \
-        xlsxwriter \
-        docx2python \
-        docxtpl \
-        mammoth \
-        pdf2image \
-        "pdfminer.six" \
-        reportlab \
-        opencv-python-headless \
-        svglib \
-        cairosvg \
-        weasyprint \
-        python-magic \
-        lxml \
-        defusedxml \
-        odfpy \
-        markdown \
-        jinja2 \
-        exifread \
-        hachoir \
-        python-barcode \
-        qrcode \
-        fonttools \
-        pytesseract \
-        ocrmypdf \
-        graphviz \
-        vsdx \
-        rasterio \
-        rioxarray \
-        geopandas \
-        pyogrio \
-        pyproj \
-        osmnx \
-        folium \
-        gpxpy; then
+    if docker exec "$CONTAINER_NAME" "$pip_path" install "${PYTHON_PACKAGES[@]}"; then
         python_packages_installed=true
     else
         echo "ERROR: Python package installation failed"
         return 1
     fi
 
+    docker exec "$CONTAINER_NAME" "$pip_path" uninstall -y PyPDF2 >/dev/null 2>&1 || true
+
     if ! docker exec "$CONTAINER_NAME" "${pkg_dest}/bin/python3" -c \
-        "import bz2, ctypes, defusedxml, graphviz, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib"; then
+        "import bz2, csvkit, ctypes, defusedxml, ebooklib, extract_msg, graphviz, importlib.util, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib; assert importlib.util.find_spec('PyPDF2') is None"; then
         echo "ERROR: Python dependency verification failed"
         return 1
     fi

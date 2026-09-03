@@ -25,6 +25,26 @@ BUN_VERSION="${BUN_VERSION:-1.3.14}"
 BASH_PACKAGE_VERSION="${BASH_PACKAGE_VERSION:-5.2.0}"
 INSTALL_FAILED=false
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
+PYTHON_PACKAGE_MANIFEST="${PYTHON_PACKAGE_MANIFEST:-${SCRIPT_DIR}/python-packages.txt}"
+
+load_python_packages() {
+    if [ ! -f "$PYTHON_PACKAGE_MANIFEST" ]; then
+        echo "ERROR: Missing Python package manifest: $PYTHON_PACKAGE_MANIFEST"
+        INSTALL_FAILED=true
+        PYTHON_PACKAGES=()
+        return
+    fi
+
+    PYTHON_PACKAGES=()
+    while IFS= read -r package_spec || [ -n "$package_spec" ]; do
+        [[ "$package_spec" =~ ^[[:space:]]*(#|$) ]] && continue
+        PYTHON_PACKAGES+=("$package_spec")
+    done < "$PYTHON_PACKAGE_MANIFEST"
+    if [ "${#PYTHON_PACKAGES[@]}" -eq 0 ]; then
+        echo "ERROR: Python package manifest is empty: $PYTHON_PACKAGE_MANIFEST"
+        INSTALL_FAILED=true
+    fi
+}
 
 load_js_packages() {
     if [ ! -f "$JS_PACKAGE_MANIFEST" ]; then
@@ -80,6 +100,7 @@ js_packages_ready() {
 }
 
 load_js_packages
+load_python_packages
 
 echo "=============================================="
 echo "  Code Interpreter - Package Init"
@@ -96,6 +117,10 @@ packages_ready() {
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/pypdf" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/pymupdf" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/weasyprint" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/csvkit" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/extract_msg" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/ebooklib" ] &&
+    [ ! -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/PyPDF2" ] &&
     [ -f "/pkgs/node/${NODE_VERSION}/.package-installed" ] &&
     js_packages_ready "/pkgs/node/${NODE_VERSION}" &&
     [ -f "/pkgs/bun/${BUN_VERSION}/.package-installed" ] &&
@@ -184,84 +209,17 @@ if [ -f "$PIP_PATH" ]; then
         PYTHON_INSTALL_CMD=("${PKG_DEST}/bin/uv" pip install --python "${PKG_DEST}/bin/python3")
     fi
 
-    # MarkItDown 0.1.x initializes Magika/ONNX at import time; the aarch64
-    # onnxruntime wheel segfaults under NsJail. 0.0.2 still supports PPTX via
-    # python-pptx without that native dependency.
-    if ! "${PYTHON_INSTALL_CMD[@]}" \
-        openpyxl \
-        matplotlib \
-        numpy \
-        pandas \
-        lifelines \
-        scipy \
-        statsmodels \
-        pillow \
-        scikit-learn \
-        scikit-image \
-        networkx \
-        sympy \
-        wordcloud \
-        pypdf2 \
-        pypdf \
-        pymupdf \
-        pikepdf \
-        pdfplumber \
-        python-docx \
-        imageio \
-        seaborn \
-        plotly \
-        beautifulsoup4 \
-        tabulate \
-        xlrd \
-        numba \
-        patsy \
-        numexpr \
-        pyarrow \
-        chdb==4.1.6 \
-        markitdown==0.0.2 \
-        python-pptx \
-        xlsxwriter \
-        docx2python \
-        docxtpl \
-        mammoth \
-        pdf2image \
-        "pdfminer.six" \
-        reportlab \
-        opencv-python-headless \
-        svglib \
-        cairosvg \
-        weasyprint \
-        python-magic \
-        lxml \
-        defusedxml \
-        odfpy \
-        markdown \
-        jinja2 \
-        exifread \
-        hachoir \
-        python-barcode \
-        qrcode \
-        fonttools \
-        pytesseract \
-        ocrmypdf \
-        graphviz \
-        vsdx \
-        rasterio \
-        rioxarray \
-        geopandas \
-        pyogrio \
-        pyproj \
-        osmnx \
-        folium \
-        gpxpy; then
+    if ! "${PYTHON_INSTALL_CMD[@]}" "${PYTHON_PACKAGES[@]}"; then
         echo "ERROR: Python package installation failed"
         INSTALL_FAILED=true
     else
         PYTHON_PACKAGES_INSTALLED=true
     fi
 
+    "$PIP_PATH" uninstall -y PyPDF2 >/dev/null 2>&1 || true
+
     if [ "$PYTHON_PACKAGES_INSTALLED" = true ] && ! "$PKG_DEST/bin/python3" -c \
-        "import bz2, ctypes, defusedxml, graphviz, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib"; then
+        "import bz2, csvkit, ctypes, defusedxml, ebooklib, extract_msg, graphviz, importlib.util, lxml, lzma, magic, markdown, ocrmypdf, odf, pdfplumber, pikepdf, pymupdf, pypdf, sqlite3, ssl, tkinter, weasyprint, zlib; assert importlib.util.find_spec('PyPDF2') is None"; then
         echo "ERROR: Python dependency verification failed"
         PYTHON_PACKAGES_INSTALLED=false
         INSTALL_FAILED=true

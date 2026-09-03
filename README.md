@@ -15,6 +15,8 @@ Code Interpreter (internally `codeapi`, the prefix used by its env vars, images,
 - **Package Delivery** - Bakes Python, Node, and Bun into the default microVM
   block-root image; a package-init PVC mode remains available for direct NsJail
   development
+- **Remote Code Bridge** - Lets an operator-owned VM connect outbound and serve
+  as a fenced, stateful sandbox through the `@librechat/code` worker
 
 ## Architecture
 
@@ -35,7 +37,9 @@ Set `CODEAPI_EXECUTION_PROFILE` consistently on an API deployment and its
 workers. The default profile keeps the existing `python-queue` and
 `other-queue`; the stateful profile uses `stateful-python-queue` and
 `stateful-other-queue`. This allows both deployments to share Redis without
-cross-consuming jobs.
+cross-consuming jobs. The `remote-bridge` backend additionally uses
+`remote-bridge-python-queue` and `remote-bridge-other-queue`, fencing attached
+worker jobs from Lambda consumers during rolling deployments.
 
 An existing Lambda MicroVM deployment upgraded from a pre-profile release may
 leave `CODEAPI_EXECUTION_PROFILE` unset for its first binary rollout. An
@@ -65,6 +69,18 @@ Two modes are supported:
 - **NsJail mode** (`kvmEnabled: false`): Direct NsJail sandboxing with Linux namespaces and cgroups
 - **MicroVM mode** (`kvmEnabled: true`): libkrun microVM with its own kernel, NsJail runs inside the guest
 
+## Remote stateful environments
+
+The `remote-bridge` backend keeps the Code API as the policy and queue boundary
+while moving execution to a sandbox on an operator-selected VM. The worker only
+makes outbound authenticated requests, so the VM does not need a public ingress
+port. Assignments carry a deadline, a single-active-worker lock, a monotonically
+increasing generation, and a one-time lease token to fence stale workers.
+
+See [Remote Code Bridge](docs/remote-bridge/README.md) for deployment and threat
+model details. The worker protocol and CLI live in the provider-neutral
+[`@librechat/code`](packages/code/README.md) package.
+
 ## Security disclaimer
 
 This service exists to run arbitrary, untrusted code — treat every
@@ -86,6 +102,26 @@ privilege, keep hosts patched, and deploy responsibly. If you believe you
 have found a vulnerability, please report it privately rather than opening a
 public issue (see [CONTRIBUTING](CONTRIBUTING.md)).
 
+## Releases
+
+Deployments should pin a [tagged release](https://github.com/LibreChat-AI/code-interpreter/releases)
+rather than track `main`, which moves whenever an internal snapshot is merged:
+
+```bash
+git clone --branch v2.0.0 --depth 1 https://github.com/LibreChat-AI/code-interpreter.git
+```
+
+Every release attaches `codeapi-<chart version>.tgz`, the packaged Helm chart
+with its Redis and MinIO subcharts vendored:
+
+```bash
+helm install codeapi ./codeapi-0.3.0.tgz -f my-values.yaml
+```
+
+Versions are `vMAJOR.MINOR.PATCH`, with `-rcN` release candidates published as
+pre-releases. See [docs/RELEASING.md](docs/RELEASING.md) for how releases are
+cut.
+
 ## Local Development
 
 ```bash
@@ -105,8 +141,10 @@ The sandbox image includes a document-processing toolchain for inspecting and
 rendering PDF, Office, image, SVG, OCR, archive, media, and Graphviz outputs.
 Language package builds also install the corresponding Python libraries,
 including PyMuPDF, pypdf, pikepdf, pdfplumber, WeasyPrint, python-magic,
-OCRmyPDF, lxml, and defusedxml. Rebuild both the package tree and sandbox image
-after changing these dependencies:
+OCRmyPDF, lxml, defusedxml, csvkit, extract-msg, and EbookLib. The shared
+top-level Python package list lives in `python-packages.txt`; PyPDF2 is removed
+in favor of pypdf. Rebuild both the package tree and sandbox image after
+changing these dependencies:
 
 ```bash
 FORCE_REBUILD=1 ./build-packages.sh
@@ -117,7 +155,8 @@ The bundled Noto font families cover Latin, Arabic, Cyrillic, Indic, CJK, and
 emoji text. Tesseract includes orientation detection plus English, Spanish,
 Portuguese, Arabic, Simplified Chinese, French, Hindi, and Russian recognition.
 Legacy Word, Excel, and RTF inspection is available through Antiword, Catdoc,
-and UnRTF.
+and UnRTF. ExifTool, MediaInfo, PST utilities, and DjVu utilities provide
+additional metadata, media, email-archive, and document inspection support.
 
 The image build performs functional document-tooling checks rather than only
 checking binary presence. The sandbox startup probe also verifies that NsJail

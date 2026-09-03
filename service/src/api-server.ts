@@ -18,6 +18,8 @@ import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-
 import { localAuth } from './auth/local';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
+import bridgeRouter from './bridge';
+import workspaceToolsRouter from './workspace-tools';
 import { connection } from './queue';
 import { metricsHandler } from './metrics';
 import { httpMetricsMiddleware } from './middleware/httpMetrics';
@@ -51,8 +53,10 @@ app.get('/v1/health', async (_, res) => {
   }
 });
 
+v1.use('/bridge', bridgeRouter);
 v1.use(isLocalMode ? localAuth : apiKeyAuth);
 
+v1.use(workspaceToolsRouter);
 v1.use(serviceRouter);
 v1.use(programmaticRouter);
 

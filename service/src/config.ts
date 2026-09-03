@@ -210,6 +210,17 @@ export function lambdaMicrovmNumericConfigError(
   return undefined;
 }
 
+export function resolvePositiveIntEnv(raw: string | undefined, defaultValue: number): number {
+  if (raw == null || raw.trim() === '') {
+    return defaultValue;
+  }
+  const parsed = Math.floor(Number(raw));
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
 export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
   const defaultTtlSeconds = Math.max(1, Math.ceil((jobTimeoutMs + EGRESS_GRANT_GRACE_MS) / 1000));
   if (rawTtlSeconds == null || rawTtlSeconds.trim() === '') {
@@ -243,12 +254,12 @@ function configuredChoice<T extends string>(
 
 export function resolveSandboxBackend(
   raw: string | undefined,
-): 'http' | 'lambda-microvm' {
+): 'http' | 'lambda-microvm' | 'remote-bridge' {
   return configuredChoice(
     raw,
     'CODEAPI_SANDBOX_BACKEND',
     'http',
-    ['http', 'lambda-microvm'],
+    ['http', 'lambda-microvm', 'remote-bridge'],
   );
 }
 
@@ -263,8 +274,20 @@ export function resolveRuntimeSessionMode(
   );
 }
 
+export function resolveBridgeAuthMode(
+  raw: string | undefined,
+): 'static' | 'paired' {
+  return configuredChoice(
+    raw,
+    'CODEAPI_BRIDGE_AUTH_MODE',
+    'static',
+    ['static', 'paired'],
+  );
+}
+
 const sandboxBackend = resolveSandboxBackend(process.env.CODEAPI_SANDBOX_BACKEND);
 const runtimeSessionMode = resolveRuntimeSessionMode(process.env.CODEAPI_RUNTIME_SESSION_MODE);
+const bridgeAuthMode = resolveBridgeAuthMode(process.env.CODEAPI_BRIDGE_AUTH_MODE);
 
 export const env = {
   PORT: process.env.SERVICE_PORT ?? 3112,
@@ -280,6 +303,9 @@ export const env = {
   EGRESS_GATEWAY_FILE_SERVER_URL: process.env.EGRESS_GATEWAY_FILE_SERVER_URL ?? process.env.FILE_SERVER_URL ?? 'http://localhost:3000',
   EGRESS_GATEWAY_TOOL_CALL_SERVER_URL: process.env.EGRESS_GATEWAY_TOOL_CALL_SERVER_URL ?? process.env.TOOL_CALL_SERVER_URL ?? 'http://localhost:3033',
   EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES: Number(process.env.EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES) || 1024 * 1024,
+  // Per-entry / aggregate caps for PTC tool results persisted in `tool_history:` (see replay-state.ts).
+  PTC_MAX_TOOL_RESULT_BYTES: resolvePositiveIntEnv(process.env.PTC_MAX_TOOL_RESULT_BYTES, 5_000_000),
+  PTC_MAX_TOOL_HISTORY_TOTAL_BYTES: resolvePositiveIntEnv(process.env.PTC_MAX_TOOL_HISTORY_TOTAL_BYTES, 40_000_000),
   EGRESS_GATEWAY_MAX_FILE_BYTES: Number(process.env.EGRESS_GATEWAY_MAX_FILE_BYTES ?? process.env.SANDBOX_MAX_FILE_SIZE) || 10_000_000,
   EGRESS_GATEWAY_MAX_PATH_LENGTH: Number(process.env.EGRESS_GATEWAY_MAX_PATH_LENGTH ?? process.env.SANDBOX_MAX_PATH_LENGTH) || 256,
   EGRESS_GATEWAY_MAX_NESTING_DEPTH: Number(process.env.EGRESS_GATEWAY_MAX_NESTING_DEPTH ?? process.env.SANDBOX_MAX_NESTING_DEPTH) || 10,
@@ -310,6 +336,16 @@ export const env = {
   FETCH_MAX_REQUESTS: Number(process.env.FETCH_MAX_REQUESTS) || 120, // 120 requests per minute
   // Redis Key Cache Config
   SESSION_CACHE_TTL: Number(process.env.SESSION_CACHE_TTL) || 86400,
+  /** TTL for the durable `session-owner:<session_id>` record that backs
+   *  deletion after `SESSION_CACHE_TTL` has lapsed (see
+   *  `session-ownership.ts`). Sized to outlive a client's retention
+   *  window — LibreChat sweeps expired files at 30 days by default, and a
+   *  shorter value here reinstates the leak it exists to close. Clamped
+   *  so it can never be tighter than the cache TTL. */
+  SESSION_OWNER_TTL: Math.max(
+    Number(process.env.SESSION_OWNER_TTL) || 90 * 86400,
+    Number(process.env.SESSION_CACHE_TTL) || 86400,
+  ),
   /** Strict tenant isolation. When true, sessionKey resolution fails closed
    *  (500) on requests whose auth context lacks `tenantId`, instead of
    *  silently falling back to the `'legacy'` tenant prefix. Default OFF in
@@ -350,8 +386,17 @@ export const env = {
    * - `http` (default): POST signed execute requests to SANDBOX_ENDPOINT
    *   (current Kubernetes/libkrun sandbox-runner).
    * - `lambda-microvm`: AWS Lambda MicroVM backend.
+   * - `remote-bridge`: dispatch to an outbound-connected @librechat/code worker.
    */
   SANDBOX_BACKEND: sandboxBackend,
+  /** Permit trusted callers to route each execution to a paired worker ID. */
+  BRIDGE_DYNAMIC_WORKERS: process.env.CODEAPI_BRIDGE_DYNAMIC_WORKERS === 'true',
+  /** Outbound worker selected by the remote-bridge backend. */
+  BRIDGE_WORKER_ID: process.env.CODEAPI_BRIDGE_WORKER_ID ?? '',
+  /** Static compatibility auth or short-lived proof-of-possession credentials. */
+  BRIDGE_AUTH_MODE: bridgeAuthMode,
+  /** Enrollment and lease credential shared only with the configured worker. */
+  BRIDGE_TOKEN: process.env.CODEAPI_BRIDGE_TOKEN ?? '',
   /**
    * Runtime session affinity for stateful sandbox backends.
    * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.

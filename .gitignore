@@ -1,5 +1,6 @@
 data/
 node_modules
+packages/*/dist/
 .env
 .git
 .npmrc
@@ -12,6 +13,7 @@ node_modules
 # Helm artifacts
 helm/*/charts/*.tgz
 helm/*/Chart.lock
+/dist/
 
 # Local sandbox runtime data (docker volume mount)
 data/
