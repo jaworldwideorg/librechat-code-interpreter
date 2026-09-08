@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { link, lstat, open, realpath, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { FileHandle } from 'node:fs/promises';
@@ -14,6 +14,7 @@ import {
   BRIDGE_WORKSPACE_LIST_MAX_RESULTS,
   BRIDGE_WORKSPACE_SEARCH_MAX_RESULTS,
   BRIDGE_WORKSPACE_SEARCH_TEXT_MAX_LENGTH,
+  comparePortableRelativePaths,
   isSafePortableRelativePath,
   isValidBridgeWorkspaceToolCapabilities,
   isWorkspaceToolRequest,
@@ -27,6 +28,8 @@ import type {
   WorkspaceReadFileResult,
   WorkspaceEditFileRequest,
   WorkspaceEditFileResult,
+  WorkspacePreviewEditRequest,
+  WorkspacePreviewEditResult,
   WorkspaceExecuteCommandRequest,
   WorkspaceExecuteCommandResult,
   WorkspaceListFilesRequest,
@@ -47,6 +50,8 @@ export type {
   WorkspaceReadFileResult,
   WorkspaceEditFileRequest,
   WorkspaceEditFileResult,
+  WorkspacePreviewEditRequest,
+  WorkspacePreviewEditResult,
   WorkspaceExecuteCommandRequest,
   WorkspaceExecuteCommandResult,
   WorkspaceListFilesRequest,
@@ -119,7 +124,7 @@ const READ_OPERATIONS = [
   'search_text',
   'list_files',
 ] as const;
-const WRITE_OPERATIONS = ['write_file', 'edit_file'] as const;
+const WRITE_OPERATIONS = ['write_file', 'preview_edit', 'edit_file'] as const;
 
 function isUtf8ScalarString(value: string): boolean {
   return Buffer.from(value).toString('utf8') === value;
@@ -455,6 +460,7 @@ async function atomicWriteConfinedFile(
   content: Buffer,
   signal?: AbortSignal,
   expected?: { dev: bigint | number; ino: bigint | number; content: Buffer },
+  allowOverwrite = true,
 ): Promise<{ created: boolean }> {
   throwIfAborted(signal);
   if (content.byteLength > BRIDGE_WORKSPACE_WRITE_MAX_BYTES) {
@@ -488,6 +494,12 @@ async function atomicWriteConfinedFile(
   if (existing?.isSymbolicLink() || (existing != null && !existing.isFile())) {
     throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
   }
+  if (!allowOverwrite && existing != null) {
+    throw new WorkspaceToolError(
+      'Workspace file already exists',
+      'EDIT_CONFLICT',
+    );
+  }
   if (
     expected != null &&
     (existing == null ||
@@ -506,6 +518,7 @@ async function atomicWriteConfinedFile(
   );
   const installTarget = resolve(canonicalParent, basename(candidate));
   let handle: FileHandle | undefined;
+  let temporaryNeedsCleanup = true;
   let staged: { dev: bigint | number; ino: bigint | number; content: Buffer };
   try {
     handle = await open(
@@ -588,10 +601,36 @@ async function atomicWriteConfinedFile(
         staged,
         signal,
       );
+      temporaryNeedsCleanup = false;
       return { created: false };
     }
     throwIfAborted(signal);
-    await rename(temporary, installTarget);
+    if (allowOverwrite) {
+      await rename(temporary, installTarget);
+      temporaryNeedsCleanup = false;
+    } else {
+      try {
+        await link(temporary, installTarget);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          throw new WorkspaceToolError(
+            'Workspace file already exists',
+            'EDIT_CONFLICT',
+          );
+        }
+        throw error;
+      }
+      try {
+        await unlink(temporary);
+        temporaryNeedsCleanup = false;
+      } catch {
+        throw new WorkspaceToolError(
+          'Workspace create cleanup could not be confirmed',
+          'WRITE_UNAVAILABLE',
+          true,
+        );
+      }
+    }
     await confirmInstalledMutation(root, installTarget, staged);
     return { created: existing == null };
   } catch (error) {
@@ -602,7 +641,9 @@ async function atomicWriteConfinedFile(
     );
   } finally {
     await handle?.close().catch(() => undefined);
-    await unlink(temporary).catch(() => undefined);
+    if (temporaryNeedsCleanup) {
+      await unlink(temporary).catch(() => undefined);
+    }
   }
 }
 
@@ -617,6 +658,8 @@ async function writeWorkspaceFile(
     request.path,
     content,
     signal,
+    undefined,
+    request.overwrite !== false,
   );
   return {
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
@@ -660,34 +703,17 @@ async function editWorkspaceFile(
       );
     }
     const original = await readBoundedEditFile(opened);
-    const hasBom =
-      original[0] === 0xef && original[1] === 0xbb && original[2] === 0xbf;
-    const body = hasBom ? original.subarray(3) : original;
-    const text = body.toString('utf8');
-    if (!Buffer.from(text, 'utf8').equals(body)) {
-      throw new WorkspaceToolError(
-        'Workspace file is not UTF-8 text',
-        'INVALID_REQUEST',
-      );
-    }
-    const first = text.indexOf(request.oldText);
     if (
-      first < 0 ||
-      text.indexOf(request.oldText, first + 1) >= 0
+      request.expectedBaseSha256 !== undefined &&
+      createHash('sha256').update(original).digest('hex') !==
+        request.expectedBaseSha256
     ) {
       throw new WorkspaceToolError(
-        'Workspace edit must match exactly once',
+        'Workspace file changed after edit preview',
         'EDIT_CONFLICT',
       );
     }
-    const updatedText =
-      text.slice(0, first) +
-      request.newText +
-      text.slice(first + request.oldText.length);
-    const updatedBody = Buffer.from(updatedText, 'utf8');
-    const updated = hasBom
-      ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), updatedBody])
-      : updatedBody;
+    const { updated, replacements } = applyWorkspaceEdits(original, request);
     await atomicWriteConfinedFile(
       root,
       request.path,
@@ -704,7 +730,7 @@ async function editWorkspaceFile(
       operation: 'edit_file',
       workspaceId: request.workspaceId,
       path: request.path,
-      replacements: 1,
+      replacements,
       bytesWritten: updated.byteLength,
     };
   } catch (error) {
@@ -713,6 +739,84 @@ async function editWorkspaceFile(
   } finally {
     await opened?.close().catch(() => undefined);
   }
+}
+
+function applyWorkspaceEdits(
+  original: Buffer,
+  request: WorkspaceEditFileRequest | WorkspacePreviewEditRequest,
+): { updated: Buffer; replacements: number } {
+  const hasBom =
+    original[0] === 0xef && original[1] === 0xbb && original[2] === 0xbf;
+  const body = hasBom ? original.subarray(3) : original;
+  const text = body.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(body)) {
+    throw new WorkspaceToolError(
+      'Workspace file is not UTF-8 text',
+      'INVALID_REQUEST',
+    );
+  }
+  const edits = request.edits ?? [
+    { oldText: request.oldText ?? '', newText: request.newText ?? '' },
+  ];
+  let updatedText = text;
+  for (const edit of edits) {
+    const first = updatedText.indexOf(edit.oldText);
+    if (first < 0 || updatedText.indexOf(edit.oldText, first + 1) >= 0) {
+      throw new WorkspaceToolError(
+        'Workspace edit must match exactly once',
+        'EDIT_CONFLICT',
+      );
+    }
+    updatedText =
+      updatedText.slice(0, first) +
+      edit.newText +
+      updatedText.slice(first + edit.oldText.length);
+  }
+  const updatedBody = Buffer.from(updatedText, 'utf8');
+  const updated = hasBom
+    ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), updatedBody])
+    : updatedBody;
+  if (updated.byteLength > BRIDGE_WORKSPACE_WRITE_MAX_BYTES) {
+    throw new WorkspaceToolError(
+      'Workspace file exceeds write limit',
+      'WRITE_LIMIT_EXCEEDED',
+    );
+  }
+  return { updated, replacements: edits.length };
+}
+
+async function previewWorkspaceEdit(
+  root: string,
+  request: WorkspacePreviewEditRequest,
+  signal?: AbortSignal,
+): Promise<WorkspacePreviewEditResult> {
+  const original = await readConfinedFileBuffer(root, request.path);
+  if (signal?.aborted) {
+    throw new WorkspaceToolError(
+      'Workspace tool execution aborted',
+      'EXECUTION_ABORTED',
+    );
+  }
+  const { updated, replacements } = applyWorkspaceEdits(original, request);
+  if (signal?.aborted) {
+    throw new WorkspaceToolError(
+      'Workspace tool execution aborted',
+      'EXECUTION_ABORTED',
+    );
+  }
+  const hasUtf8Bom =
+    updated[0] === 0xef && updated[1] === 0xbb && updated[2] === 0xbf;
+  return {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    operation: 'preview_edit',
+    workspaceId: request.workspaceId,
+    path: request.path,
+    content: decodeWorkspaceText(updated),
+    hasUtf8Bom,
+    baseSha256: createHash('sha256').update(original).digest('hex'),
+    replacements,
+    bytesWritten: updated.byteLength,
+  };
 }
 
 interface SearchCandidates {
@@ -736,6 +840,10 @@ async function listSearchCandidates(
         '--files',
         '--no-config',
         '--no-follow',
+        /* Deterministic order, as list_files uses: without it ripgrep's parallel
+         * walk decides both result order and which files survive truncation. */
+        '--sort',
+        'path',
         '--path-separator',
         '/',
         '--null',
@@ -1049,192 +1157,213 @@ async function listWorkspaceFiles(
     .filter((segment) => segment.length > 0 && segment !== '.')
     .join('/');
   const requestedResultPath = normalizedRequestedResultPath || undefined;
+  let afterPath = request.afterPath;
 
-  const candidates: Array<{ filesystemPath: string; resultPath: string }> = [];
-  let truncated = false;
-  let pending: Buffer = Buffer.alloc(0);
-  let stoppedForLimit = false;
-  await new Promise<void>((resolvePromise, reject) => {
-    const args = [
-      '--files',
-      '--no-config',
-      '--no-follow',
-      '--no-messages',
-      '--sort',
-      'path',
-      '--null',
-    ];
-    if (portableCanonicalListPath !== '.') {
-      args.push(
-        '--glob',
-        canonicalTargetIsDirectory
-          ? `${portableCanonicalListPath}/**`
-          : portableCanonicalListPath,
-      );
-    }
-    args.push('--', '.');
-    const child = spawn(
-      'rg',
-      args,
-      { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    let aborted = false;
-    let timedOut = false;
-    const abort = () => {
-      aborted = true;
-      child.kill();
-    };
-    signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted) abort();
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, Math.max(0, deadline - Date.now()));
-    const cleanup = () => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', abort);
-    };
-    const pathDecoder = new TextDecoder('utf-8', {
-      fatal: true,
-      ignoreBOM: true,
-    });
-    const consumePath = (rawPath: Buffer) => {
-      if (rawPath.length === 0 || stoppedForLimit) return;
-      let path: string;
-      try {
-        path = pathDecoder.decode(rawPath);
-      } catch {
-        return;
+  for (;;) {
+    await withinListDeadline(Promise.resolve(), signal, deadline);
+    const candidates: Array<{ filesystemPath: string; resultPath: string }> = [];
+    let truncated = false;
+    let pending: Buffer = Buffer.alloc(0);
+    let stoppedForLimit = false;
+    await new Promise<void>((resolvePromise, reject) => {
+      const args = [
+        '--files',
+        '--no-config',
+        '--no-follow',
+        '--no-messages',
+        '--sort',
+        'path',
+        '--null',
+      ];
+      if (portableCanonicalListPath !== '.') {
+        args.push(
+          '--glob',
+          canonicalTargetIsDirectory
+            ? `${portableCanonicalListPath}/**`
+            : portableCanonicalListPath,
+        );
       }
-      if (!Buffer.from(path).equals(rawPath)) return;
-      if (candidates.length === maxResults + BRIDGE_WORKSPACE_LIST_MAX_RESULTS) {
-        truncated = true;
-        stoppedForLimit = true;
+      args.push('--', '.');
+      const child = spawn(
+        'rg',
+        args,
+        { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      let aborted = false;
+      let timedOut = false;
+      const abort = () => {
+        aborted = true;
         child.kill();
-        return;
-      }
-      const portablePath = sep === '\\' ? path.split(sep).join('/') : path;
-      const normalizedPath = portablePath.startsWith('./')
-        ? portablePath.slice(2)
-        : portablePath;
-      const resultPath =
-        requestedResultPath == null
-          ? normalizedPath
-          : portableCanonicalListPath === '.'
-            ? `${requestedResultPath}/${normalizedPath}`
-            : normalizedPath === portableCanonicalListPath ||
-                normalizedPath.startsWith(`${portableCanonicalListPath}/`)
-              ? `${requestedResultPath}${normalizedPath.slice(portableCanonicalListPath.length)}`
-              : normalizedPath;
-      if (!isSafePortableRelativePath(resultPath)) return;
-      candidates.push({ filesystemPath: normalizedPath, resultPath });
-    };
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+      }, Math.max(0, deadline - Date.now()));
+      const cleanup = () => {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', abort);
+      };
+      const pathDecoder = new TextDecoder('utf-8', {
+        fatal: true,
+        ignoreBOM: true,
+      });
+      const consumePath = (rawPath: Buffer) => {
+        if (rawPath.length === 0 || stoppedForLimit) return;
+        let path: string;
+        try {
+          path = pathDecoder.decode(rawPath);
+        } catch {
+          return;
+        }
+        if (!Buffer.from(path).equals(rawPath)) return;
+        if (candidates.length === maxResults + BRIDGE_WORKSPACE_LIST_MAX_RESULTS) {
+          truncated = true;
+          stoppedForLimit = true;
+          child.kill();
+          return;
+        }
+        const portablePath = sep === '\\' ? path.split(sep).join('/') : path;
+        const normalizedPath = portablePath.startsWith('./')
+          ? portablePath.slice(2)
+          : portablePath;
+        const resultPath =
+          requestedResultPath == null
+            ? normalizedPath
+            : portableCanonicalListPath === '.'
+              ? `${requestedResultPath}/${normalizedPath}`
+              : normalizedPath === portableCanonicalListPath ||
+                  normalizedPath.startsWith(`${portableCanonicalListPath}/`)
+                ? `${requestedResultPath}${normalizedPath.slice(portableCanonicalListPath.length)}`
+                : normalizedPath;
+        if (!isSafePortableRelativePath(resultPath)) return;
+        if (
+          afterPath !== undefined &&
+          comparePortableRelativePaths(resultPath, afterPath) <= 0
+        ) {
+          return;
+        }
+        candidates.push({ filesystemPath: normalizedPath, resultPath });
+      };
 
-    child.stdout.on('data', (chunk: Buffer) => {
-      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
-      let delimiter = pending.indexOf(0);
-      while (delimiter >= 0) {
-        consumePath(pending.subarray(0, delimiter));
-        pending = pending.subarray(delimiter + 1);
-        delimiter = pending.indexOf(0);
-      }
-    });
-    child.once('error', () => {
-      cleanup();
-      reject(
-        new WorkspaceToolError(
-          'Workspace listing unavailable',
-          'LIST_UNAVAILABLE',
-        ),
-      );
-    });
-    child.once('close', (code) => {
-      cleanup();
-      consumePath(pending);
-      if (aborted) {
-        reject(
-          new WorkspaceToolError(
-            'Workspace tool execution aborted',
-            'EXECUTION_ABORTED',
-          ),
-        );
-      } else if (timedOut) {
-        reject(
-          new WorkspaceToolError('Workspace listing timed out', 'LIST_TIMEOUT'),
-        );
-      } else if (stoppedForLimit || code === 0 || code === 1) {
-        resolvePromise();
-      } else {
+      child.stdout.on('data', (chunk: Buffer) => {
+        pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+        let delimiter = pending.indexOf(0);
+        while (delimiter >= 0) {
+          consumePath(pending.subarray(0, delimiter));
+          pending = pending.subarray(delimiter + 1);
+          delimiter = pending.indexOf(0);
+        }
+      });
+      child.once('error', () => {
+        cleanup();
         reject(
           new WorkspaceToolError(
             'Workspace listing unavailable',
             'LIST_UNAVAILABLE',
           ),
         );
-      }
+      });
+      child.once('close', (code) => {
+        cleanup();
+        consumePath(pending);
+        if (aborted) {
+          reject(
+            new WorkspaceToolError(
+              'Workspace tool execution aborted',
+              'EXECUTION_ABORTED',
+            ),
+          );
+        } else if (timedOut) {
+          reject(
+            new WorkspaceToolError('Workspace listing timed out', 'LIST_TIMEOUT'),
+          );
+        } else if (stoppedForLimit || code === 0 || code === 1) {
+          resolvePromise();
+        } else {
+          reject(
+            new WorkspaceToolError(
+              'Workspace listing unavailable',
+              'LIST_UNAVAILABLE',
+            ),
+          );
+        }
+      });
     });
-  });
 
-  const paths: string[] = [];
-  const seenPaths = new Set<string>();
-  for (const candidate of candidates) {
-    let canonicalPath: string;
-    try {
-      canonicalPath = await withinListDeadline(
-        realpath(resolveWorkspacePath(root, candidate.filesystemPath)),
-        signal,
-        deadline,
-      );
-    } catch (error) {
-      if (error instanceof WorkspaceToolError) throw error;
+    const paths: string[] = [];
+    const seenPaths = new Set<string>();
+    for (const candidate of candidates) {
+      let canonicalPath: string;
+      try {
+        canonicalPath = await withinListDeadline(
+          realpath(resolveWorkspacePath(root, candidate.filesystemPath)),
+          signal,
+          deadline,
+        );
+      } catch (error) {
+        if (error instanceof WorkspaceToolError) throw error;
+        continue;
+      }
+      if (!isWithinRoot(root, canonicalPath)) {
+        continue;
+      }
+      const reportedPath = resolveWorkspacePath(root, candidate.resultPath);
+      try {
+        const reportedPathStat = await withinListDeadline(
+          lstat(reportedPath),
+          signal,
+          deadline,
+        );
+        if (reportedPathStat.isSymbolicLink()) continue;
+        const canonicalReportedPath = await withinListDeadline(
+          realpath(reportedPath),
+          signal,
+          deadline,
+        );
+        if (canonicalReportedPath !== canonicalPath) continue;
+      } catch (error) {
+        if (error instanceof WorkspaceToolError) throw error;
+        continue;
+      }
+      let regularFile = false;
+      try {
+        regularFile = (
+          await withinListDeadline(stat(canonicalPath), signal, deadline)
+        ).isFile();
+      } catch (error) {
+        if (error instanceof WorkspaceToolError) throw error;
+        continue;
+      }
+      if (!regularFile || seenPaths.has(candidate.resultPath)) continue;
+      if (paths.length === maxResults) {
+        truncated = true;
+        break;
+      }
+      seenPaths.add(candidate.resultPath);
+      paths.push(candidate.resultPath);
+    }
+
+    if (truncated && paths.length === 0) {
+      // A scan window can consist entirely of vanished files or symlinks.
+      // Advance the internal scan cursor, not the public page cursor, and
+      // keep the original deadline and per-window candidate limit.
+      afterPath = candidates[candidates.length - 1].resultPath;
       continue;
     }
-    if (!isWithinRoot(root, canonicalPath)) {
-      continue;
-    }
-    const reportedPath = resolveWorkspacePath(root, candidate.resultPath);
-    try {
-      const reportedPathStat = await withinListDeadline(
-        lstat(reportedPath),
-        signal,
-        deadline,
-      );
-      if (reportedPathStat.isSymbolicLink()) continue;
-      const canonicalReportedPath = await withinListDeadline(
-        realpath(reportedPath),
-        signal,
-        deadline,
-      );
-      if (canonicalReportedPath !== canonicalPath) continue;
-    } catch (error) {
-      if (error instanceof WorkspaceToolError) throw error;
-      continue;
-    }
-    let regularFile = false;
-    try {
-      regularFile = (
-        await withinListDeadline(stat(canonicalPath), signal, deadline)
-      ).isFile();
-    } catch (error) {
-      if (error instanceof WorkspaceToolError) throw error;
-      continue;
-    }
-    if (!regularFile || seenPaths.has(candidate.resultPath)) continue;
-    if (paths.length === maxResults) {
-      truncated = true;
-      break;
-    }
-    seenPaths.add(candidate.resultPath);
-    paths.push(candidate.resultPath);
+
+    return {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'list_files',
+      workspaceId: request.workspaceId,
+      paths,
+      truncated,
+      ...(truncated && paths.length > 0
+        ? { nextAfterPath: paths[paths.length - 1] }
+        : {}),
+    };
   }
-
-  return {
-    protocolVersion: BRIDGE_PROTOCOL_VERSION,
-    operation: 'list_files',
-    workspaceId: request.workspaceId,
-    paths,
-    truncated,
-  };
 }
 
 async function withinListDeadline<T>(
@@ -1242,6 +1371,9 @@ async function withinListDeadline<T>(
   signal: AbortSignal | undefined,
   deadline: number,
 ): Promise<T> {
+  // The filesystem operation has already started. Observe its rejection even
+  // when cancellation or the deadline prevents us from waiting for it.
+  void operation.catch(() => undefined);
   if (signal?.aborted) {
     throw new WorkspaceToolError(
       'Workspace tool execution aborted',
@@ -1298,11 +1430,19 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
     private readonly roots: ReadonlyMap<string, WorkspaceRoot>,
     operations: BridgeWorkspaceToolCapabilities['operations'],
     workspaces: BridgeWorkspaceDescriptor[],
+    writeFileModes?: BridgeWorkspaceToolCapabilities['writeFileModes'],
+    editFileModes?: BridgeWorkspaceToolCapabilities['editFileModes'],
+    editFileFeatures?: BridgeWorkspaceToolCapabilities['editFileFeatures'],
+    listFileFeatures?: BridgeWorkspaceToolCapabilities['listFileFeatures'],
   ) {
     this.capabilities = {
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       operations,
       workspaces,
+      ...(writeFileModes != null ? { writeFileModes } : {}),
+      ...(editFileModes != null ? { editFileModes } : {}),
+      ...(editFileFeatures != null ? { editFileFeatures } : {}),
+      ...(listFileFeatures != null ? { listFileFeatures } : {}),
     };
   }
 
@@ -1335,6 +1475,12 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       operations,
       workspaces,
+      ...(anyWritable ? { writeFileModes: ['replace', 'create'] } : {}),
+      ...(anyWritable ? { editFileModes: ['single', 'batch'] } : {}),
+      ...(anyWritable
+        ? { editFileFeatures: ['expected_base_sha256'] }
+        : {}),
+      listFileFeatures: ['after_path'],
     };
     if (!isValidBridgeWorkspaceToolCapabilities(capabilities)) {
       throw new WorkspaceToolError(
@@ -1358,7 +1504,15 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
         writable: workspace.writable === true,
       });
     }
-    return new LocalWorkspaceTools(roots, operations, workspaces);
+    return new LocalWorkspaceTools(
+      roots,
+      operations,
+      workspaces,
+      capabilities.writeFileModes,
+      capabilities.editFileModes,
+      capabilities.editFileFeatures,
+      capabilities.listFileFeatures,
+    );
   }
 
   async execute(
@@ -1383,7 +1537,11 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
     }
     const { root } = workspace;
 
-    if (request.operation === 'write_file' || request.operation === 'edit_file') {
+    if (
+      request.operation === 'write_file' ||
+      request.operation === 'preview_edit' ||
+      request.operation === 'edit_file'
+    ) {
       if (!workspace.writable) {
         throw new WorkspaceToolError(
           'Workspace mutations are disabled by the worker',
@@ -1396,8 +1554,11 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
           'EXECUTION_ABORTED',
         );
       }
-      return request.operation === 'write_file'
-        ? writeWorkspaceFile(root, request, signal)
+      if (request.operation === 'write_file') {
+        return writeWorkspaceFile(root, request, signal);
+      }
+      return request.operation === 'preview_edit'
+        ? previewWorkspaceEdit(root, request, signal)
         : editWorkspaceFile(root, request, signal);
     }
 
@@ -1482,6 +1643,18 @@ export class SandboxWorkspaceTools implements WorkspaceToolExecutor {
     this.capabilities = {
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       operations: [...new Set([...base.operations, 'execute_command' as const])],
+      ...(base.writeFileModes != null
+        ? { writeFileModes: base.writeFileModes }
+        : {}),
+      ...(base.editFileModes != null
+        ? { editFileModes: base.editFileModes }
+        : {}),
+      ...(base.editFileFeatures != null
+        ? { editFileFeatures: base.editFileFeatures }
+        : {}),
+      ...(base.listFileFeatures != null
+        ? { listFileFeatures: base.listFileFeatures }
+        : {}),
       workspaces: base.workspaces.map((workspace) => ({
         ...workspace,
         operations: [
@@ -1504,6 +1677,12 @@ export class SandboxWorkspaceTools implements WorkspaceToolExecutor {
     request: WorkspaceToolRequest,
     signal?: AbortSignal,
   ): Promise<WorkspaceToolResult> {
+    if (!isWorkspaceToolRequest(request)) {
+      throw new WorkspaceToolError(
+        'Invalid workspace tool request',
+        'INVALID_REQUEST',
+      );
+    }
     if (request.operation !== 'execute_command') {
       return this.options.workspaceTools.execute(request, signal);
     }

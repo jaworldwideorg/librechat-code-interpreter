@@ -94,6 +94,105 @@ test('CLI rejects an unknown command sandbox before entering the run loop', () =
   );
 });
 
+test('CLI rejects incomplete GitHub App authentication before worker registration', () => {
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('./cli.js', import.meta.url))],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LIBRECHAT_CODE_URL: 'https://code.example/v1',
+        LIBRECHAT_CODE_WORKER_TOKEN: 'worker-secret',
+        LIBRECHAT_CODE_WORKER_ID: 'engineering-vm',
+        LIBRECHAT_CODE_GITHUB_APP_ID: '123',
+        LIBRECHAT_CODE_GITHUB_INSTALLATION_ID: undefined,
+        LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE: undefined,
+      },
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /GitHub App authentication requires/);
+});
+
+test('CLI refuses GitHub credentials without native sandboxed commands', () => {
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('./cli.js', import.meta.url))],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LIBRECHAT_CODE_URL: 'https://code.example/v1',
+        LIBRECHAT_CODE_WORKER_TOKEN: 'worker-secret',
+        LIBRECHAT_CODE_WORKER_ID: 'engineering-vm',
+        LIBRECHAT_CODE_GITHUB_TOKEN: 'github_pat_abcdefghijklmnopqrstuvwxyz',
+      },
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /GitHub authentication requires workspace commands/,
+  );
+});
+
+test('CLI rejects a GitHub App API URL that does not match its Git host', () => {
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('./cli.js', import.meta.url))],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LIBRECHAT_CODE_URL: 'https://code.example/v1',
+        LIBRECHAT_CODE_WORKER_TOKEN: 'worker-secret',
+        LIBRECHAT_CODE_WORKER_ID: 'engineering-vm',
+        LIBRECHAT_CODE_GITHUB_APP_ID: '123',
+        LIBRECHAT_CODE_GITHUB_INSTALLATION_ID: '456',
+        LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE: '/does/not/matter',
+        LIBRECHAT_CODE_GITHUB_HOST: 'github.example.test',
+        LIBRECHAT_CODE_GITHUB_API_URL: 'https://other.example.test/api/v3',
+      },
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /LIBRECHAT_CODE_GITHUB_HOST must match the GitHub App API hostname/,
+  );
+});
+
+test('CLI validates GitHub App credentials before worker registration', () => {
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('./cli.js', import.meta.url))],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LIBRECHAT_CODE_URL: 'http://127.0.0.1:1/v1',
+        LIBRECHAT_CODE_WORKER_TOKEN: 'worker-secret',
+        LIBRECHAT_CODE_WORKER_ID: 'engineering-vm',
+        LIBRECHAT_CODE_WORKER_DIR: process.cwd(),
+        LIBRECHAT_CODE_ALLOW_WORKSPACE_COMMANDS: 'true',
+        LIBRECHAT_CODE_GITHUB_APP_ID: '123',
+        LIBRECHAT_CODE_GITHUB_INSTALLATION_ID: '456',
+        LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE: '/does/not/exist/app.pem',
+        LIBRECHAT_CODE_GITHUB_HOST: undefined,
+        LIBRECHAT_CODE_GITHUB_API_URL: undefined,
+      },
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ENOENT|no such file/i);
+  assert.doesNotMatch(result.stderr, /fetch failed/);
+});
+
 test('CLI requires a runtime image for Docker supervision', () => {
   const result = spawnSync(
     process.execPath,
@@ -132,7 +231,10 @@ test('CLI requires the macOS NsJail seccomp profile', () => {
   );
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /LIBRECHAT_CODE_DOCKER_SECCOMP_PROFILE is required/);
+  assert.match(
+    result.stderr,
+    /LIBRECHAT_CODE_DOCKER_SECCOMP_PROFILE is required/,
+  );
 });
 
 test('CLI requires a package mount for the macOS NsJail profile', () => {
@@ -154,7 +256,10 @@ test('CLI requires a package mount for the macOS NsJail profile', () => {
   );
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /LIBRECHAT_CODE_DOCKER_PACKAGES_PATH is required/);
+  assert.match(
+    result.stderr,
+    /LIBRECHAT_CODE_DOCKER_PACKAGES_PATH is required/,
+  );
 });
 
 test('CLI reset does not require Docker runtime launch inputs', () => {
@@ -176,6 +281,7 @@ test('CLI reset does not require Docker runtime launch inputs', () => {
         LIBRECHAT_CODE_RUNTIME_IMAGE: undefined,
         LIBRECHAT_CODE_DOCKER_SECCOMP_PROFILE: undefined,
         LIBRECHAT_CODE_DOCKER_PACKAGES_PATH: undefined,
+        LIBRECHAT_CODE_GITHUB_TOKEN: 'github_pat_abcdefghijklmnopqrstuvwxyz',
       },
     },
   );
@@ -184,6 +290,10 @@ test('CLI reset does not require Docker runtime launch inputs', () => {
   assert.doesNotMatch(
     result.stderr,
     /LIBRECHAT_CODE_(?:RUNTIME_IMAGE|DOCKER_SECCOMP_PROFILE|DOCKER_PACKAGES_PATH) is required/,
+  );
+  assert.doesNotMatch(
+    result.stderr,
+    /GitHub authentication requires workspace commands/,
   );
 });
 
@@ -260,4 +370,45 @@ test('CLI treats a whitespace-only file relay upstream as disabled', () => {
     result.stderr,
     /LIBRECHAT_CODE_(?:EXECUTION_MANIFEST_PUBLIC_KEY|FILE_RELAY_IMAGE) is required/,
   );
+});
+
+test('CLI host-only enterprise configuration sends App JWTs to GHES, never GitHub.com', async (t) => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { mkdtemp, rm, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const directory = await mkdtemp(join(tmpdir(), 'cli-ghes-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const privateKeyPath = join(directory, 'app.pem');
+  const preload = join(directory, 'fetch.mjs');
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  await writeFile(privateKeyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  await writeFile(preload, `
+    globalThis.fetch = async (input) => {
+      console.error('GITHUB_REQUEST:' + String(input));
+      throw new Error('test stopped before network delivery');
+    };
+  `);
+  const result = spawnSync(process.execPath, [
+    '--import', preload, fileURLToPath(new URL('./cli.js', import.meta.url)),
+  ], {
+    encoding: 'utf8', timeout: 10000,
+    env: {
+      ...process.env,
+      LIBRECHAT_CODE_URL: 'http://127.0.0.1:1/v1',
+      LIBRECHAT_CODE_WORKER_TOKEN: 'worker-secret',
+      LIBRECHAT_CODE_WORKER_ID: 'engineering-vm',
+      LIBRECHAT_CODE_WORKER_DIR: directory,
+      LIBRECHAT_CODE_ALLOW_WORKSPACE_COMMANDS: 'true',
+      LIBRECHAT_CODE_GITHUB_TOKEN: undefined,
+      LIBRECHAT_CODE_GITHUB_APP_ID: '123',
+      LIBRECHAT_CODE_GITHUB_INSTALLATION_ID: '456',
+      LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE: privateKeyPath,
+      LIBRECHAT_CODE_GITHUB_HOST: 'GitHub.Example.Test',
+      LIBRECHAT_CODE_GITHUB_API_URL: undefined,
+    },
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /GITHUB_REQUEST:https:\/\/github\.example\.test\/api\/v3\/app\/installations\/456\/access_tokens/);
+  assert.doesNotMatch(result.stderr, /GITHUB_REQUEST:https:\/\/api\.github\.com/);
 });

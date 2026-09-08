@@ -103,6 +103,14 @@ export type RequestFile = {
 
 export type FileRefs = FileRef[];
 
+export interface ArtifactDeliveryFailure {
+  code: 'artifact_delivery_failed';
+  status: 'partial' | 'failed';
+  attempted: number;
+  delivered: number;
+  failed: number;
+}
+
 export type ExecuteResponse = {
   run?: {
     stdout: string;
@@ -121,9 +129,12 @@ export type ExecuteResponse = {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
 };
 
 export interface RequestBody {
+  /** Optional positive runtime cap in milliseconds, clamped to JOB_TIMEOUT. */
+  timeout?: number;
   code: string;
   lang: string;
   args?: string[];
@@ -221,6 +232,7 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
   code?: number | null;
   signal?: string | null;
   message?: string | null;
@@ -358,6 +370,7 @@ export interface ProgrammaticResponse {
   stdout?: string;
   stderr?: string;
   files?: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
   /** Top-level execution session id (one sandbox PTC invocation). */
   session_id?: string;
   tool_calls_made?: number;

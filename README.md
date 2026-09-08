@@ -124,6 +124,15 @@ cut.
 
 ## Local Development
 
+Copy `.env.example` to `.env` and set `CODEAPI_BRIDGE_TOKEN` to a private value
+of at least 32 bytes (generate one with `openssl rand -hex 32`). The API exposes
+bridge routes even with the default HTTP sandbox backend, so hardened mode
+requires this enrollment credential. Compose defaults to
+`CODEAPI_BRIDGE_AUTH_MODE=paired` and `CODEAPI_BRIDGE_DYNAMIC_WORKERS=true`.
+To restrict pairing to a fixed worker, set `CODEAPI_BRIDGE_DYNAMIC_WORKERS=false`
+and `CODEAPI_BRIDGE_WORKER_ID` to its ID. Keep the token outside workspaces and
+model-visible configuration.
+
 ```bash
 docker-compose up --build
 ```
@@ -133,6 +142,23 @@ The default KVM Compose path builds `sandbox-runner-baked`: the guest root and
 virtio-fs mount. The first image build takes longer because it compiles the
 language runtimes, but package-heavy workloads do not accumulate host file
 descriptors in the launcher.
+
+KVM guests use the runner container's `/etc/resolv.conf`, including Docker's
+embedded resolver or Kubernetes nameservers and search domains. The launcher
+preserves service hostnames instead of pinning their startup IP addresses.
+Both baked and directory rootfs images contain a resolver symlink whose target
+is populated by a guest wrapper in private `/run` runtime storage before any
+`LAUNCHER_EXEC` executable starts; the
+read-only root disk does not need modification at boot. Rebuild the runner
+image to pick up this layout change. A missing resolver handoff fails startup
+rather than leaving the guest with an unrelated public DNS server.
+
+To validate a deployment, execute code that creates a file in `/mnt/data`,
+confirm the response includes its file reference, and download it. Recreate the
+egress gateway with a different container IP while leaving the runner alive,
+then repeat after DNS caches expire. The file must still upload and download;
+`artifact_delivery` must not report a failure. `tests/kvm_guest_dns.sh` checks
+the resolver handoff and rootfs assembly without requiring KVM.
 
 Setting `KVM_ENABLED=false` still selects the directory-root target and the
 host package mount automatically for direct NsJail development.

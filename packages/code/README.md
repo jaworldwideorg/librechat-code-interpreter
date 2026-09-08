@@ -35,9 +35,39 @@ LIBRECHAT_CODE_SANDBOX_ENDPOINT=http://127.0.0.1:2000/api/v2 \
 librechat-code run
 ```
 
+Credential and quarantine storage supports macOS and Linux (including WSL2).
+On macOS, native descriptor-based ACL calls remove inherited ACLs from new
+credential/state files before writing secrets and verify the result. Reads reject
+ACL-exposed identities and GitHub App keys; ancestor checks reject ACL write
+grants and inheritable allow entries before any child is created. Removing an
+ACL after creation cannot revoke descriptors opened while the grant existed. Existing sharing ACLs on parent directories
+are never silently removed. Default application-owned workspace directories have
+their ACLs removed and modes restricted to `0700`.
+
+macOS requires the packaged Koffi native dependency (prebuilt for Apple Silicon
+and Intel); no Python interpreter or local compiler is needed with those builds.
+If it cannot load or ACL inspection fails, storage fails closed before pairing.
+Native Windows remains explicitly unsupported until DACL removal and verification
+are implemented. Use WSL2 with storage on a native Linux filesystem, not a Windows
+drive under `/mnt`. Linux retains ownership and POSIX mode/ACL-mask checks.
+
+Every storage ancestor, including intermediate symlink entries and targets, must
+be owned by this account or root and must not allow group/other writes unless
+protected by the sticky bit. A private directory inside a shared writable parent
+is insufficient: that parent can replace the directory. This also applies when
+loading GitHub App keys or clearing quarantine state.
+
 Use `--identity <path>` while pairing and
 `LIBRECHAT_CODE_IDENTITY_FILE=<path>` while running to override the identity
 file location.
+
+The identity file itself must not be a bind-mount target: saving a paired
+credential atomically replaces that entry. Mount its containing directory
+instead. Pairing preflight checks `/proc/self/mountinfo` before redeeming the
+one-time code and fails closed if mount information cannot be verified (including
+a mount table larger than 4 MiB). Existing identity reads remain supported.
+The check describes the current mount namespace; administrators must keep mount
+configuration stable during pairing.
 
 ## Native BYOM sandbox (default)
 
@@ -85,6 +115,59 @@ An operator may allow explicit egress destinations with the comma-separated
 policy: an allowed destination can receive workspace data. The normalized
 allowlist is included in the worker policy digest. Tool approval hooks remain
 the user-facing allow/deny boundary for each invocation.
+
+The native sandbox preserves standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+and `NO_PROXY` names (including lowercase forms), plus Windows process and profile
+variables on Windows. SRT remains responsible for the final sandbox environment
+and can replace proxy values with its filtered proxy endpoints. This does not
+expand the allowed domains or expose unrelated inherited credentials.
+
+### GitHub authentication
+
+The native BYOM worker can provide Git HTTPS authentication without exposing a
+real token to the command sandbox. Prefer a GitHub App installed only on the
+repositories the agent may access:
+
+```bash
+LIBRECHAT_CODE_GITHUB_APP_ID=12345 \
+LIBRECHAT_CODE_GITHUB_INSTALLATION_ID=67890 \
+LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE=/secure/librechat-agent.pem \
+librechat-code run --worker-dir /path/to/project --allow-workspace-commands
+```
+
+The private key must be an owner-only regular file outside the workspace. It is
+read only by the trusted worker, which mints and refreshes short-lived
+installation tokens. A personal access token is supported as a fallback with
+`LIBRECHAT_CODE_GITHUB_TOKEN`, but the GitHub App is the safer default because
+its repository access and permissions can be narrowly installed and revoked.
+Native Windows credential storage is unavailable until native DACL removal and
+verification are implemented; use macOS, Linux, or WSL2. This also applies to GitHub App
+private keys.
+
+Git receives authentication through process-scoped `GIT_CONFIG_*` variables.
+The same isolated config supplies the standard Git LFS filters; hosts using LFS
+must install `git-lfs`, and checkout fails instead of silently leaving pointer
+files when it is unavailable.
+SRT replaces only the bearer-token portion with a sentinel inside the sandbox
+and substitutes the real value in its host proxy only for `github.com` HTTPS
+traffic. TLS termination is enabled for that substitution. The worker restores
+the parent environment immediately after constructing the sandbox command; it
+never writes credentials into the repository, a remote URL, or Git config.
+GitHub's required domains are added to the command egress allowlist only when
+authentication is configured. The worker identity, GitHub App key path, token
+source variables, and mutation-quarantine record remain denied to sandboxed
+commands.
+
+For GitHub Enterprise Server, set `LIBRECHAT_CODE_GITHUB_HOST` to its hostname.
+App authentication defaults to `https://<host>/api/v3`; GitHub.com continues to
+use `https://api.github.com`. Set `LIBRECHAT_CODE_GITHUB_API_URL` to override
+the HTTPS API base URL, including a custom port or path. Its hostname must
+match the configured Git host (with `api.github.com` corresponding to
+`github.com`), and it must not contain credentials, a query, or a fragment.
+App token requests do not follow redirects. GitHub
+authentication currently requires the `native-srt` command sandbox. Every
+clone, commit, or push command still crosses LibreChat's tool-approval policy;
+the credential boundary does not grant approval by itself.
 
 Select the backend explicitly when desired:
 
@@ -271,8 +354,19 @@ names and exposes bounded `read_file`, literal `search_text`, and deterministic
 can explicitly add confined `write_file` and exact-match `edit_file` operations
 with `--allow-workspace-writes` or
 `LIBRECHAT_CODE_ALLOW_WORKSPACE_WRITES=true`.
-Only IDs, names, protocol version, and supported operations appear in worker
-capabilities; absolute host paths remain local to the worker process.
+`write_file` preserves its overwrite behavior by default; callers can set
+`overwrite: false` to require an atomic create that returns `EDIT_CONFLICT` if
+the target already exists. Code API dispatches that mode only after the worker
+and server negotiate `create` in `writeFileModes`.
+`edit_file` accepts either the legacy `oldText`/`newText` pair or an ordered
+`edits` array; every exact replacement is validated before the updated file is
+installed as one atomic mutation. Code API dispatches the batch form only after
+the worker and server negotiate `batch` in `editFileModes`.
+Revision-fenced edits likewise require the negotiated
+`expected_base_sha256` entry in `editFileFeatures`.
+Only IDs, names, protocol version, supported operations, and negotiated write
+modes appear in worker capabilities; absolute host paths remain local to the
+worker process.
 
 The protocol also defines a bounded `execute_command` request and result for a
 sandbox-backed executor. Commands are treated as workspace mutations and cannot
@@ -320,9 +414,14 @@ bounded set of ignored-aware candidates with configuration and symlink following
 disabled. It then opens and verifies each candidate through the same confined
 1 MiB read boundary before matching locally. File listing invokes `rg` without
 a shell, with configuration and symlink following disabled. Both operations
-stop after bounded global result counts. The worker process still belongs inside
-the trusted BYOM boundary and should receive filesystem access only to roots the
-operator intentionally registers.
+stop after bounded global result counts. A truncated `list_files` result includes
+`nextAfterPath`; pass that value back as `afterPath` with the same workspace and
+path to continue deterministically beyond the 500-file protocol ceiling.
+Continuation is advertised and negotiated as the `after_path` list-file feature,
+so mixed Code API and worker versions keep the legacy bounded response shape
+during rolling upgrades. The worker process still belongs inside the trusted
+BYOM boundary and should receive filesystem access only to roots the operator
+intentionally registers.
 
 Writes are limited to 1 MiB of UTF-8 text and require an existing directory
 inside the registered root. They reject traversal, symlink targets, and

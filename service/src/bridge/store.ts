@@ -12,6 +12,8 @@ import type {
 
 import {
   BRIDGE_PROTOCOL_VERSION,
+  isValidBridgeWorkerCapabilities,
+  isValidBridgeWorkerId,
   isWorkspaceToolRequest,
   isWorkspaceToolResult,
 } from '../../../packages/code/src/protocol';
@@ -68,6 +70,13 @@ export interface RegisteredBridgeWorker extends BridgeWorkerRegistration {
   identityId?: string;
 }
 
+export interface BridgeWorkerStatus {
+  online: boolean;
+  ready: boolean;
+  leaseExpiresInMs?: number;
+  capabilities?: BridgeWorkerRegistration['capabilities'];
+}
+
 function supportsWorkspaceTool(
   registration: RegisteredBridgeWorker,
   request: WorkspaceToolRequest,
@@ -76,13 +85,41 @@ function supportsWorkspaceTool(
   const workspace = capabilities?.workspaces.find(
     (candidate) => candidate.id === request.workspaceId,
   );
-  return (
+  const supportsOperation =
     capabilities != null &&
     capabilities.operations.includes(request.operation) &&
     workspace != null &&
     (workspace.operations == null ||
-      workspace.operations.includes(request.operation))
-  );
+      workspace.operations.includes(request.operation));
+  if (!supportsOperation) {
+    return supportsOperation;
+  }
+  if (request.operation === 'list_files' && request.afterPath !== undefined) {
+    return capabilities?.listFileFeatures?.includes('after_path') === true;
+  }
+  if (request.operation === 'write_file') {
+    const mode = request.overwrite === false ? 'create' : 'replace';
+    const modes = capabilities?.writeFileModes;
+    return request.overwrite === undefined && modes == null
+      ? true
+      : modes?.includes(mode) === true;
+  }
+  if (
+    request.operation === 'preview_edit' ||
+    request.operation === 'edit_file'
+  ) {
+    const mode = request.edits === undefined ? 'single' : 'batch';
+    const modes = capabilities?.editFileModes;
+    const supportsMode = modes == null ? mode === 'single' : modes.includes(mode);
+    if (request.operation === 'preview_edit') return supportsMode;
+    return (
+      supportsMode &&
+      (request.expectedBaseSha256 === undefined ||
+        capabilities?.editFileFeatures?.includes('expected_base_sha256') ===
+          true)
+    );
+  }
+  return true;
 }
 
 function workerKey(workerId: string): string {
@@ -279,6 +316,63 @@ export class RedisBridgeStore {
       label,
       signal,
     );
+  }
+
+  /** Returns only the worker's ephemeral registration state. The registration
+   * is the heartbeat: when its TTL expires the worker is offline. */
+  async workerStatus(workerId: string): Promise<BridgeWorkerStatus> {
+    const snapshot = (await boundedCommand(
+      this.redis.eval(
+        [
+          "local registration = redis.call('GET', KEYS[1])",
+          "if not registration then return { false, false, false, -2 } end",
+          'return {',
+          '  registration,',
+          "  redis.call('GET', KEYS[2]) or false,",
+          "  redis.call('GET', KEYS[3]) or false,",
+          "  redis.call('PTTL', KEYS[1])",
+          '}',
+        ].join('\n'),
+        3,
+        workerKey(workerId),
+        workerReadyKey(workerId),
+        workerRegistrationGenerationKey(workerId),
+      ),
+      this.redisCommandTimeoutMs,
+      'Bridge worker status',
+    )) as [string | null, string | null, string | null, number];
+    const [rawRegistration, readyToken, registrationGeneration, leaseExpiresInMs] = snapshot;
+    if (rawRegistration == null || rawRegistration === '' || leaseExpiresInMs <= 0) {
+      return { online: false, ready: false };
+    }
+
+    let registration: RegisteredBridgeWorker;
+    try {
+      registration = JSON.parse(rawRegistration) as RegisteredBridgeWorker;
+    } catch {
+      return { online: false, ready: false };
+    }
+    if (
+      registration.protocolVersion !== BRIDGE_PROTOCOL_VERSION ||
+      !isValidBridgeWorkerId(registration.workerId) ||
+      registration.workerId !== workerId ||
+      typeof registration.incarnationId !== 'string' ||
+      !isValidBridgeWorkerCapabilities(registration.capabilities)
+    ) {
+      return { online: false, ready: false };
+    }
+
+    const requiresConfirmation = registration.capabilities.requiresReadyConfirmation === true;
+    const ready =
+      !requiresConfirmation ||
+      (registrationGeneration != null &&
+        readyToken === workerReadyToken(registration.incarnationId, Number(registrationGeneration)));
+    return {
+      online: true,
+      ready,
+      leaseExpiresInMs,
+      capabilities: registration.capabilities,
+    };
   }
 
   async register(
@@ -485,22 +579,28 @@ export class RedisBridgeStore {
         'Invalid workspace tool request',
       );
     }
-    const settlement = (await this.dispatch({
+    return (await this.dispatch({
       ...args,
       body: {} as t.PayloadBody,
       headers: {},
       workspaceRequest: args.request,
+      finalize: async (settlement, registration) => {
+        if (
+          settlement.status === 'fulfilled' &&
+          !isWorkspaceToolResult(
+            args.request,
+            settlement.result,
+            registration.capabilities.workspaceTools,
+          )
+        ) {
+          throw new BridgeStoreError(
+            'RESULT_INVALID',
+            'Bridge worker returned an invalid workspace tool result',
+          );
+        }
+        return settlement;
+      },
     })) as unknown as CodeBridgeWorkspaceSettlement;
-    if (
-      settlement.status === 'fulfilled' &&
-      !isWorkspaceToolResult(args.request, settlement.result)
-    ) {
-      throw new BridgeStoreError(
-        'RESULT_INVALID',
-        'Bridge worker returned an invalid workspace tool result',
-      );
-    }
-    return settlement;
   }
 
   async dispatch(args: {
@@ -515,6 +615,7 @@ export class RedisBridgeStore {
     signal: AbortSignal;
     finalize?: (
       settlement: CodeBridgeSettlement,
+      registration: RegisteredBridgeWorker,
     ) => Promise<CodeBridgeSettlement>;
   }): Promise<CodeBridgeSettlement> {
     this.assertDispatchActive(args.signal, args.deadlineAtMs);
@@ -694,13 +795,8 @@ export class RedisBridgeStore {
         const result =
           args.finalize == null
             ? settlement
-            : await args.finalize(settlement);
-        await this.commitPendingWorkspace(
-          assignment,
-          settlement,
-          args.deadlineAtMs,
-          args.signal,
-        );
+            : await args.finalize(settlement, registration);
+        await this.commitPendingWorkspace(assignment, settlement);
         resultCommitted = true;
         return result;
       } catch (error) {
@@ -1349,22 +1445,30 @@ export class RedisBridgeStore {
     deadlineAtMs: number,
     signal: AbortSignal,
   ): Promise<CodeBridgeSettlement> {
-    while (!signal.aborted && Date.now() < deadlineAtMs) {
-      const raw = await boundedCommand(
-        this.redis.get(settlementKey(assignment.assignmentId)),
-        Math.max(
-          1,
-          Math.min(this.redisCommandTimeoutMs, deadlineAtMs - Date.now()),
-        ),
-        'Bridge settlement poll',
-        signal,
-      );
-      if (raw != null) return JSON.parse(raw) as CodeBridgeSettlement;
-      await delay(POLL_INTERVAL_MS, signal);
+    let pollError: unknown;
+    try {
+      while (!signal.aborted && Date.now() < deadlineAtMs) {
+        const raw = await boundedCommand(
+          this.redis.get(settlementKey(assignment.assignmentId)),
+          Math.max(
+            1,
+            Math.min(this.redisCommandTimeoutMs, deadlineAtMs - Date.now()),
+          ),
+          'Bridge settlement poll',
+          signal,
+        );
+        if (raw != null) return JSON.parse(raw) as CodeBridgeSettlement;
+        await delay(POLL_INTERVAL_MS, signal);
+      }
+    } catch (error) {
+      // A failed/aborted poll does not cancel Redis work. Arbitrate with
+      // settlement before returning an error, even when the caller is gone.
+      pollError = error;
     }
     const closeKeys = [
       assignmentKey(assignment.assignmentId),
       settlementKey(assignment.assignmentId),
+      assignmentDeadlineKey(assignment.assignmentId),
     ];
     if (assignment.runtimeSessionId !== undefined) {
       closeKeys.push(
@@ -1374,10 +1478,14 @@ export class RedisBridgeStore {
         ),
       );
     }
+    // The deadline key is also the fulfillment gate checked by settle().
+    // Keep acknowledged assignment metadata for late clean rejection recovery,
+    // but atomically revoke fulfillment when no settlement has won yet.
     const closeScript = [
       'local settlement = redis.call(\'GET\', KEYS[2])',
       'if settlement then return settlement end',
-      'if #KEYS == 3 and redis.call(\'GET\', KEYS[3]) == ARGV[1] then return nil end',
+      'redis.call(\'DEL\', KEYS[3])',
+      'if #KEYS == 4 and redis.call(\'GET\', KEYS[4]) == ARGV[1] then return nil end',
       'redis.call(\'DEL\', KEYS[1])',
       'return nil',
     ].join('\n');
@@ -1393,6 +1501,9 @@ export class RedisBridgeStore {
     );
     if (finalSettlement != null) {
       return JSON.parse(String(finalSettlement)) as CodeBridgeSettlement;
+    }
+    if (pollError != null && !signal.aborted && Date.now() < deadlineAtMs) {
+      throw pollError;
     }
     throw new BridgeStoreError(
       'ASSIGNMENT_EXPIRED',
@@ -1518,8 +1629,6 @@ export class RedisBridgeStore {
   private async commitPendingWorkspace(
     assignment: StoredAssignment,
     settlement: AnyCodeBridgeSettlement,
-    deadlineAtMs: number,
-    signal: AbortSignal,
   ): Promise<void> {
     if (
       assignment.runtimeSessionId === undefined ||
@@ -1545,12 +1654,10 @@ export class RedisBridgeStore {
           ),
           assignment.assignmentId,
         ),
-        Math.max(
-          1,
-          Math.min(this.redisCommandTimeoutMs, deadlineAtMs - Date.now()),
-        ),
+        // Once settlement wins, caller cancellation must not prevent its
+        // workspace commit. Redis availability still has a bounded budget.
+        this.redisCommandTimeoutMs,
         'Bridge workspace commit',
-        signal,
       ),
     );
     if (committed !== 1) {
