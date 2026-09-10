@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import {
   basename,
   dirname,
@@ -11,7 +11,15 @@ import {
   sep,
 } from 'node:path';
 import { constants as fsConstants } from 'node:fs';
-import { access, realpath, stat } from 'node:fs/promises';
+import {
+  access,
+  mkdtemp,
+  open,
+  realpath,
+  rm,
+  stat,
+} from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 
 import { SandboxManager } from '@anthropic-ai/sandbox-runtime';
 
@@ -21,7 +29,13 @@ import {
   BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
   isWorkspaceToolRequest,
 } from './protocol.js';
+import {
+  assertPrivateStorageAcl,
+  assertPrivateStorageAncestors,
+  removePrivateStorageAcl,
+} from './private-storage.js';
 import { WorkspaceToolError } from './workspace.js';
+import { restoreScratchTraversal } from './native-scratch.js';
 
 import type {
   ChildProcessWithoutNullStreams,
@@ -96,6 +110,17 @@ const {
   ...TRUSTED_GIT_CONFIG_ENTRIES
 } = TRUSTED_GIT_ENVIRONMENT;
 
+const NATIVE_SANDBOX_SCRATCH_PREFIX = 'librechat-code-srt-';
+// SRT grants these shared compatibility paths by default. A worker-specific
+// TMPDIR must also deny them or separate worker processes can exchange files.
+const SRT_SHARED_SCRATCH_PATHS = ['/tmp/claude', '/private/tmp/claude'];
+const SRT_SCRATCH_SELECTOR_NAMES = [
+  'CLAUDE_CODE_TMPDIR',
+  'CLAUDE_TMPDIR',
+] as const;
+// Capture this before any command wrapper can temporarily mutate process.env.
+const HOST_TEMPORARY_ROOT = tmpdir();
+
 interface NativeSandboxManager {
   isSupportedPlatform(): boolean;
   checkDependenciesAsync(): Promise<{ warnings: string[]; errors: string[] }>;
@@ -112,6 +137,13 @@ interface NativeSandboxManager {
   cleanupAfterCommand(): void;
   reset(): Promise<void>;
 }
+
+// SRT's default manager is process-global, including its policy and cleanup
+// state. Distinct workspace objects must not reconfigure the same manager.
+const managerOwners = new WeakMap<
+  NativeSandboxManager,
+  NativeSrtWorkspaceCommandSandbox
+>();
 
 type SpawnCommand = (
   command: string,
@@ -211,6 +243,11 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
   private readonly platform: NodeJS.Platform;
   private initialized?: Promise<void>;
   private canonicalRoot?: string;
+  private scratchDirectory?: string;
+  private scratchHandle?: FileHandle;
+  private execution?: Promise<WorkspaceExecuteCommandResult>;
+  private closing?: Promise<void>;
+  private resetFailed = false;
 
   constructor(
     private readonly options: NativeSrtWorkspaceCommandSandboxOptions,
@@ -227,9 +264,27 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
   }
 
   private async initialize(): Promise<void> {
+    if (this.closing || this.resetFailed) {
+      throw new WorkspaceToolError(
+        'Native sandbox is closing or requires cleanup',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
     if (this.initialized) return this.initialized;
+    const owner = managerOwners.get(this.manager);
+    if (owner && owner !== this) {
+      throw new WorkspaceToolError(
+        'Native sandbox manager already belongs to another workspace; use a separate worker process',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
+    managerOwners.set(this.manager, this);
     this.initialized = this.initializeOnce().catch(async (error) => {
-      await this.manager.reset().catch(() => undefined);
+      await this.manager.reset().catch(() => {
+        this.resetFailed = true;
+      });
+      await this.removeScratchDirectory().catch(() => undefined);
+      if (!this.resetFailed) managerOwners.delete(this.manager);
       this.initialized = undefined;
       throw error;
     });
@@ -266,6 +321,26 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         'REGISTRATION_INVALID',
       );
     }
+    const sharedScratchPaths = await Promise.all(
+      (this.platform === 'win32' ? [] : SRT_SHARED_SCRATCH_PATHS).map(
+        canonicalPath,
+      ),
+    );
+    const inheritedWritablePaths = [
+      ...sharedScratchPaths,
+      ...(await Promise.all(
+        [join(home, '.npm', '_logs'), join(home, '.claude', 'debug')].map(
+          canonicalPath,
+        ),
+      )),
+    ];
+    const deniedInheritedWritablePaths = [...new Set(inheritedWritablePaths)];
+    if (deniedInheritedWritablePaths.some((path) => isWithin(path, root))) {
+      throw new WorkspaceToolError(
+        'Native sandbox workspace cannot be inside an inherited writable path',
+        'REGISTRATION_INVALID',
+      );
+    }
     const dependencies = await this.manager.checkDependenciesAsync();
     if (dependencies.errors.length > 0) {
       throw new WorkspaceToolError(
@@ -283,6 +358,17 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         );
       }
     }
+    const canonicalScratchDirectory =
+      await this.createScratchDirectory(sharedScratchPaths);
+    if (
+      canonicalScratchDirectory &&
+      isWithin(root, canonicalScratchDirectory)
+    ) {
+      throw new WorkspaceToolError(
+        'Native sandbox workspace cannot contain worker scratch storage',
+        'REGISTRATION_INVALID',
+      );
+    }
     const config: SandboxRuntimeConfig = {
       network: {
         allowedDomains: [...(this.options.allowedDomains ?? [])],
@@ -293,10 +379,21 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         ...(this.options.maskedEnvironment ? { tlsTerminate: {} } : {}),
       },
       filesystem: {
-        denyRead: [home],
-        allowRead: [root],
-        allowWrite: [root],
-        denyWrite: protectedPaths,
+        denyRead: [
+          home,
+          ...sharedScratchPaths.filter((path) =>
+            deniedInheritedWritablePaths.includes(path),
+          ),
+        ],
+        allowRead: [
+          root,
+          ...(canonicalScratchDirectory ? [canonicalScratchDirectory] : []),
+        ],
+        allowWrite: [
+          root,
+          ...(canonicalScratchDirectory ? [canonicalScratchDirectory] : []),
+        ],
+        denyWrite: [...protectedPaths, ...deniedInheritedWritablePaths],
         allowGitConfig: false,
       },
       credentials: {
@@ -305,7 +402,14 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
           mode: 'deny' as const,
         })),
         envVars: [
-          ...deniedEnvironmentNames(this.environment, this.platform)
+          ...deniedEnvironmentNames(
+            {
+              ...this.environment,
+              CLAUDE_CODE_TMPDIR: '',
+              CLAUDE_TMPDIR: '',
+            },
+            this.platform,
+          )
             .filter((name) => {
               const normalized = normalizedEnvironmentName(
                 name,
@@ -340,6 +444,25 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
   }
 
   async execute(
+    request: WorkspaceExecuteCommandRequest,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceExecuteCommandResult> {
+    if (this.execution || this.closing) {
+      throw new WorkspaceToolError(
+        'Native sandbox already has an active command or is closing',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
+    const execution = this.executeExclusive(request, signal);
+    this.execution = execution;
+    try {
+      return await execution;
+    } finally {
+      this.execution = undefined;
+    }
+  }
+
+  private async executeExclusive(
     request: WorkspaceExecuteCommandRequest,
     signal?: AbortSignal,
   ): Promise<WorkspaceExecuteCommandResult> {
@@ -388,6 +511,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         {
           ...TRUSTED_GIT_ENVIRONMENT,
           ...(credentialEnvironment ?? {}),
+          ...this.scratchSelectorEnvironment(),
         },
         () =>
           this.manager.wrapWithSandboxArgv(
@@ -476,6 +600,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             cwd,
             env: {
               ...wrapped.env,
+              ...this.scratchEnvironment(),
               ...TRUSTED_GIT_CONFIG_ENTRIES,
               GIT_CONFIG_COUNT:
                 wrapped.env.GIT_CONFIG_COUNT ?? TRUSTED_GIT_CONFIG_COUNT,
@@ -556,6 +681,10 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
                 'Workspace command execution aborted',
                 'EXECUTION_ABORTED',
                 true,
+                // POSIX commands run in a detached process group, so its
+                // observed close follows a group-wide SIGKILL. The Windows
+                // fallback cannot yet prove descendant termination.
+                this.platform === 'win32',
               ),
             );
             return;
@@ -618,10 +747,122 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       : 1;
   }
 
+  private async createScratchDirectory(
+    sharedScratchPaths: string[],
+  ): Promise<string | undefined> {
+    // Windows SRT supplies the restricted account's private TEMP directory.
+    if (this.platform === 'win32') return undefined;
+    if (this.scratchDirectory || this.scratchHandle) {
+      throw new Error(
+        'Native sandbox scratch cleanup is still pending; close the sandbox before reinitializing',
+      );
+    }
+    const canonicalTemporaryRoot = await canonicalPath(HOST_TEMPORARY_ROOT);
+    const sharedScratchRoot = sharedScratchPaths.find((path) =>
+      isWithin(path, canonicalTemporaryRoot),
+    );
+    const scratchDirectory = await mkdtemp(
+      join(
+        sharedScratchRoot
+          ? dirname(sharedScratchRoot)
+          : canonicalTemporaryRoot,
+        NATIVE_SANDBOX_SCRATCH_PREFIX,
+      ),
+    );
+    try {
+      await assertPrivateStorageAncestors(scratchDirectory);
+      const scratchHandle = await open(scratchDirectory, 'r');
+      try {
+        await removePrivateStorageAcl(scratchHandle, scratchDirectory);
+        await scratchHandle.chmod(0o700);
+        await assertPrivateStorageAcl(
+          scratchHandle,
+          scratchDirectory,
+          true,
+        );
+        if (((await scratchHandle.stat()).mode & 0o777) !== 0o700) {
+          throw new Error('Native sandbox scratch directory is not private');
+        }
+        this.scratchHandle = scratchHandle;
+      } catch (error) {
+        await scratchHandle.close();
+        throw error;
+      }
+      this.scratchDirectory = await realpath(scratchDirectory);
+      return this.scratchDirectory;
+    } catch (error) {
+      await this.scratchHandle?.close().catch(() => undefined);
+      this.scratchHandle = undefined;
+      await rm(scratchDirectory, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+      throw error;
+    }
+  }
+
+  private scratchEnvironment(): NodeJS.ProcessEnv {
+    const scratchDirectory = this.scratchDirectory;
+    if (!scratchDirectory) return {};
+    return this.platform === 'win32'
+      ? {
+          TMPDIR: scratchDirectory,
+          TEMP: scratchDirectory,
+          TMP: scratchDirectory,
+        }
+      : { TMPDIR: scratchDirectory };
+  }
+
+  private scratchSelectorEnvironment(): NodeJS.ProcessEnv {
+    const scratchDirectory = this.scratchDirectory;
+    if (!scratchDirectory) return {};
+    return Object.fromEntries(
+      SRT_SCRATCH_SELECTOR_NAMES.map((name) => [name, scratchDirectory]),
+    );
+  }
+
+  private async removeScratchDirectory(): Promise<void> {
+    const scratchDirectory = this.scratchDirectory;
+    if (!scratchDirectory) return;
+    const scratchHandle = this.scratchHandle;
+    if (!scratchHandle) {
+      throw new Error('Native sandbox scratch descriptor is unavailable');
+    }
+    try {
+      await rm(scratchDirectory, { recursive: true, force: true });
+    } catch {
+      await restoreScratchTraversal(scratchHandle);
+      await rm(scratchDirectory, { recursive: true, force: true });
+    }
+    // Retain both the descriptor and path when cleanup fails so close() can
+    // retry without falling back to an attacker-replaceable ambient path.
+    await scratchHandle.close();
+    this.scratchHandle = undefined;
+    this.scratchDirectory = undefined;
+  }
+
   async close(): Promise<void> {
-    if (!this.initialized) return;
-    await this.manager.reset();
+    if (this.closing) return this.closing;
+    const closing = this.closeExclusive();
+    this.closing = closing;
+    try {
+      await closing;
+    } finally {
+      this.closing = undefined;
+    }
+  }
+
+  private async closeExclusive(): Promise<void> {
+    // Never reset proxy/credential state or remove scratch beneath a live child.
+    await this.execution?.catch(() => undefined);
+    await this.initialized?.catch(() => undefined);
+    if (managerOwners.get(this.manager) === this) {
+      this.resetFailed = true;
+      await this.manager.reset();
+      this.resetFailed = false;
+      managerOwners.delete(this.manager);
+    }
     this.initialized = undefined;
     this.canonicalRoot = undefined;
+    await this.removeScratchDirectory();
   }
 }

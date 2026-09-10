@@ -18,9 +18,12 @@ import {
   isWorkspaceToolResult,
 } from '../../../packages/code/src/protocol';
 import type { BridgeWorkerBinding } from './pairing';
+import { BridgeAdmissionQueue } from './admission';
+import { BridgeWorkspaceSlots } from './slots';
 
 const PREFIX = 'codeapi:bridge:v1';
 const POLL_INTERVAL_MS = 100;
+const CANCELLED_WORKSPACE_SETTLEMENT_GRACE_MS = 5_000;
 const DEFAULT_WORKER_TTL_SECONDS = 60;
 const DEFAULT_REDIS_COMMAND_TIMEOUT_MS = 1_000;
 
@@ -43,6 +46,7 @@ export class BridgeStoreError extends Error {
       | 'WORKER_OFFLINE'
       | 'WORKER_UNAUTHORIZED'
       | 'WORKER_BUSY'
+      | 'WORKER_QUEUE_FULL'
       | 'ASSIGNMENT_EXPIRED'
       | 'ASSIGNMENT_FENCED'
       | 'ASSIGNMENT_NOT_FOUND'
@@ -62,6 +66,31 @@ export class BridgeStoreError extends Error {
 interface StoredAssignment extends CodeBridgeAssignment {
   leaseTokenHash: string;
   workerIdentityId?: string;
+  workspaceFence?: string;
+}
+
+type AssignmentOwnership = Pick<
+  StoredAssignment,
+  | 'assignmentId'
+  | 'workerId'
+  | 'incarnationId'
+  | 'workspaceFence'
+  | 'workspaceLeaseSlot'
+  | 'generation'
+  | 'leaseTokenHash'
+  | 'workerIdentityId'
+  | 'expiresAt'
+  | 'runtimeSessionId'
+>;
+
+function workspaceFenceReceiptKey(assignmentId: string): string {
+  return `${assignmentKey(assignmentId)}:workspace-fence-owner`;
+}
+
+function assignmentWorkspace(
+  assignment: AssignmentOwnership,
+): string | undefined {
+  return assignment.workspaceFence ?? assignment.runtimeSessionId;
 }
 
 export interface RegisteredBridgeWorker extends BridgeWorkerRegistration {
@@ -171,16 +200,28 @@ function workspaceQuarantineKey(
   return `${PREFIX}:worker:${encodeURIComponent(workerId)}:workspace:${sessionHash}:quarantined`;
 }
 
-function queueKey(workerId: string, incarnationId: string): string {
-  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:assignments`;
+function queueKey(
+  workerId: string,
+  incarnationId: string,
+  slot?: number,
+): string {
+  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:assignments${slot === undefined ? '' : `:slot:${slot}`}`;
 }
 
-function leaseClaimKey(workerId: string, incarnationId: string): string {
-  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:lease-claim`;
+function leaseClaimKey(
+  workerId: string,
+  incarnationId: string,
+  slot?: number,
+): string {
+  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:lease-claim${slot === undefined ? '' : `:slot:${slot}`}`;
 }
 
-function leaseAckKey(workerId: string, incarnationId: string): string {
-  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:lease-ack`;
+function leaseAckKey(
+  workerId: string,
+  incarnationId: string,
+  slot?: number,
+): string {
+  return `${PREFIX}:worker:${encodeURIComponent(workerId)}:incarnation:${incarnationId}:lease-ack${slot === undefined ? '' : `:slot:${slot}`}`;
 }
 
 function generationKey(workerId: string): string {
@@ -281,7 +322,22 @@ export class RedisBridgeStore {
     private readonly redis: Redis,
     private readonly workerTtlSeconds = DEFAULT_WORKER_TTL_SECONDS,
     private readonly redisCommandTimeoutMs = DEFAULT_REDIS_COMMAND_TIMEOUT_MS,
-  ) {}
+    private readonly maxWorkspaceLeaseSlots = 1,
+  ) {
+    if (
+      !Number.isSafeInteger(maxWorkspaceLeaseSlots) ||
+      maxWorkspaceLeaseSlots < 1 ||
+      maxWorkspaceLeaseSlots > 8
+    ) {
+      throw new Error(
+        'Workspace lease slot ceiling must be an integer from 1 to 8',
+      );
+    }
+  }
+
+  workspaceLeaseCapacity(requested = 1): number {
+    return Math.min(this.maxWorkspaceLeaseSlots, requested);
+  }
 
   private async dispatchCommand<T>(
     command: () => Promise<T>,
@@ -377,12 +433,34 @@ export class RedisBridgeStore {
 
   async register(
     registration: RegisteredBridgeWorker,
-    authorization?: string | {
-      identityId?: string;
-      pairingGeneration?: number;
-      activeCredentialId?: string;
-    },
+    authorization?:
+      | string
+      | {
+          identityId?: string;
+          pairingGeneration?: number;
+          activeCredentialId?: string;
+        },
   ): Promise<number> {
+    if (registration.capabilities.workspaceLeaseSlots !== undefined) {
+      if (
+        !isValidBridgeWorkerCapabilities(registration.capabilities) ||
+        registration.capabilities.requiresReadyConfirmation !== true
+      ) {
+        throw new BridgeStoreError(
+          'WORKER_MISMATCH',
+          'Concurrent workspaces require readiness negotiation',
+        );
+      }
+      registration = {
+        ...registration,
+        capabilities: {
+          ...registration.capabilities,
+          workspaceLeaseSlots: this.workspaceLeaseCapacity(
+            registration.capabilities.workspaceLeaseSlots,
+          ),
+        },
+      };
+    }
     const authorizationObject =
       typeof authorization === 'object' ? authorization : undefined;
     const expectedActiveCredentialId =
@@ -394,12 +472,12 @@ export class RedisBridgeStore {
       '  local pairingGeneration = redis.call(\'GET\', KEYS[7]) or "0"',
       '  if pairingGeneration ~= ARGV[5] then return -5 end',
       '  if ARGV[6] ~= "" then',
-      '    if redis.call(\'GET\', KEYS[8]) ~= ARGV[6] then return -5 end',
+      "    if redis.call('GET', KEYS[8]) ~= ARGV[6] then return -5 end",
       '  elseif ARGV[7] ~= "" and redis.call(\'GET\', KEYS[9]) ~= ARGV[7] then return -5',
       '  end',
       'end',
       'if ARGV[8] ~= "" then',
-      '  local stableIdentity = redis.call(\'GET\', KEYS[8])',
+      "  local stableIdentity = redis.call('GET', KEYS[8])",
       '  if stableIdentity and stableIdentity ~= ARGV[8] then return -4 end',
       '  if not stableIdentity then',
       '    if ARGV[7] ~= "" and redis.call(\'GET\', KEYS[9]) ~= ARGV[7] then return -4 end',
@@ -407,29 +485,31 @@ export class RedisBridgeStore {
       '  end',
       'elseif ARGV[7] ~= "" and redis.call(\'GET\', KEYS[9]) ~= ARGV[7] then return -4',
       'end',
-      'if redis.call(\'EXISTS\', KEYS[3]) == 1 then return -2 end',
-      'if redis.call(\'EXISTS\', KEYS[2]) == 1 then return -1 end',
-      'local current = redis.call(\'GET\', KEYS[4])',
-      'if not current and redis.call(\'EXISTS\', KEYS[5]) == 1 then',
-      '  local owner = redis.call(\'GET\', KEYS[6])',
+      "if redis.call('EXISTS', KEYS[3]) == 1 then return -2 end",
+      "if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end",
+      "local current = redis.call('GET', KEYS[4])",
+      "if current == ARGV[1] and redis.call('EXISTS', KEYS[5]) == 1 and (redis.call('GET', KEYS[13]) or \"1\") ~= ARGV[10] then return -3 end",
+      "if not current and redis.call('EXISTS', KEYS[5]) == 1 then",
+      "  local owner = redis.call('GET', KEYS[6])",
       '  if owner ~= ARGV[1] then return -3 end',
       'end',
       'if current then',
       '  if current ~= ARGV[1] then',
-      '    if redis.call(\'EXISTS\', KEYS[5]) == 1 then return -3 end',
-      '    redis.call(\'SET\', ARGV[4] .. current .. \':fenced\', \"1\")',
+      "    if redis.call('EXISTS', KEYS[5]) == 1 then return -3 end",
+      "    redis.call('SET', ARGV[4] .. current .. ':fenced', \"1\")",
       '  end',
       'end',
       'local registrationGeneration = tonumber(redis.call(\'GET\', KEYS[10]) or \"0\")',
-      'local registrationGenerationIncarnation = redis.call(\'GET\', KEYS[11])',
+      "local registrationGenerationIncarnation = redis.call('GET', KEYS[11])",
       'local registrationGenerationChanged = false',
       'if registrationGeneration < 1 or registrationGenerationIncarnation ~= ARGV[1] then',
-      '  registrationGeneration = redis.call(\'INCR\', KEYS[10])',
-      '  redis.call(\'SET\', KEYS[11], ARGV[1])',
+      "  registrationGeneration = redis.call('INCR', KEYS[10])",
+      "  redis.call('SET', KEYS[11], ARGV[1])",
       '  registrationGenerationChanged = true',
       'end',
       'redis.call(\'SET\', KEYS[1], ARGV[2], \"EX\", ARGV[3])',
       'redis.call(\'SET\', KEYS[4], ARGV[1], \"EX\", ARGV[3])',
+      'redis.call(\'SET\', KEYS[13], ARGV[10], \"EX\", ARGV[3])',
       'if ARGV[9] == "1" and registrationGenerationChanged then redis.call(\'DEL\', KEYS[12]) end',
       'return registrationGeneration',
     ].join('\n');
@@ -437,9 +517,12 @@ export class RedisBridgeStore {
       await boundedCommand(
         this.redis.eval(
           script,
-          12,
+          13,
           workerKey(registration.workerId),
-          incarnationFenceKey(registration.workerId, registration.incarnationId),
+          incarnationFenceKey(
+            registration.workerId,
+            registration.incarnationId,
+          ),
           quarantineKey(registration.workerId, registration.incarnationId),
           workerIncarnationKey(registration.workerId),
           lockKey(registration.workerId),
@@ -450,6 +533,7 @@ export class RedisBridgeStore {
           workerRegistrationGenerationKey(registration.workerId),
           workerRegistrationGenerationIncarnationKey(registration.workerId),
           workerReadyKey(registration.workerId),
+          `${PREFIX}:worker:${encodeURIComponent(registration.workerId)}:workspace-slot-capacity`,
           registration.incarnationId,
           JSON.stringify(registration),
           String(this.workerTtlSeconds),
@@ -460,7 +544,10 @@ export class RedisBridgeStore {
           authorizationObject?.identityId ?? '',
           expectedActiveCredentialId ?? '',
           registration.identityId ?? '',
-          registration.capabilities.requiresReadyConfirmation === true ? '1' : '0',
+          registration.capabilities.requiresReadyConfirmation === true
+            ? '1'
+            : '0',
+          String(registration.capabilities.workspaceLeaseSlots ?? 1),
         ),
         this.redisCommandTimeoutMs,
         'Bridge worker registration',
@@ -497,7 +584,9 @@ export class RedisBridgeStore {
       );
     }
     if (!Number.isSafeInteger(result) || result < 1) {
-      throw new Error('Bridge worker registration returned an invalid generation');
+      throw new Error(
+        'Bridge worker registration returned an invalid generation',
+      );
     }
     return result;
   }
@@ -571,6 +660,7 @@ export class RedisBridgeStore {
     requireTenantBinding?: boolean;
     request: WorkspaceToolRequest;
     deadlineAtMs: number;
+    executionTimeoutMs?: number;
     signal: AbortSignal;
   }): Promise<CodeBridgeWorkspaceSettlement> {
     if (!isWorkspaceToolRequest(args.request)) {
@@ -612,12 +702,25 @@ export class RedisBridgeStore {
     workspaceRequest?: WorkspaceToolRequest;
     runtimeSessionId?: string;
     deadlineAtMs: number;
+    executionTimeoutMs?: number;
     signal: AbortSignal;
     finalize?: (
       settlement: CodeBridgeSettlement,
       registration: RegisteredBridgeWorker,
     ) => Promise<CodeBridgeSettlement>;
   }): Promise<CodeBridgeSettlement> {
+    if (
+      args.executionTimeoutMs !== undefined &&
+      (args.workspaceRequest == null ||
+        !Number.isSafeInteger(args.executionTimeoutMs) ||
+        args.executionTimeoutMs < 1 ||
+        args.executionTimeoutMs > 305_000)
+    ) {
+      throw new BridgeStoreError(
+        'ASSIGNMENT_INVALID',
+        'Invalid workspace execution budget',
+      );
+    }
     this.assertDispatchActive(args.signal, args.deadlineAtMs);
     const dispatchable = await this.dispatchCommand(
       () => this.dispatchableRegistration(args.workerId),
@@ -631,6 +734,15 @@ export class RedisBridgeStore {
       );
     }
     let { registration, readyToken } = dispatchable;
+    if (
+      (registration.capabilities.workspaceLeaseSlots ?? 1) >
+      this.maxWorkspaceLeaseSlots
+    ) {
+      throw new BridgeStoreError(
+        'WORKER_MISMATCH',
+        'Worker slot negotiation exceeds this Code API replica ceiling; use consistent replica configuration',
+      );
+    }
     if (
       (args.requireTenantBinding === true && registration.binding == null) ||
       (registration.binding != null &&
@@ -680,22 +792,97 @@ export class RedisBridgeStore {
 
     const assignmentId = randomBytes(18).toString('base64url');
     const leaseToken = randomBytes(32).toString('base64url');
-    const ttlSeconds = assignmentTtlSeconds(args.deadlineAtMs);
+    // The lock is acquired before admission finishes; it must outlive the later execution deadline.
+    const ttlSeconds = assignmentTtlSeconds(
+      args.deadlineAtMs + (args.executionTimeoutMs ?? 0),
+    );
     const lockIncarnationId = registration.incarnationId;
     let assignment: StoredAssignment | undefined;
+    let workspaceLeaseSlot: number | undefined;
+    const workspaceSlots =
+      args.workspaceRequest != null &&
+      (registration.capabilities.workspaceLeaseSlots ?? 1) > 1
+        ? new BridgeWorkspaceSlots(this.redis)
+        : undefined;
     let resultCommitted = false;
+    const admission =
+      args.workspaceRequest == null
+        ? undefined
+        : new BridgeAdmissionQueue(this.redis);
     try {
-      const locked = await this.dispatchCommand(
-        () =>
-          this.acquireLock(
-            args.workerId,
-            assignmentId,
-            lockIncarnationId,
-            ttlSeconds,
-          ),
-        args,
-        'Bridge assignment lock acquisition',
-      );
+      if (
+        admission != null &&
+        !(await this.dispatchCommand(
+          () =>
+            admission.enter(
+              args.workerId,
+              assignmentId,
+              args.deadlineAtMs,
+              workspaceSlots == null
+                ? undefined
+                : args.workspaceRequest?.workspaceId,
+            ),
+          args,
+          'Bridge admission enqueue',
+        ))
+      ) {
+        throw new BridgeStoreError(
+          'WORKER_QUEUE_FULL',
+          'Bridge worker pending request limit reached',
+        );
+      }
+      let locked = false;
+      do {
+        if (
+          admission != null &&
+          workspaceSlots == null &&
+          !(await this.dispatchCommand(
+            () => admission.isHead(args.workerId, assignmentId),
+            args,
+            'Bridge admission position',
+          ))
+        ) {
+          await delay(
+            Math.min(POLL_INTERVAL_MS, args.deadlineAtMs - Date.now()),
+            args.signal,
+          );
+          continue;
+        }
+        if (workspaceSlots != null) {
+          workspaceLeaseSlot = await this.dispatchCommand(
+            () =>
+              workspaceSlots.reserve({
+                workerId: args.workerId,
+                incarnationId: lockIncarnationId,
+                assignmentId,
+                workspaceId: args.workspaceRequest!.workspaceId,
+                capacity: registration.capabilities.workspaceLeaseSlots!,
+                expiresAtMs: Date.now() + ttlSeconds * 1000,
+              }),
+            args,
+            'Bridge workspace slot acquisition',
+          );
+          locked = workspaceLeaseSlot !== undefined;
+        } else {
+          locked = await this.dispatchCommand(
+            () =>
+              this.acquireLock(
+                args.workerId,
+                assignmentId,
+                lockIncarnationId,
+                ttlSeconds,
+              ),
+            args,
+            'Bridge assignment lock acquisition',
+          );
+        }
+        if (!locked && admission != null) {
+          await delay(
+            Math.min(POLL_INTERVAL_MS, args.deadlineAtMs - Date.now()),
+            args.signal,
+          );
+        }
+      } while (!locked && admission != null);
       if (!locked) {
         throw new BridgeStoreError(
           'WORKER_BUSY',
@@ -703,6 +890,38 @@ export class RedisBridgeStore {
         );
       }
       this.assertDispatchActive(args.signal, args.deadlineAtMs);
+      if (admission != null) {
+        // Waiting must not transfer accepted work to a replacement machine or identity.
+        const current = await this.dispatchCommand(
+          () => this.dispatchableRegistration(args.workerId),
+          args,
+          'Bridge admitted worker validation',
+        );
+        if (
+          current == null ||
+          current.registration.incarnationId !== registration.incarnationId ||
+          current.registration.identityId !== registration.identityId ||
+          current.registration.binding?.tenantId !==
+            registration.binding?.tenantId
+        ) {
+          throw new BridgeStoreError(
+            'WORKER_OFFLINE',
+            'Bridge worker changed while the request was waiting',
+          );
+        }
+        if (
+          !supportsWorkspaceTool(current.registration, args.workspaceRequest!)
+        ) {
+          throw new BridgeStoreError(
+            'WORKER_MISMATCH',
+            'Bridge worker capabilities changed while the request was waiting',
+          );
+        }
+      }
+      this.assertDispatchActive(args.signal, args.deadlineAtMs);
+      if (args.executionTimeoutMs !== undefined) {
+        args = { ...args, deadlineAtMs: Date.now() + args.executionTimeoutMs };
+      }
       const generation = await this.dispatchCommand(
         () => this.redis.incr(generationKey(args.workerId)),
         args,
@@ -716,6 +935,12 @@ export class RedisBridgeStore {
         generation,
         leaseToken,
         leaseTokenHash: tokenHash(leaseToken),
+        ...(workspaceLeaseSlot === undefined
+          ? {}
+          : {
+              workspaceLeaseSlot,
+              workspaceFence: `native-workspace:${args.workspaceRequest!.workspaceId}`,
+            }),
         ...(registration.identityId != null
           ? { workerIdentityId: registration.identityId }
           : {}),
@@ -748,6 +973,12 @@ export class RedisBridgeStore {
           'Bridge assignment enqueue',
         );
         if (queued) break;
+        if (admission != null) {
+          throw new BridgeStoreError(
+            'WORKER_FENCED',
+            'Bridge worker changed before the waiting request could be dispatched',
+          );
+        }
         const replacement = await this.dispatchCommand(
           () => this.dispatchableRegistration(args.workerId),
           args,
@@ -770,7 +1001,10 @@ export class RedisBridgeStore {
         }
         if (
           args.workspaceRequest != null &&
-          !supportsWorkspaceTool(replacement.registration, args.workspaceRequest)
+          !supportsWorkspaceTool(
+            replacement.registration,
+            args.workspaceRequest,
+          )
         ) {
           throw new BridgeStoreError(
             'WORKER_MISMATCH',
@@ -810,6 +1044,14 @@ export class RedisBridgeStore {
         throw error;
       }
     } finally {
+      if (admission != null) {
+        // Expiry remains the fallback if Redis is unavailable during cancellation.
+        await boundedCommand(
+          admission.leave(args.workerId, assignmentId),
+          this.redisCommandTimeoutMs,
+          'Bridge admission cleanup',
+        ).catch(() => undefined);
+      }
       if (resultCommitted) {
         try {
           await this.cleanupWithRetry(args.workerId, assignmentId, assignment);
@@ -821,6 +1063,17 @@ export class RedisBridgeStore {
       } else {
         await this.cleanupDispatch(args.workerId, assignmentId, assignment);
       }
+      if (workspaceSlots != null && assignment == null) {
+        await boundedCommand(
+          workspaceSlots.release(
+            args.workerId,
+            lockIncarnationId,
+            assignmentId,
+          ),
+          this.redisCommandTimeoutMs,
+          'Bridge unassigned slot cleanup',
+        );
+      }
     }
   }
 
@@ -830,18 +1083,32 @@ export class RedisBridgeStore {
     waitMs: number,
     signal?: AbortSignal,
     identityId?: string,
+    slot?: number,
   ): Promise<CodeBridgeAssignment | undefined> {
+    if (slot !== undefined) {
+      const registration = await this.registration(workerId);
+      if (
+        !Number.isSafeInteger(slot) ||
+        slot < 0 ||
+        slot >= this.maxWorkspaceLeaseSlots ||
+        slot >= (registration?.capabilities.workspaceLeaseSlots ?? 1) ||
+        (registration?.capabilities.workspaceLeaseSlots ?? 1) <= 1 ||
+        registration?.incarnationId !== incarnationId
+      ) {
+        throw new BridgeStoreError(
+          'WORKER_MISMATCH',
+          'Workspace lease slot was not negotiated',
+        );
+      }
+    }
     const deadline = Date.now() + waitMs;
     let firstPoll = true;
-    while (
-      !signalAborted(signal) &&
-      (firstPoll || Date.now() < deadline)
-    ) {
+    while (!signalAborted(signal) && (firstPoll || Date.now() < deadline)) {
       firstPoll = false;
       let assignmentId: string | null;
       try {
         assignmentId = await this.leaseCommand(
-          this.claimOrPopLease(workerId, incarnationId, identityId),
+          this.claimOrPopLease(workerId, incarnationId, identityId, slot),
           signal,
           'Bridge lease claim',
         );
@@ -865,10 +1132,11 @@ export class RedisBridgeStore {
         if (
           assignment == null ||
           assignment.workerId !== workerId ||
-          assignment.incarnationId !== incarnationId
+          assignment.incarnationId !== incarnationId ||
+          assignment.workspaceLeaseSlot !== slot
         ) {
           await this.leaseCommand(
-            this.discardLeaseClaim(workerId, incarnationId, assignmentId),
+            this.discardLeaseClaim(workerId, incarnationId, assignmentId, slot),
             signal,
             'Bridge lease claim discard',
           );
@@ -891,7 +1159,7 @@ export class RedisBridgeStore {
         }
         if (assignment.workerIdentityId !== identityId) {
           await this.leaseCommand(
-            this.discardLeaseClaim(workerId, incarnationId, assignmentId),
+            this.discardLeaseClaim(workerId, incarnationId, assignmentId, slot),
             signal,
             'Bridge unauthorized lease discard',
           );
@@ -900,7 +1168,7 @@ export class RedisBridgeStore {
         if (Date.parse(assignment.expiresAt) <= Date.now()) {
           const acknowledged =
             (await this.leaseCommand(
-              this.redis.get(leaseAckKey(workerId, incarnationId)),
+              this.redis.get(leaseAckKey(workerId, incarnationId, slot)),
               signal,
               'Bridge lease acknowledgement read',
             )) === assignmentId;
@@ -912,7 +1180,7 @@ export class RedisBridgeStore {
             );
           }
           await this.leaseCommand(
-            this.discardLeaseClaim(workerId, incarnationId, assignmentId),
+            this.discardLeaseClaim(workerId, incarnationId, assignmentId, slot),
             signal,
             'Bridge expired lease discard',
           );
@@ -925,6 +1193,7 @@ export class RedisBridgeStore {
         const {
           leaseTokenHash: _leaseTokenHash,
           workerIdentityId: _workerIdentityId,
+          workspaceFence: _workspaceFence,
           ...wireAssignment
         } = assignment;
         return {
@@ -939,6 +1208,7 @@ export class RedisBridgeStore {
           workerId,
           incarnationId,
           assignmentId,
+          slot,
         );
         if (signalAborted(signal)) return undefined;
         throw error;
@@ -988,8 +1258,8 @@ export class RedisBridgeStore {
             'return 1',
           ].join('\n'),
           2,
-          leaseClaimKey(workerId, incarnationId),
-          leaseAckKey(workerId, incarnationId),
+          leaseClaimKey(workerId, incarnationId, assignment.workspaceLeaseSlot),
+          leaseAckKey(workerId, incarnationId, assignment.workspaceLeaseSlot),
           assignmentId,
           String(ttlSeconds),
         ),
@@ -1009,6 +1279,7 @@ export class RedisBridgeStore {
     workerId: string,
     incarnationId: string,
     identityId?: string,
+    slot?: number,
   ): Promise<string | null> {
     const result = await this.redis.eval(
       [
@@ -1026,8 +1297,8 @@ export class RedisBridgeStore {
         'return assignment',
       ].join('\n'),
       3,
-      queueKey(workerId, incarnationId),
-      leaseClaimKey(workerId, incarnationId),
+      queueKey(workerId, incarnationId, slot),
+      leaseClaimKey(workerId, incarnationId, slot),
       workerStableIdentityKey(workerId),
       identityId ?? '',
     );
@@ -1038,6 +1309,7 @@ export class RedisBridgeStore {
     workerId: string,
     incarnationId: string,
     assignmentId: string,
+    slot?: number,
   ): Promise<void> {
     await this.redis.eval(
       [
@@ -1047,8 +1319,8 @@ export class RedisBridgeStore {
         'return 0',
       ].join('\n'),
       2,
-      leaseClaimKey(workerId, incarnationId),
-      leaseAckKey(workerId, incarnationId),
+      leaseClaimKey(workerId, incarnationId, slot),
+      leaseAckKey(workerId, incarnationId, slot),
       assignmentId,
     );
   }
@@ -1058,6 +1330,7 @@ export class RedisBridgeStore {
       assignment.workerId,
       assignment.incarnationId,
       assignment.assignmentId,
+      assignment.workspaceLeaseSlot,
     );
   }
 
@@ -1065,6 +1338,7 @@ export class RedisBridgeStore {
     workerId: string,
     incarnationId: string,
     assignmentId: string,
+    slot?: number,
   ): Promise<void> {
     await boundedCommand(
       this.redis.eval(
@@ -1080,9 +1354,9 @@ export class RedisBridgeStore {
         ].join('\n'),
         4,
         assignmentKey(assignmentId),
-        queueKey(workerId, incarnationId),
-        leaseClaimKey(workerId, incarnationId),
-        leaseAckKey(workerId, incarnationId),
+        queueKey(workerId, incarnationId, slot),
+        leaseClaimKey(workerId, incarnationId, slot),
+        leaseAckKey(workerId, incarnationId, slot),
         assignmentId,
       ),
       this.redisCommandTimeoutMs,
@@ -1094,11 +1368,12 @@ export class RedisBridgeStore {
     workerId: string,
     incarnationId: string,
     assignmentId: string,
+    slot?: number,
   ): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        await this.returnLeaseById(workerId, incarnationId, assignmentId);
+        await this.returnLeaseById(workerId, incarnationId, assignmentId, slot);
         return;
       } catch (error) {
         lastError = error;
@@ -1111,7 +1386,7 @@ export class RedisBridgeStore {
   private async clearUndeliveredWorkspaceFence(
     assignment: StoredAssignment,
   ): Promise<void> {
-    if (assignment.runtimeSessionId === undefined) return;
+    if (assignmentWorkspace(assignment) === undefined) return;
     await this.redis.eval(
       [
         "if redis.call('GET', KEYS[1]) == ARGV[1] then",
@@ -1122,7 +1397,7 @@ export class RedisBridgeStore {
       1,
       workspaceQuarantineKey(
         assignment.workerId,
-        assignment.runtimeSessionId,
+        assignmentWorkspace(assignment)!,
       ),
       assignment.assignmentId,
     );
@@ -1134,15 +1409,28 @@ export class RedisBridgeStore {
     settlement: AnyCodeBridgeSettlement,
     signal?: AbortSignal,
     identityId?: string,
+    quarantineWorkspace = false,
   ): Promise<void> {
+    if (quarantineWorkspace) {
+      await this.quarantineSettledWorkspace(
+        workerId,
+        assignmentId,
+        settlement,
+        signal,
+        identityId,
+      );
+      return;
+    }
     const serializedSettlement = JSON.stringify(settlement);
     const existingSettlement = await this.leaseCommand(
       this.redis.get(settlementKey(assignmentId)),
       signal,
       'Bridge settlement existing read',
     );
-    if (existingSettlement === serializedSettlement) return;
-    if (existingSettlement != null) {
+    if (
+      existingSettlement != null &&
+      existingSettlement !== serializedSettlement
+    ) {
       throw new BridgeStoreError(
         'ASSIGNMENT_FENCED',
         'Bridge assignment was already settled with a different result',
@@ -1153,7 +1441,14 @@ export class RedisBridgeStore {
       signal,
       'Bridge settlement assignment read',
     );
+    if (
+      existingSettlement === serializedSettlement &&
+      (assignment?.workspaceLeaseSlot === undefined ||
+        settlement.status !== 'rejected')
+    )
+      return;
     if (assignment == null) {
+      if (existingSettlement === serializedSettlement) return;
       throw new BridgeStoreError(
         'ASSIGNMENT_NOT_FOUND',
         'Bridge assignment was not found',
@@ -1195,38 +1490,48 @@ export class RedisBridgeStore {
     const settlementKeys = [
       assignmentKey(assignmentId),
       settlementKey(assignmentId),
-      leaseClaimKey(workerId, assignment.incarnationId),
-      leaseAckKey(workerId, assignment.incarnationId),
+      leaseClaimKey(
+        workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
+      leaseAckKey(
+        workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
       assignmentDeadlineKey(assignmentId),
     ];
-    if (assignment.runtimeSessionId !== undefined) {
+    if (assignmentWorkspace(assignment) !== undefined) {
       settlementKeys.push(
-        workspaceQuarantineKey(workerId, assignment.runtimeSessionId),
+        workspaceQuarantineKey(workerId, assignmentWorkspace(assignment)!),
       );
     }
-    const hasWorkspace = assignment.runtimeSessionId !== undefined;
+    const hasWorkspace = assignmentWorkspace(assignment) !== undefined;
     settlementKeys.push(
       `${PREFIX}:stable-identity:${workerId}`,
       workerIncarnationKey(workerId),
     );
     const script = [
-      'local existing = redis.call(\'GET\', KEYS[2])',
+      "local existing = redis.call('GET', KEYS[2])",
       'if existing then',
       '  if existing == ARGV[1] then return 2 end',
       '  return -1',
       'end',
-      'if redis.call(\'EXISTS\', KEYS[1]) == 0 then return 0 end',
+      "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end",
       'if ARGV[6] == "1" and redis.call(\'GET\', KEYS[6]) ~= ARGV[3] then return -2 end',
       'if ARGV[4] ~= "rejected" and redis.call(\'EXISTS\', KEYS[5]) == 0 then return -3 end',
       'local stableIdentityKey = KEYS[#KEYS - 1]',
       'if ARGV[5] ~= "" then',
-      '  if redis.call(\'GET\', stableIdentityKey) ~= ARGV[5] then return -4 end',
-      'elseif redis.call(\'EXISTS\', stableIdentityKey) == 1 then return -4',
+      "  if redis.call('GET', stableIdentityKey) ~= ARGV[5] then return -4 end",
+      "elseif redis.call('EXISTS', stableIdentityKey) == 1 then return -4",
       'end',
-      'if redis.call(\'GET\', KEYS[#KEYS]) ~= ARGV[7] then return -4 end',
+      "if redis.call('GET', KEYS[#KEYS]) ~= ARGV[7] then return -4 end",
       'redis.call(\'SET\', KEYS[2], ARGV[1], \"EX\", ARGV[2])',
-      'if redis.call(\'GET\', KEYS[3]) == ARGV[3] then redis.call(\'DEL\', KEYS[3], KEYS[4]) end',
-      'if ARGV[6] == "1" and ARGV[4] == "rejected" then redis.call(\'DEL\', KEYS[6]) end',
+      "if redis.call('GET', KEYS[3]) == ARGV[3] then redis.call('DEL', KEYS[3], KEYS[4]) end",
+      'if ARGV[6] == "1" and ARGV[4] == "rejected" and ARGV[8] ~= "1" then',
+      "  redis.call('DEL', KEYS[6])",
+      'end',
       'return 1',
     ].join('\n');
     const accepted = Number(
@@ -1242,6 +1547,7 @@ export class RedisBridgeStore {
           identityId ?? '',
           hasWorkspace ? '1' : '0',
           settlement.incarnationId,
+          assignment.workspaceLeaseSlot === undefined ? '0' : '1',
         ),
         signal,
         'Bridge settlement commit',
@@ -1276,6 +1582,15 @@ export class RedisBridgeStore {
         'ASSIGNMENT_EXPIRED',
         'Bridge assignment closed before settlement was committed',
       );
+    }
+    if (
+      assignment.workspaceLeaseSlot !== undefined &&
+      settlement.status === 'rejected'
+    ) {
+      // The dispatcher may already have timed out and finished its cleanup.
+      // Release only this settled reservation, retaining a quarantine marker.
+      await this.commitPendingWorkspace(assignment, settlement);
+      await this.cleanupWithRetry(workerId, assignmentId, assignment);
     }
   }
 
@@ -1346,6 +1661,126 @@ export class RedisBridgeStore {
     );
   }
 
+  async confirmWorkspaceCleanup(
+    workerId: string,
+    assignmentId: string,
+    intent: AnyCodeBridgeSettlement,
+    signal?: AbortSignal,
+    identityId?: string,
+  ): Promise<void> {
+    await this.quarantineSettledWorkspace(
+      workerId,
+      assignmentId,
+      intent,
+      signal,
+      identityId,
+      false,
+    );
+  }
+
+  private async quarantineSettledWorkspace(
+    workerId: string,
+    assignmentId: string,
+    settlement: AnyCodeBridgeSettlement,
+    signal?: AbortSignal,
+    identityId?: string,
+    quarantine = true,
+  ): Promise<void> {
+    // Keep a small, expiring ownership receipt separate from assignment cleanup.
+    // A local guard can fail to clear after the result has already committed.
+    const receiptKey = workspaceFenceReceiptKey(assignmentId);
+    const raw = await this.leaseCommand(
+      this.redis.hgetall(receiptKey),
+      signal,
+      'Workspace fence ownership read',
+    );
+    const receipt =
+      raw.metadata == null
+        ? undefined
+        : (JSON.parse(raw.metadata) as AssignmentOwnership);
+    if (
+      receipt == null ||
+      receipt.workerId !== workerId ||
+      receipt.assignmentId !== assignmentId ||
+      receipt.workspaceFence == null ||
+      receipt.workspaceLeaseSlot === undefined ||
+      settlement.status !== 'rejected' ||
+      receipt.incarnationId !== settlement.incarnationId ||
+      receipt.generation !== settlement.generation ||
+      receipt.leaseTokenHash !== tokenHash(settlement.leaseToken) ||
+      receipt.workerIdentityId !== identityId
+    ) {
+      throw new BridgeStoreError(
+        'ASSIGNMENT_FENCED',
+        'Workspace quarantine ownership is stale',
+      );
+    }
+    const fence = workspaceQuarantineKey(workerId, receipt.workspaceFence);
+    const accepted = Number(
+      await this.leaseCommand(
+        this.redis.eval(
+          [
+            "if redis.call('HGET', KEYS[1], 'metadata') ~= ARGV[1] then return 0 end",
+            "if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[4] then return 0 end",
+            "if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end",
+            "if (redis.call('GET', KEYS[3]) or '') ~= ARGV[3] then return 0 end",
+            "if (redis.call('GET', KEYS[4]) or '0') ~= ARGV[4] then return 0 end",
+            'if ARGV[8] == "1" then',
+            // A completed cleanup receipt is terminal: a lost response must
+            // not let a late quarantine overwrite a newer root owner.
+            "  if redis.call('HGET', KEYS[1], 'localCleanup') == '1' and redis.call('HGET', KEYS[1], 'resultCommitted') == '1' then return 1 end",
+            "  redis.call('SET', KEYS[5], 'quarantined:' .. ARGV[5])",
+            // Never replace a committed result. Before settlement, terminate the waiter.
+            "  redis.call('SET', KEYS[6], ARGV[6], 'EX', ARGV[7], 'NX')",
+            'else',
+            "  local fence = redis.call('GET', KEYS[5])",
+            "  if fence and string.sub(fence, 1, 12) == 'quarantined:' then return 0 end",
+            "  redis.call('HSET', KEYS[1], 'localCleanup', '1')",
+            "  if redis.call('HGET', KEYS[1], 'resultCommitted') == '1' and fence == ARGV[5] then redis.call('DEL', KEYS[5]) end",
+            'end',
+            "if redis.call('GET', KEYS[7]) == ARGV[5] then redis.call('DEL', KEYS[7]) end",
+            "if redis.call('GET', KEYS[8]) == ARGV[5] then redis.call('DEL', KEYS[8]) end",
+            'return 1',
+          ].join('\n'),
+          8,
+          receiptKey,
+          workerIncarnationKey(workerId),
+          workerStableIdentityKey(workerId),
+          `${fence}:epoch`,
+          fence,
+          settlementKey(assignmentId),
+          leaseClaimKey(
+            workerId,
+            receipt.incarnationId,
+            receipt.workspaceLeaseSlot,
+          ),
+          leaseAckKey(
+            workerId,
+            receipt.incarnationId,
+            receipt.workspaceLeaseSlot,
+          ),
+          raw.metadata,
+          receipt.incarnationId,
+          identityId ?? '',
+          raw.epoch,
+          assignmentId,
+          JSON.stringify(settlement),
+          assignmentTtlSeconds(Date.parse(receipt.expiresAt)),
+          quarantine ? '1' : '0',
+        ),
+        signal,
+        'Workspace quarantine fence commit',
+      ),
+    );
+    if (accepted !== 1) {
+      throw new BridgeStoreError(
+        'ASSIGNMENT_FENCED',
+        'Workspace quarantine ownership changed or was reset',
+      );
+    }
+    await this.cleanupWithRetry(workerId, assignmentId, receipt);
+  }
+
   async resetWorkspace(
     workerId: string,
     incarnationId: string,
@@ -1359,12 +1794,14 @@ export class RedisBridgeStore {
             "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end",
             "if redis.call('EXISTS', KEYS[2]) == 1 then return -2 end",
             "redis.call('DEL', KEYS[3])",
+            "if redis.call('EXISTS', KEYS[4]) == 1 then redis.call('INCR', KEYS[4]) end",
             'return 1',
           ].join('\n'),
-          3,
+          4,
           workerIncarnationKey(workerId),
           lockKey(workerId),
           workspaceQuarantineKey(workerId, runtimeSessionId),
+          `${workspaceQuarantineKey(workerId, runtimeSessionId)}:epoch`,
           incarnationId,
         ),
         signal,
@@ -1465,16 +1902,65 @@ export class RedisBridgeStore {
       // settlement before returning an error, even when the caller is gone.
       pollError = error;
     }
+    const workspaceRequest =
+      assignment.executionKind === 'workspace_tool' &&
+      isWorkspaceToolRequest(assignment.request)
+        ? assignment.request
+        : undefined;
+    const cancelledMutation =
+      signal.aborted &&
+      workspaceRequest != null &&
+      (workspaceRequest.operation === 'write_file' ||
+        workspaceRequest.operation === 'edit_file' ||
+        workspaceRequest.operation === 'execute_command');
+    if (cancelledMutation) {
+      try {
+        // Keep the acknowledged assignment available long enough for the
+        // worker to terminate its process tree and commit a clean rejection.
+        // Closing it first makes that rejection impossible to acknowledge and
+        // leaves the worker's durable mutation guard armed.
+        await this.cancel(assignment.assignmentId, assignment);
+        // Rejected settlements remain valid after the execution deadline.
+        // Give Stop its own grace so a near-timeout cancellation is not
+        // misclassified as an ambiguous timeout.
+        const cancellationDeadlineAtMs =
+          Date.now() + CANCELLED_WORKSPACE_SETTLEMENT_GRACE_MS;
+        let cancellationPollMs = POLL_INTERVAL_MS;
+        while (Date.now() < cancellationDeadlineAtMs) {
+          const raw = await boundedCommand(
+            this.redis.get(settlementKey(assignment.assignmentId)),
+            Math.max(
+              1,
+              Math.min(
+                this.redisCommandTimeoutMs,
+                cancellationDeadlineAtMs - Date.now(),
+              ),
+            ),
+            'Bridge cancelled workspace settlement poll',
+          );
+          if (raw != null) return JSON.parse(raw) as CodeBridgeSettlement;
+          await delay(
+            Math.min(
+              cancellationPollMs,
+              Math.max(0, cancellationDeadlineAtMs - Date.now()),
+            ),
+          );
+          cancellationPollMs = Math.min(cancellationPollMs * 2, 500);
+        }
+      } catch (error) {
+        pollError ??= error;
+      }
+    }
     const closeKeys = [
       assignmentKey(assignment.assignmentId),
       settlementKey(assignment.assignmentId),
       assignmentDeadlineKey(assignment.assignmentId),
     ];
-    if (assignment.runtimeSessionId !== undefined) {
+    if (assignmentWorkspace(assignment) !== undefined) {
       closeKeys.push(
         workspaceQuarantineKey(
           assignment.workerId,
-          assignment.runtimeSessionId,
+          assignmentWorkspace(assignment)!,
         ),
       );
     }
@@ -1482,11 +1968,11 @@ export class RedisBridgeStore {
     // Keep acknowledged assignment metadata for late clean rejection recovery,
     // but atomically revoke fulfillment when no settlement has won yet.
     const closeScript = [
-      'local settlement = redis.call(\'GET\', KEYS[2])',
+      "local settlement = redis.call('GET', KEYS[2])",
       'if settlement then return settlement end',
-      'redis.call(\'DEL\', KEYS[3])',
-      'if #KEYS == 4 and redis.call(\'GET\', KEYS[4]) == ARGV[1] then return nil end',
-      'redis.call(\'DEL\', KEYS[1])',
+      "redis.call('DEL', KEYS[3])",
+      "if #KEYS == 4 and redis.call('GET', KEYS[4]) == ARGV[1] then return nil end",
+      "redis.call('DEL', KEYS[1])",
       'return nil',
     ].join('\n');
     const finalSettlement = await boundedCommand(
@@ -1513,19 +1999,14 @@ export class RedisBridgeStore {
 
   private async cancel(
     assignmentId: string,
-    assignment?: StoredAssignment,
+    assignment?: AssignmentOwnership,
   ): Promise<void> {
     const ttlSeconds =
       assignment == null
         ? 30
         : assignmentTtlSeconds(Date.parse(assignment.expiresAt));
     await boundedCommand(
-      this.redis.set(
-        cancellationKey(assignmentId),
-        '1',
-        'EX',
-        ttlSeconds,
-      ),
+      this.redis.set(cancellationKey(assignmentId), '1', 'EX', ttlSeconds),
       this.redisCommandTimeoutMs,
       'Bridge assignment cancellation',
     );
@@ -1537,31 +2018,61 @@ export class RedisBridgeStore {
     readyToken?: string,
   ): Promise<boolean> {
     const script = [
-      'if redis.call(\'GET\', KEYS[1]) ~= ARGV[1] then return 0 end',
+      "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
       'if ARGV[7] ~= "" and redis.call(\'GET\', KEYS[6]) ~= ARGV[7] then return 0 end',
-      'if #KEYS == 7 and redis.call(\'EXISTS\', KEYS[7]) == 1 then return -1 end',
+      "if #KEYS >= 7 and redis.call('EXISTS', KEYS[7]) == 1 then return -1 end",
       'redis.call(\'SET\', KEYS[2], ARGV[2], \"EX\", ARGV[3])',
-      'redis.call(\'RPUSH\', KEYS[3], ARGV[4])',
-      'redis.call(\'EXPIRE\', KEYS[3], ARGV[3])',
-      'redis.call(\'SET\', KEYS[4], ARGV[1], \"PX\", ARGV[5])',
+      "redis.call('RPUSH', KEYS[3], ARGV[4])",
+      "redis.call('EXPIRE', KEYS[3], ARGV[3])",
+      ...(assignment.workspaceLeaseSlot === undefined
+        ? ['redis.call(\'SET\', KEYS[4], ARGV[1], \"PX\", ARGV[5])']
+        : []),
       'redis.call(\'SET\', KEYS[5], "1", \"PXAT\", ARGV[6])',
-      'if #KEYS == 7 then redis.call(\'SET\', KEYS[7], ARGV[4]) end',
+      "if #KEYS >= 7 then redis.call('SET', KEYS[7], ARGV[4]) end",
+      'if #KEYS == 9 then',
+      "  local epoch = redis.call('GET', KEYS[9])",
+      "  if type(epoch) ~= 'string' then epoch = '0'; redis.call('SET', KEYS[9], epoch, 'EX', ARGV[3]) end",
+      "  if redis.call('PTTL', KEYS[9]) < tonumber(ARGV[3]) * 1000 then redis.call('EXPIRE', KEYS[9], ARGV[3]) end",
+      "  redis.call('HSET', KEYS[8], 'metadata', ARGV[8], 'epoch', epoch)",
+      "  redis.call('EXPIRE', KEYS[8], ARGV[3])",
+      'end',
       'return 1',
     ].join('\n');
     const keys = [
       workerIncarnationKey(assignment.workerId),
       assignmentKey(assignment.assignmentId),
-      queueKey(assignment.workerId, assignment.incarnationId),
+      queueKey(
+        assignment.workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
       lockIncarnationKey(assignment.workerId),
       assignmentDeadlineKey(assignment.assignmentId),
       workerReadyKey(assignment.workerId),
     ];
-    if (assignment.runtimeSessionId !== undefined) {
+    if (assignmentWorkspace(assignment) !== undefined) {
       keys.push(
         workspaceQuarantineKey(
           assignment.workerId,
-          assignment.runtimeSessionId,
+          assignmentWorkspace(assignment)!,
         ),
+      );
+    }
+    const receipt: AssignmentOwnership = {
+      assignmentId: assignment.assignmentId,
+      workerId: assignment.workerId,
+      incarnationId: assignment.incarnationId,
+      workspaceFence: assignment.workspaceFence,
+      workspaceLeaseSlot: assignment.workspaceLeaseSlot,
+      generation: assignment.generation,
+      leaseTokenHash: assignment.leaseTokenHash,
+      workerIdentityId: assignment.workerIdentityId,
+      expiresAt: assignment.expiresAt,
+    };
+    if (assignment.workspaceLeaseSlot !== undefined) {
+      keys.push(
+        workspaceFenceReceiptKey(assignment.assignmentId),
+        `${workspaceQuarantineKey(assignment.workerId, assignment.workspaceFence!)}:epoch`,
       );
     }
     const result = await this.redis.eval(
@@ -1575,6 +2086,7 @@ export class RedisBridgeStore {
       String(ttlSeconds * 1000),
       String(Date.parse(assignment.expiresAt)),
       readyToken ?? '',
+      JSON.stringify(receipt),
     );
     if (Number(result) === -1) {
       throw new BridgeStoreError(
@@ -1612,7 +2124,7 @@ export class RedisBridgeStore {
   private async cleanupDispatch(
     workerId: string,
     assignmentId: string,
-    assignment: StoredAssignment | undefined,
+    assignment: AssignmentOwnership | undefined,
   ): Promise<void> {
     await Promise.all([
       this.cancel(assignmentId, assignment),
@@ -1630,16 +2142,45 @@ export class RedisBridgeStore {
     assignment: StoredAssignment,
     settlement: AnyCodeBridgeSettlement,
   ): Promise<void> {
+    if (assignment.workspaceLeaseSlot !== undefined) {
+      const committed = Number(
+        await boundedCommand(
+          this.redis.eval(
+            [
+              "if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end",
+              "redis.call('HSET', KEYS[2], 'resultCommitted', '1')",
+              "if redis.call('HGET', KEYS[2], 'localCleanup') == '1' and redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end",
+              'return 1',
+            ].join('\n'),
+            2,
+            workspaceQuarantineKey(
+              assignment.workerId,
+              assignment.workspaceFence!,
+            ),
+            workspaceFenceReceiptKey(assignment.assignmentId),
+            assignment.assignmentId,
+          ),
+          this.redisCommandTimeoutMs,
+          'Bridge native workspace result commit',
+        ),
+      );
+      if (committed !== 1)
+        throw new BridgeStoreError(
+          'WORKSPACE_QUARANTINED',
+          'Native workspace cleanup ownership expired',
+        );
+      return;
+    }
     if (
-      assignment.runtimeSessionId === undefined ||
+      assignmentWorkspace(assignment) === undefined ||
       settlement.status !== 'fulfilled'
     ) {
       return;
     }
-    const runtimeSessionId = assignment.runtimeSessionId;
+    const runtimeSessionId = assignmentWorkspace(assignment)!;
     const script = [
-      'if redis.call(\'GET\', KEYS[1]) == ARGV[1] then',
-      '  return redis.call(\'DEL\', KEYS[1])',
+      "if redis.call('GET', KEYS[1]) == ARGV[1] then",
+      "  return redis.call('DEL', KEYS[1])",
       'end',
       'return 0',
     ].join('\n');
@@ -1648,10 +2189,7 @@ export class RedisBridgeStore {
         this.redis.eval(
           script,
           1,
-          workspaceQuarantineKey(
-            assignment.workerId,
-            runtimeSessionId,
-          ),
+          workspaceQuarantineKey(assignment.workerId, runtimeSessionId),
           assignment.assignmentId,
         ),
         // Once settlement wins, caller cancellation must not prevent its
@@ -1671,7 +2209,7 @@ export class RedisBridgeStore {
   private async cleanupWithRetry(
     workerId: string,
     assignmentId: string,
-    assignment: StoredAssignment | undefined,
+    assignment: AssignmentOwnership | undefined,
   ): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1686,17 +2224,29 @@ export class RedisBridgeStore {
     throw lastError;
   }
 
-  private async cleanup(assignment: StoredAssignment): Promise<void> {
+  private async cleanup(assignment: AssignmentOwnership): Promise<void> {
     const keys = [
       assignmentKey(assignment.assignmentId),
-      queueKey(assignment.workerId, assignment.incarnationId),
-      leaseClaimKey(assignment.workerId, assignment.incarnationId),
-      leaseAckKey(assignment.workerId, assignment.incarnationId),
-      assignment.runtimeSessionId === undefined
+      queueKey(
+        assignment.workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
+      leaseClaimKey(
+        assignment.workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
+      leaseAckKey(
+        assignment.workerId,
+        assignment.incarnationId,
+        assignment.workspaceLeaseSlot,
+      ),
+      assignmentWorkspace(assignment) === undefined
         ? `${assignmentKey(assignment.assignmentId)}:no-workspace`
         : workspaceQuarantineKey(
             assignment.workerId,
-            assignment.runtimeSessionId,
+            assignmentWorkspace(assignment)!,
           ),
     ];
     const cleanupScript = [
@@ -1709,10 +2259,15 @@ export class RedisBridgeStore {
       'if claimed and not acknowledged then',
       "  redis.call('DEL', KEYS[3], KEYS[4])",
       'end',
+      'if ARGV[3] == "1" and redis.call(\'GET\', KEYS[5]) == ARGV[1] then return -1 end',
       'if queued == 0 and acknowledged and ARGV[2] == "1" and redis.call(\'GET\', KEYS[5]) == ARGV[1] then',
       '  return -1',
       'end',
-      "return redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])",
+      // A delayed cleanup can outlive its lock. Never erase the next
+      // assignment's claim or acknowledgement when that happens.
+      "if claimed then redis.call('DEL', KEYS[3]) end",
+      "if acknowledged then redis.call('DEL', KEYS[4]) end",
+      "return redis.call('DEL', KEYS[1])",
     ].join('\n');
     const cleanupResult = Number(
       await boundedCommand(
@@ -1721,7 +2276,8 @@ export class RedisBridgeStore {
           keys.length,
           ...keys,
           assignment.assignmentId,
-          assignment.runtimeSessionId === undefined ? '0' : '1',
+          assignmentWorkspace(assignment) === undefined ? '0' : '1',
+          assignment.workspaceLeaseSlot === undefined ? '0' : '1',
         ),
         this.redisCommandTimeoutMs,
         'Bridge assignment cleanup',
@@ -1729,7 +2285,13 @@ export class RedisBridgeStore {
     );
     if (cleanupResult !== -1) {
       await boundedCommand(
-        this.releaseLock(assignment.workerId, assignment.assignmentId),
+        assignment.workspaceLeaseSlot === undefined
+          ? this.releaseLock(assignment.workerId, assignment.assignmentId)
+          : new BridgeWorkspaceSlots(this.redis).release(
+              assignment.workerId,
+              assignment.incarnationId,
+              assignment.assignmentId,
+            ),
         this.redisCommandTimeoutMs,
         'Bridge assignment lock release',
       );

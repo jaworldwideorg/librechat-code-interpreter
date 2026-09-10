@@ -126,8 +126,10 @@ cut.
 
 Copy `.env.example` to `.env` and set `CODEAPI_BRIDGE_TOKEN` to a private value
 of at least 32 bytes (generate one with `openssl rand -hex 32`). The API exposes
-bridge routes even with the default HTTP sandbox backend, so hardened mode
-requires this enrollment credential. Compose defaults to
+bridge routes when configured through the remote-bridge backend, paired auth,
+dynamic workers, or a bridge token. Hardened deployments with none of these
+configured leave bridge routes disabled and do not require a bridge token.
+Enabled bridges still require this enrollment credential. Compose defaults to
 `CODEAPI_BRIDGE_AUTH_MODE=paired` and `CODEAPI_BRIDGE_DYNAMIC_WORKERS=true`.
 To restrict pairing to a fixed worker, set `CODEAPI_BRIDGE_DYNAMIC_WORKERS=false`
 and `CODEAPI_BRIDGE_WORKER_ID` to its ID. Keep the token outside workspaces and
@@ -152,6 +154,15 @@ is populated by a guest wrapper in private `/run` runtime storage before any
 read-only root disk does not need modification at boot. Rebuild the runner
 image to pick up this layout change. A missing resolver handoff fails startup
 rather than leaving the guest with an unrelated public DNS server.
+
+libkrun delivers the guest environment on the kernel command line, which only
+carries single-line printable ASCII and is capped at 2048 bytes by the guest
+kernel. The launcher entrypoint therefore forwards only the `nameserver`,
+`search`, `domain`, `options` and `sortlist` directives, joined by `|`, and the
+guest wrapper expands them back into `/etc/resolv.conf` lines. The launcher
+rejects any forwarded variable that would not survive that trip (control
+characters, non-ASCII bytes, quoting the kernel would split, or an oversized
+environment) with a named error instead of a libkrun panic and restart loop.
 
 To validate a deployment, execute code that creates a file in `/mnt/data`,
 confirm the response includes its file reference, and download it. Recreate the

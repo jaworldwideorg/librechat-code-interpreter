@@ -5,6 +5,7 @@ import { readRuntimeSessionRecord } from '../runtime-session/registry';
 import { HostedAppControlPlaneError } from './control-plane';
 import {
   hostedAppRuntimeIdFromHostname,
+  hostedAppRequestHostname,
   HostedAppPreviewAccessError,
   hostedAppPreviewOwnerBinding,
   signHostedAppPreviewAccess,
@@ -15,16 +16,6 @@ import { applyHostedAppPreviewSecurityHeaders } from './proxy-policy';
 
 const COOKIE_NAME = '__Host-codeapi-app';
 const PREVIEW_COOKIE_TTL_MS = 60 * 60_000;
-
-function rawHostname(req: Request): string | undefined {
-  const host = req.headers.host;
-  if (!host || /[\s/@\\]/.test(host)) return undefined;
-  try {
-    return new URL(`http://${host}`).hostname;
-  } catch {
-    return undefined;
-  }
-}
 
 function cookie(req: Request, name: string): string | undefined {
   for (const item of (req.headers.cookie ?? '').split(';')) {
@@ -49,13 +40,47 @@ function reject(res: Response, status: number, message: string): Response {
   return res.status(status).type('text/plain').send(message);
 }
 
+/**
+ * End the cross-site navigation before loading the app. A SameSite=Strict
+ * cookie set on a cross-site HTTP redirect can remain excluded for the whole
+ * redirect chain. Loading this small document first makes its navigation to
+ * `/` originate from the preview site while keeping the cookie Strict.
+ */
+export function sendHostedAppPreviewAuthorizationHandoff(
+  res: Response,
+  sessionToken: string,
+  maxAge: number,
+): Response {
+  res.setHeader('Set-Cookie', [
+    `${COOKIE_NAME}=${encodeURIComponent(sessionToken)}`,
+    'Path=/',
+    'HttpOnly',
+    'Secure',
+    'SameSite=Strict',
+    `Max-Age=${maxAge}`,
+  ].join('; '));
+  res.setHeader('Cache-Control', 'no-store');
+  return res.status(200).type('html').send([
+    '<!doctype html>',
+    '<html><head>',
+    '<meta charset="utf-8">',
+    '<meta name="referrer" content="no-referrer">',
+    '<meta http-equiv="refresh" content="0;url=/">',
+    '<title>Opening preview</title>',
+    '</head><body>',
+    '<script>location.replace("/")</script>',
+    '<p><a href="/">Continue to preview</a></p>',
+    '</body></html>',
+  ].join(''));
+}
+
 export async function hostedAppPreviewGateway(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   if (!env.HOSTED_APPS_ENABLED || !env.HOSTED_APP_PREVIEW_ORIGIN) return next();
-  const hostname = rawHostname(req);
+  const hostname = hostedAppRequestHostname(req.headers.host);
   const runtimeId = hostname
     ? hostedAppRuntimeIdFromHostname(hostname, env.HOSTED_APP_PREVIEW_ORIGIN)
     : undefined;
@@ -111,16 +136,7 @@ export async function hostedAppPreviewGateway(
         expiresAt,
       }, previewKey());
       const maxAge = Math.max(1, Math.floor((expiresAt - Date.now()) / 1_000));
-      res.setHeader('Set-Cookie', [
-        `${COOKIE_NAME}=${encodeURIComponent(sessionToken)}`,
-        'Path=/',
-        'HttpOnly',
-        'Secure',
-        'SameSite=Strict',
-        `Max-Age=${maxAge}`,
-      ].join('; '));
-      res.setHeader('Cache-Control', 'no-store');
-      res.redirect(303, '/');
+      sendHostedAppPreviewAuthorizationHandoff(res, sessionToken, maxAge);
       return;
     }
 

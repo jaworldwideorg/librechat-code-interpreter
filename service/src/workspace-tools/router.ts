@@ -3,11 +3,16 @@ import { Router } from 'express';
 import type { RequestHandler, Response } from 'express';
 import type { AuthenticatedRequest } from '../types';
 import type { RedisBridgeStore } from '../bridge/store';
+import type { WorkspaceToolRequest } from '../../../packages/code/src/protocol';
 
+import { getWorkspaceToolOutcome } from './outcome';
 import { getPrincipalOrReject } from '../auth/principal';
 import { BridgeStoreError } from '../bridge/store';
 import { checkServiceShutDown } from '../lifecycle';
-import { isWorkspaceToolRequest } from '../../../packages/code/src/protocol';
+import {
+  isWorkspaceToolRequest,
+  BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+} from '../../../packages/code/src/protocol';
 import {
   CODEAPI_BRIDGE_WORKER_HEADER,
   BridgeWorkerSelectionError,
@@ -20,6 +25,7 @@ interface WorkspaceToolsRouterOptions {
   configuredWorkerId: string;
   dynamicWorkers: boolean;
   timeoutMs?: number;
+  queueTimeoutMs?: number;
   isShuttingDown?: () => boolean;
 }
 
@@ -30,6 +36,7 @@ function asyncRoute(handler: (req: AuthenticatedRequest, res: Response) => Promi
 }
 
 export function bridgeStoreStatus(error: BridgeStoreError): number {
+  if (error.code === 'WORKER_QUEUE_FULL') return 429;
   if (error.code === 'WORKER_UNAUTHORIZED') return 403;
   if (error.code === 'ASSIGNMENT_INVALID') return 400;
   if (error.code === 'RESULT_INVALID') return 502;
@@ -41,23 +48,49 @@ export function bridgeStoreStatus(error: BridgeStoreError): number {
 }
 
 export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions): Router {
+  const queueBudgetMs = options.queueTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(queueBudgetMs) || queueBudgetMs < 1 || queueBudgetMs > 30_000) {
+    throw new RangeError('Workspace queue timeout must be between 1 and 30000 milliseconds');
+  }
+  if (options.timeoutMs !== undefined && (
+    !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1
+  )) {
+    throw new RangeError('Workspace execution timeout must be a positive safe integer');
+  }
   const router = Router();
 
   router.post(
     '/workspace-tools/execute',
     asyncRoute(async (req, res) => {
+      const outcome = getWorkspaceToolOutcome(res);
       const principal = getPrincipalOrReject(req, res);
-      if (!principal) return;
+      if (!principal) {
+        outcome.errorCode = 'UNAUTHENTICATED';
+        return;
+      }
       if ((options.isShuttingDown ?? checkServiceShutDown)()) {
+        outcome.errorCode = 'SERVICE_SHUTTING_DOWN';
         res.status(503).json({ error: 'Service is shutting down' });
         return;
       }
       if (!isWorkspaceToolRequest(req.body)) {
+        outcome.errorCode = 'INVALID_WORKSPACE_TOOL_REQUEST';
         res.status(400).json({
           error: 'Invalid workspace tool request',
         });
         return;
       }
+      outcome.operation = req.body.operation;
+      const request: WorkspaceToolRequest = req.body.operation === 'execute_command'
+        ? { ...req.body, timeoutMs: Math.min(
+          req.body.timeoutMs ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+          options.timeoutMs ?? Number.MAX_SAFE_INTEGER,
+        ) }
+        : req.body;
+      const executionBudgetMs = request.operation === 'execute_command'
+        ? request.timeoutMs! + 5_000
+        : Math.min(options.timeoutMs ?? 30_000, 30_000);
+      outcome.deadlineBudgetMs = queueBudgetMs + executionBudgetMs;
 
       let selection: { workerId: string; explicit: boolean } | undefined;
       try {
@@ -70,36 +103,45 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
         });
       } catch (error) {
         if (error instanceof BridgeWorkerSelectionError) {
+          outcome.errorCode = 'WORKER_SELECTION_REJECTED';
           res.status(error.status).json({ error: error.message });
           return;
         }
         throw error;
       }
       if (selection == null) {
+        outcome.errorCode = 'WORKSPACE_BACKEND_UNAVAILABLE';
         res.status(503).json({
           error: 'Workspace tools require the remote-bridge backend',
         });
         return;
       }
+      outcome.workerId = selection.workerId;
 
       const controller = new AbortController();
-      const abort = () => controller.abort();
+      const abort = (): void => controller.abort();
       req.once('aborted', abort);
-      const abortClosedResponse = () => {
+      const abortClosedResponse = (): void => {
         if (!res.writableEnded) abort();
       };
       res.once('close', abortClosedResponse);
       try {
+        outcome.dispatchPending = true;
+        const dispatchStartedAt = performance.now();
         const settlement = await options.store.dispatchWorkspaceTool({
           workerId: selection.workerId,
           tenantId: principal.tenantId,
           requireTenantBinding:
             selection.explicit && (options.dynamicWorkers || selection.workerId !== options.configuredWorkerId),
-          request: req.body,
-          deadlineAtMs: Date.now() + Math.max(1, options.timeoutMs ?? 30_000),
+          request,
+          deadlineAtMs: Date.now() + queueBudgetMs,
+          executionTimeoutMs: executionBudgetMs,
           signal: controller.signal,
+        }).finally(() => {
+          outcome.dispatchDurationMs = Math.round(performance.now() - dispatchStartedAt);
         });
         if (settlement.status === 'rejected') {
+          outcome.errorCode = settlement.errorCode ?? 'WORKSPACE_TOOL_REJECTED';
           let status = 422;
           if (
             settlement.errorCode === 'SEARCH_TIMEOUT' ||
@@ -129,14 +171,18 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
         res.status(200).json(settlement.result);
       } catch (error) {
         if (error instanceof BridgeStoreError) {
+          outcome.errorCode = error.code;
           res.status(bridgeStoreStatus(error)).json({
             error: error.message,
             code: error.code,
           });
           return;
         }
+        outcome.errorCode = 'INTERNAL_ERROR';
         throw error;
       } finally {
+        outcome.dispatchPending = false;
+        outcome.flush();
         req.removeListener('aborted', abort);
         res.removeListener('close', abortClosedResponse);
       }

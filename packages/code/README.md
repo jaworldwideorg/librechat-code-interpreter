@@ -88,10 +88,45 @@ bubblewrap plus seccomp on Linux, and the SRT restricted-account helper on
 Windows. Startup fails before worker registration when the platform or its
 dependencies are unavailable. There is no unsandboxed command fallback.
 
-The bridge worker remains outside the sandbox so it can maintain its outbound
-Code API connection. Each command and its descendants run inside SRT with:
+The native SRT manager owns process-global policy, proxy, and cleanup state.
+Only one sandbox instance may own a manager, and that instance accepts one
+command at a time. Overlapping calls fail before a second command starts;
+they are not queued inside the sandbox. `close()` waits for the active command
+and initialization before resetting the manager and removing scratch. A failed
+reset keeps ownership fenced until a later `close()` succeeds. Independent
+native workspaces need separate worker processes, not multiple instances of
+the default manager in one process. This lifecycle guard does not enable
+parallel assignments on a single bridge worker.
 
-- write access restricted to the one canonical registered workspace;
+The CLI hosts the native manager in a persistent, dedicated Node executor
+process. It does not inherit the bridge credential, arbitrary host environment,
+or Node loader/debugger options. Workspace policy and per-command masked
+credentials travel over private parent/child IPC, never command-line arguments.
+The bridge retains pairing and GitHub App identity management. Cancellation is
+addressed to the active command; executor loss after dispatch is treated as an
+uncertain mutation and is never automatically replayed. Restarting a worker
+still requires its existing quarantine checks. Native platform limitations on
+hard descendant teardown continue to apply.
+
+Embedding applications can use `NativeProcessWorkspaceCommandSandbox` from
+`@librechat/code` for separate native managers in one host application, with
+`prepare()`, `execute()`, and `close()`. Each instance is serial and must be
+closed by its owner. The bridge scheduler remains serial until negotiated
+execution slots and workspace-scoped quarantine are supported end to end.
+
+The bridge worker remains outside the sandbox so it can maintain its outbound
+Code API connection. On macOS and Linux, each worker process creates an
+owner-only scratch directory and grants SRT access to that exact directory
+without opening the host temporary-directory root. Commands receive it through
+`TMPDIR`, and orderly worker shutdown removes it. SRT's shared compatibility
+scratch path is explicitly denied. Windows uses the restricted SRT account's
+isolated profile and temporary directory instead. A workspace registration is
+rejected if it sits inside SRT's shared scratch path or is broad enough to
+contain worker scratch storage. Each command and its descendants run inside
+SRT with:
+
+- write access restricted to the one canonical registered workspace and the
+  worker's private scratch directory;
 - read access denied to the worker's home directory except for that workspace;
 - paired identity and mutation-quarantine files explicitly denied;
 - `LIBRECHAT_CODE_*` and nonessential inherited environment variables removed;
@@ -485,3 +520,63 @@ with `librechat-code reset-workspace <runtime-session-id>`. The command uses the
 configured worker credentials, registers a fresh incarnation, and only clears
 the server fence when no assignment is active. Run it while the normal worker
 process is stopped, then restart the normal worker after the command exits.
+
+### Opt-in concurrent native workspaces
+
+Code API defaults to **one execution slot**. To allow independent native roots
+to execute concurrently, configure `CODEAPI_BRIDGE_MAX_WORKSPACE_LEASE_SLOTS=2`
+on every Code API replica and start an updated worker with:
+
+```sh
+librechat-code run \
+  --worker-dir /projects/first \
+  --workspace second=/projects/second \
+  --workspace-lease-slots 2 \
+  --allow-workspace-writes \
+  --allow-workspace-commands
+```
+
+Keep the existing URL, pairing/identity, and network policy configuration.
+The primary root keeps its configured workspace ID (default `primary`). Repeat
+`--workspace id=path` to add named roots, up to the protocol's 32-root limit.
+Roots must already exist and must not overlap or alias one another. Commands
+retain the selected root's sandbox boundary, not a shared parent-directory grant.
+The `LIBRECHAT_CODE_WORKSPACE_QUARANTINE_FILE` single-file override is rejected
+when multiple roots are configured; unset it to use separate root-derived markers.
+
+`LIBRECHAT_CODE_WORKSPACE_LEASE_SLOTS` is the equivalent worker setting. Both
+ceilings must be integers from 1 to 8; the lower ceiling wins. An older Code API
+without the negotiation receipt keeps the worker on the serial protocol. Deploy
+the updated API to all replicas before enabling slots on workers. A capacity
+change while work is active fails closed; stop and drain the worker before
+changing it.
+
+Different roots can run concurrently; requests targeting the **same root remain
+serialized**, even across chats or agents. This is root-level exclusion, not
+file-level locking. Assign separate project/worktree roots for independent work.
+The admission queue remains bounded at 32 requests per worker. An idle SRT process
+cache is bounded by the local slot setting and evicts only idle executors. Runtime
+sandbox assignments continue through the exclusive legacy lane; this does not
+enable concurrent Docker/NsJail sessions or bypass any approval/network policy.
+
+An uncertain mutation or executor failure leaves an assignment-owned local guard
+and a server-side fence for that root. Healthy roots can continue. The worker
+does not replay the failed command. A guard-cleanup failure after settlement fences
+the root independently without replacing the committed result. Expiring ownership
+receipts exclude command payloads; explicit reset invalidates old fence requests.
+The server releases a root only after result finalization **and** explicit local
+cleanup confirmation. Local guard cleanup has a five-second bound; an expired
+receipt never implies a clean root. Control receipt delivery retries three times.
+If delivery remains unavailable, the root remains fenced while every advertised
+lane keeps polling. Capacity becomes reusable when its owned reservation is
+released or expires; inspect/reset the affected root before using it again.
+Reset-only registration stays unready and cannot attract new assignments.
+To recover a quarantined native root:
+
+1. Stop the worker and inspect or restore the affected directory.
+2. Run `librechat-code clear-workspace-quarantine --worker-dir /projects/second --workspace-id second` using the same deployment/identity configuration.
+3. Run the normal worker command with all its root/slot options plus `--reset-workspace-quarantine second`. This verifies the local guard is cleared, resets the server fence, then exits.
+4. Restart the normal worker command without the reset option.
+
+The workspace selector in LibreChat must preserve these registered IDs. Adding
+roots here does not grant a principal access or change an agent's selected root.

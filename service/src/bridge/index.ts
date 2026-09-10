@@ -3,11 +3,18 @@ import { env } from '../config';
 import { RedisBridgePairingStore } from './pairing';
 import { createBridgeRouter } from './router';
 import { RedisBridgeStore } from './store';
+import { isBridgeEnabled } from './enabled';
 
-export const bridgeStore = new RedisBridgeStore(connection);
+export const bridgeStore = new RedisBridgeStore(
+  connection,
+  undefined,
+  undefined,
+  env.BRIDGE_MAX_WORKSPACE_LEASE_SLOTS,
+);
 export const bridgePairings = new RedisBridgePairingStore(connection);
 
 export default createBridgeRouter({
+  enabled: isBridgeEnabled(),
   store: bridgeStore,
   pairings: bridgePairings,
   authMode: env.BRIDGE_AUTH_MODE,
