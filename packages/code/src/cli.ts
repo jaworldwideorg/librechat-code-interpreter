@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { realpath, stat } from 'node:fs/promises';
-import { basename, resolve, relative, isAbsolute, sep } from 'node:path';
+import { readdir, realpath, stat } from 'node:fs/promises';
+import { basename, join, resolve, relative, isAbsolute, sep } from 'node:path';
 
 import { pairBridgeWorker } from './pairing.js';
+import { discoverProjects } from './projects.js';
+import { loadProjectRoots, projectRootArguments } from './project-roots.js';
+import {
+    loadCodeEnvironment,
+    assertEnvironmentDefinitionsOutsideRoots,
+    EnvironmentWorkspaceTools,
+} from './environment.js';
 import { startFileRelay } from './relay.js';
 import { DockerFileRelaySupervisor } from './relay-runtime.js';
 import {
@@ -29,16 +36,26 @@ import {
 import { RuntimeWorkspaceCommandSandbox } from './workspace-runtime.js';
 import { NativeProcessWorkspaceCommandSandbox } from './native-process.js';
 import { NativeWorkspaceCommandPool } from './native-pool.js';
+import { GitWorktreeWorkspaceTools, internalWorkspaceId } from './workspace-instances.js';
+import { LINKED_WORKTREE_DIRECTORY, LinkedWorktreeWorkspaceTools } from './linked-worktrees.js';
+import { GitWorktreeManager } from './worktrees.js';
+import { captureWorkspaceRootIdentity } from './root-identity.js';
+import {
+  resolveNativeSrtCommandPolicy,
+  serializeNativeSrtCommandPolicy,
+} from './native-policy.js';
 import { workspaceMutationGuard } from './workspace-guards.js';
 import type { NativeProcessSandboxOptions } from './native-process.js';
 import type { LocalWorkspaceConfig } from './workspace.js';
 import {
   GITHUB_ALLOWED_DOMAINS,
-  GITHUB_CREDENTIAL_ENV_NAME,
   GitHubAppCredentialProvider,
+  gitHubRepositoryForCommand,
+  gitHubRepositoryForDirectory,
+  gitHubCommandCredentialEnvironment,
+  gitHubMaskedCredentialVariables,
   StaticGitHubCredentialProvider,
   gitHubAuthenticationPolicyIdentity,
-  gitHubCredentialEnvironment,
   normalizeGitHubHost,
   wrapGitHubCredentialCommand,
 } from './github.js';
@@ -48,8 +65,10 @@ import type { WorkspaceToolExecutor } from './workspace.js';
 import {
   BRIDGE_WORKSPACE_NAME_MAX_LENGTH,
   BridgeProtocolError,
-  isValidBridgeWorkerCapabilities,
-  isValidBridgeWorkerId,
+    isValidBridgeWorkerCapabilities,
+    isValidBridgeWorkerId,
+    isValidLinkedWorktreeName,
+    workspaceIsolationKey,
 } from './protocol.js';
 
 function workspaceSecurityIdentity(
@@ -57,7 +76,8 @@ function workspaceSecurityIdentity(
   configuredToken: string | undefined,
 ): string {
   return (
-    pairedPublicKey ?? required('LIBRECHAT_CODE_WORKER_TOKEN', configuredToken)
+        pairedPublicKey ??
+        required('LIBRECHAT_CODE_WORKER_TOKEN', configuredToken)
   );
 }
 
@@ -66,7 +86,8 @@ function workspaceQuarantinePath(options: {
   workerId: string;
   workspaceRoot?: string;
 }): string {
-  const override = process.env.LIBRECHAT_CODE_WORKSPACE_QUARANTINE_FILE?.trim();
+    const override =
+        process.env.LIBRECHAT_CODE_WORKSPACE_QUARANTINE_FILE?.trim();
   if (override) return override;
   return defaultWorkspaceQuarantinePath({
     ...options,
@@ -84,7 +105,7 @@ function list(value: string | undefined): string[] {
   return (
     value
       ?.split(',')
-      .map((item) => item.trim())
+            .map(item => item.trim())
       .filter(Boolean) ?? []
   );
 }
@@ -123,7 +144,7 @@ function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
   if (index >= 0) return args[index + 1];
   return args
-    .find((value) => value.startsWith(`${name}=`))
+        .find(value => value.startsWith(`${name}=`))
     ?.slice(name.length + 1);
 }
 
@@ -131,11 +152,14 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value?.trim().length ? value : undefined;
 }
 
-function githubCredentials(): {
+function githubCredentials(args: string[]): {
   provider?: GitHubCredentialProvider;
   host: string;
   privateKeyPath?: string;
   mode?: 'app' | 'token';
+  repositoryRouting?: boolean;
+  checkoutRouting?: boolean;
+  installationTokenScope?: boolean;
   policyIdentity: string;
 } {
   const token = nonEmpty(process.env.LIBRECHAT_CODE_GITHUB_TOKEN);
@@ -143,19 +167,43 @@ function githubCredentials(): {
   const installationId = nonEmpty(
     process.env.LIBRECHAT_CODE_GITHUB_INSTALLATION_ID,
   );
+  const routing =
+    option(args, '--github-repository-routing')?.trim().toLowerCase() ??
+    process.env.LIBRECHAT_CODE_GITHUB_REPOSITORY_ROUTING?.trim().toLowerCase() ??
+    'admitted';
+  if (routing !== 'admitted' && routing !== 'checkout') {
+    throw new Error('GitHub repository routing must be admitted or checkout');
+  }
   const privateKeyPath = nonEmpty(
     process.env.LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE,
   );
   const appValues = [appId, installationId, privateKeyPath];
   const hasApp = appValues.some(Boolean);
-  if (hasApp && !appValues.every(Boolean)) {
+  if (hasApp && (!appId || !privateKeyPath)) {
     throw new Error(
-      'GitHub App authentication requires LIBRECHAT_CODE_GITHUB_APP_ID, LIBRECHAT_CODE_GITHUB_INSTALLATION_ID, and LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE',
+      'GitHub App authentication requires LIBRECHAT_CODE_GITHUB_APP_ID and LIBRECHAT_CODE_GITHUB_PRIVATE_KEY_FILE; LIBRECHAT_CODE_GITHUB_INSTALLATION_ID is an optional legacy fallback',
     );
   }
   if (hasApp && token) {
     throw new Error(
       'Configure either GitHub App authentication or a GitHub token, not both',
+    );
+  }
+  if (routing === 'checkout' && (!hasApp || installationId)) {
+    throw new Error(
+      'Checkout GitHub repository routing requires a GitHub App without a fixed installation ID',
+    );
+  }
+  const tokenScope =
+    option(args, '--github-token-scope')?.trim().toLowerCase() ??
+    process.env.LIBRECHAT_CODE_GITHUB_TOKEN_SCOPE?.trim().toLowerCase() ??
+    'repository';
+  if (tokenScope !== 'repository' && tokenScope !== 'installation') {
+    throw new Error('GitHub token scope must be repository or installation');
+  }
+  if (tokenScope === 'installation' && (!hasApp || installationId)) {
+    throw new Error(
+      'Installation-scoped GitHub tokens require a GitHub App without a fixed installation ID',
     );
   }
   const configuredHostValue = nonEmpty(
@@ -171,7 +219,9 @@ function githubCredentials(): {
     try {
       parsedApiUrl = new URL(apiUrl);
     } catch {
-      throw new Error('LIBRECHAT_CODE_GITHUB_API_URL must be a valid URL');
+            throw new Error(
+                'LIBRECHAT_CODE_GITHUB_API_URL must be a valid URL',
+            );
     }
     apiHost =
       parsedApiUrl.hostname.toLowerCase() === 'api.github.com'
@@ -188,16 +238,21 @@ function githubCredentials(): {
     return {
       host,
       mode: 'app',
+      repositoryRouting: !installationId,
+      checkoutRouting: routing === 'checkout',
+      installationTokenScope: tokenScope === 'installation',
       policyIdentity: gitHubAuthenticationPolicyIdentity({
         mode: 'app',
         host,
         appId,
         installationId,
-      }),
+      }) + (routing === 'checkout' ? ':routing:checkout' : '') +
+        (tokenScope === 'installation' ? ':scope:installation' : ''),
       privateKeyPath,
       provider: new GitHubAppCredentialProvider({
         appId: appId!,
-        installationId: installationId!,
+        installationId,
+        tokenScope,
         privateKeyPath: privateKeyPath!,
         host,
         apiUrl,
@@ -284,7 +339,7 @@ async function relay(): Promise<void> {
   process.stdout.write(
     `librechat-code: file relay listening at ${handle.url}\n`,
   );
-  await new Promise<void>((resolve) => {
+    await new Promise<void>(resolve => {
     process.once('SIGINT', resolve);
     process.once('SIGTERM', resolve);
   });
@@ -295,6 +350,67 @@ async function run(
   runtimeSessionId?: string,
   args: string[] = [],
 ): Promise<void> {
+    const projectArgs = projectRootArguments(args);
+    if (
+        projectArgs &&
+        (runtimeSessionId != null ||
+            args.some(arg =>
+                ['--environment', '--worker-dir', '--default-workspace',
+                    '--workspace', '--workspace-id', '--workspace-name'].some(
+                    flag => arg === flag || arg.startsWith(`${flag}=`),
+                ),
+            ) ||
+            [process.env.LIBRECHAT_CODE_WORKER_DIR,
+                process.env.LIBRECHAT_CODE_WORKSPACE_ID,
+                process.env.LIBRECHAT_CODE_WORKSPACE_NAME].some(value => value?.trim()) ||
+            process.env.LIBRECHAT_CODE_DEFAULT_WORKSPACE?.trim().toLowerCase() === 'true')
+    ) {
+        throw new Error('Project selection cannot be combined with other workspace registration settings');
+    }
+    const projectRoots = projectArgs
+        ? await loadProjectRoots(projectArgs.root, projectArgs.projects)
+        : [];
+    const environmentPaths: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--environment') {
+            const path = args[++i];
+            if (!path || path.startsWith('--'))
+                throw new Error('--environment requires a YAML file');
+            environmentPaths.push(path);
+        } else if (args[i].startsWith('--environment=')) {
+            const path = args[i].slice('--environment='.length);
+            if (!path) throw new Error('--environment requires a YAML file');
+            environmentPaths.push(path);
+        }
+    }
+    if (environmentPaths.length > 32)
+        throw new Error('At most 32 environments may be registered');
+    const environments = await Promise.all(
+        environmentPaths.map(loadCodeEnvironment),
+    );
+    if (
+        environments.length &&
+        (runtimeSessionId != null ||
+            args.some(arg =>
+                [
+                    '--worker-dir',
+                    '--default-workspace',
+                    '--workspace',
+                    '--workspace-id',
+                    '--workspace-name',
+                ].some(flag => arg === flag || arg.startsWith(`${flag}=`)),
+            ) ||
+            [
+                process.env.LIBRECHAT_CODE_WORKER_DIR,
+                process.env.LIBRECHAT_CODE_WORKSPACE_ID,
+                process.env.LIBRECHAT_CODE_WORKSPACE_NAME,
+            ].some(value => value?.trim()) ||
+            process.env.LIBRECHAT_CODE_DEFAULT_WORKSPACE?.trim().toLowerCase() === 'true')
+    ) {
+        throw new Error(
+            '--environment cannot be combined with workspace directory, ID, or name settings',
+        );
+    }
   const configuredWorkerId = process.env.LIBRECHAT_CODE_WORKER_ID?.trim();
   const configuredIdentityPath =
     process.env.LIBRECHAT_CODE_IDENTITY_FILE?.trim();
@@ -343,7 +459,8 @@ async function run(
     );
   }
   const nsjailDockerMode =
-    runtimeMode === 'docker-nsjail' || runtimeMode === 'docker-macos-nsjail';
+        runtimeMode === 'docker-nsjail' ||
+        runtimeMode === 'docker-macos-nsjail';
   const sandboxEndpoint =
     process.env.LIBRECHAT_CODE_SANDBOX_ENDPOINT ??
     'http://127.0.0.1:2000/api/v2';
@@ -370,16 +487,20 @@ async function run(
     runtimeSessionId == null &&
     (fileRelayUpstream?.length ?? 0) > 0;
   const workspaceId =
+        projectRoots[0]?.id ??
+        environments[0]?.definition.name ??
     option(args, '--workspace-id') ??
     process.env.LIBRECHAT_CODE_WORKSPACE_ID?.trim() ??
     'primary';
   const explicitWorkerDirectory =
-    runtimeSessionId == null
+        projectRoots[0]?.root ??
+        environments[0]?.definition.root ??
+        (runtimeSessionId == null
       ? nonEmpty(
           option(args, '--worker-dir') ??
             process.env.LIBRECHAT_CODE_WORKER_DIR?.trim(),
         )
-      : undefined;
+            : undefined);
   const useDefaultWorkspace =
     runtimeSessionId == null &&
     (args.includes('--default-workspace') ||
@@ -395,20 +516,62 @@ async function run(
     (args.includes('--allow-workspace-commands') ||
       process.env.LIBRECHAT_CODE_ALLOW_WORKSPACE_COMMANDS?.trim().toLowerCase() ===
         'true');
+  const linkedWorktreeLanes =
+    runtimeSessionId == null &&
+    (args.includes('--linked-worktree-lanes') ||
+      process.env.LIBRECHAT_CODE_LINKED_WORKTREE_LANES?.trim().toLowerCase() ===
+        'true');
   const commandSandboxMode =
     option(args, '--command-sandbox') ??
     process.env.LIBRECHAT_CODE_COMMAND_SANDBOX?.trim().toLowerCase() ??
     (nsjailDockerMode ? 'runtime' : 'native-srt');
-  if (commandSandboxMode !== 'native-srt' && commandSandboxMode !== 'runtime') {
+    if (
+        commandSandboxMode !== 'native-srt' &&
+        commandSandboxMode !== 'runtime'
+    ) {
     throw new Error(
       'LIBRECHAT_CODE_COMMAND_SANDBOX must be native-srt or runtime',
     );
   }
+    if (environments.length && commandSandboxMode !== 'native-srt') {
+        throw new Error('Environment definitions require native-srt');
+    }
+    if (projectRoots.length && commandSandboxMode !== 'native-srt') {
+        throw new Error('Project selections require native-srt');
+    }
+    if (
+        environments.some(environment => environment.definition.setup) &&
+        !allowWorkspaceCommands
+    ) {
+        throw new Error(
+            'Environment setup requires --allow-workspace-commands',
+        );
+    }
+  const nativeProgrammaticEnabled =
+    allowWorkspaceCommands &&
+    commandSandboxMode === 'native-srt' &&
+    process.platform !== 'win32' &&
+    (fileRelayUpstream?.length ?? 0) > 0;
+  const commandPolicy = resolveNativeSrtCommandPolicy(
+    option(args, '--command-policy-preset') ??
+      process.env.LIBRECHAT_CODE_COMMAND_POLICY_PRESET?.trim().toLowerCase() ??
+      'restricted',
+  );
+  if (
+    commandPolicy.preset !== 'restricted' &&
+    (!allowWorkspaceCommands || commandSandboxMode !== 'native-srt')
+  ) {
+    throw new Error(
+      'A permissive command policy preset requires native-srt workspace commands',
+    );
+  }
   const github =
     runtimeSessionId == null
-      ? githubCredentials()
+      ? githubCredentials(args)
       : {
           host: 'github.com',
+          repositoryRouting: false,
+          checkoutRouting: false,
           policyIdentity: gitHubAuthenticationPolicyIdentity({
             host: 'github.com',
           }),
@@ -421,6 +584,16 @@ async function run(
   if (github.provider && commandSandboxMode !== 'native-srt') {
     throw new Error(
       'GitHub authentication currently requires the native-srt command sandbox',
+    );
+  }
+  if (github.checkoutRouting && commandPolicy.preset !== 'trusted-vm') {
+    throw new Error(
+      'Checkout GitHub repository routing requires the trusted-vm command policy',
+    );
+  }
+  if (github.installationTokenScope && commandPolicy.preset !== 'trusted-vm') {
+    throw new Error(
+      'Installation-scoped GitHub tokens require the trusted-vm command policy',
     );
   }
   const githubDomains = github.provider
@@ -464,7 +637,8 @@ async function run(
     }
   }
   const mutationQuarantinePath =
-    (allowWorkspaceWrites || allowWorkspaceCommands) && canonicalWorkerDirectory
+        (allowWorkspaceWrites || allowWorkspaceCommands) &&
+        canonicalWorkerDirectory
       ? workspaceQuarantinePath({
           codeApiUrl,
           workerId,
@@ -479,21 +653,65 @@ async function run(
   );
   if (workspaceLeaseSlots > 8)
     throw new Error('Workspace lease slots cannot exceed 8');
+  const conversationWorktreeRoot =
+    option(args, '--conversation-worktree-root') ??
+    process.env.LIBRECHAT_CODE_CONVERSATION_WORKTREE_ROOT?.trim();
+  const conversationWorktreeMax = positiveInteger(
+    'LIBRECHAT_CODE_CONVERSATION_WORKTREE_MAX',
+    option(args, '--conversation-worktree-max') ??
+      process.env.LIBRECHAT_CODE_CONVERSATION_WORKTREE_MAX,
+    64,
+  );
+  if (conversationWorktreeMax > 1024) {
+    throw new Error('Conversation worktree capacity cannot exceed 1024');
+  }
+  const conversationWorktreeCloneTimeoutMs = positiveInteger(
+    'LIBRECHAT_CODE_CONVERSATION_WORKTREE_CLONE_TIMEOUT_MS',
+    option(args, '--conversation-worktree-clone-timeout-ms') ??
+      process.env.LIBRECHAT_CODE_CONVERSATION_WORKTREE_CLONE_TIMEOUT_MS,
+    5 * 60_000,
+  );
+  if (
+    conversationWorktreeCloneTimeoutMs < 30_000 ||
+    conversationWorktreeCloneTimeoutMs > 30 * 60_000
+  ) {
+    throw new Error(
+      'Conversation worktree clone timeout must be between 30000 and 1800000 milliseconds',
+    );
+  }
   const roots: LocalWorkspaceConfig[] = canonicalWorkerDirectory
     ? [
         {
           id: workspaceId,
           root: canonicalWorkerDirectory,
+          identity: projectRoots[0]?.identity,
           writable: allowWorkspaceWrites,
           name:
+                      projectRoots[0]?.name ??
+                      environments[0]?.definition.name ??
             option(args, '--workspace-name') ??
             process.env.LIBRECHAT_CODE_WORKSPACE_NAME?.trim() ??
             (useDefaultWorkspace
               ? workspaceId
-              : defaultWorkspaceName(workerDirectory!, workspaceId)),
+                          : defaultWorkspaceName(
+                                workerDirectory!,
+                                workspaceId,
+                            )),
         },
       ]
     : [];
+    for (const environment of environments.slice(1)) {
+        roots.push({
+            id: environment.definition.name,
+            name: environment.definition.name,
+            root: environment.definition.root,
+            writable: allowWorkspaceWrites,
+        });
+    }
+    for (const project of projectRoots.slice(1)) {
+        roots.push({ ...project, writable: allowWorkspaceWrites });
+    }
+    await assertEnvironmentDefinitionsOutsideRoots(environments, roots);
   for (let i = 0; i < args.length; i++) {
     if (
       args[i] === '--workspace' &&
@@ -529,16 +747,18 @@ async function run(
   if (roots.length > 32)
     throw new Error('At most 32 workspace roots may be registered');
   const rootIdentities = await Promise.all(
-    roots.map((root) => stat(root.root)),
+        roots.map(root => stat(root.root)),
   );
-  const normalized = roots.map((root) => root.root);
+    const normalized = roots.map(root => root.root);
   for (let i = 0; i < roots.length; i++)
     for (let j = 0; j < i; j++) {
       const inside = (a: string, b: string): boolean => {
         const path = relative(a, b);
         return (
           path === '' ||
-          (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path))
+                    (path !== '..' &&
+                        !path.startsWith(`..${sep}`) &&
+                        !isAbsolute(path))
         );
       };
       if (
@@ -556,7 +776,37 @@ async function run(
     workspaceLeaseSlots > 1 &&
     (!allowWorkspaceCommands || commandSandboxMode !== 'native-srt')
   ) {
-    throw new Error('Concurrent workspace leases require native-srt commands');
+        throw new Error(
+            'Concurrent workspace leases require native-srt commands',
+        );
+  }
+  if (
+    conversationWorktreeRoot &&
+    (!allowWorkspaceCommands ||
+      commandSandboxMode !== 'native-srt' ||
+      workspaceLeaseSlots < 2)
+  ) {
+    throw new Error(
+      'Conversation worktrees require native-srt commands and at least two workspace lease slots',
+    );
+  }
+  if (
+    linkedWorktreeLanes &&
+    (!allowWorkspaceCommands ||
+      commandSandboxMode !== 'native-srt' ||
+      workspaceLeaseSlots < 2)
+  ) {
+    throw new Error(
+      'Linked worktree lanes require native-srt commands and at least two workspace lease slots',
+    );
+  }
+  if (linkedWorktreeLanes && conversationWorktreeRoot) {
+    throw new Error(
+      'Linked worktree lanes cannot be combined with conversation worktrees',
+    );
+  }
+  if (linkedWorktreeLanes && process.platform === 'win32') {
+    throw new Error('Linked worktree Git guard requires a POSIX host');
   }
   if (
     roots.length > 1 &&
@@ -567,7 +817,7 @@ async function run(
     );
   }
   const rootQuarantinePaths = new Map(
-    roots.map((root) => [
+        roots.map(root => [
       root.id,
       workspaceQuarantinePath({
         codeApiUrl,
@@ -576,11 +826,33 @@ async function run(
       }),
     ]),
   );
-  let workspaceTools: WorkspaceToolExecutor | undefined = workerDirectory
+  // Keep an admission boundary even when trusted-VM checkout routing uses a
+  // nested repository's remote for the current command.
+  const admittedGitHubRepositories = github.provider && github.repositoryRouting
+    ? new Map(
+        await Promise.all(
+          roots.map(async root => [
+            root.root,
+            await gitHubRepositoryForDirectory(root.root, github.host),
+          ] as const),
+        ),
+      )
+    : undefined;
+  const repositoriesByWorkspace = admittedGitHubRepositories
+    ? new Map(
+        roots.map((root) => [
+          root.id,
+          admittedGitHubRepositories.get(root.root),
+        ]),
+      )
+    : undefined;
+  const localWorkspaceTools = workerDirectory
     ? await LocalWorkspaceTools.create({
         workspaces: roots,
+        repositoryInstructions: args.includes('--repository-instructions'),
       })
     : undefined;
+  let workspaceTools: WorkspaceToolExecutor | undefined = localWorkspaceTools;
   if (allowWorkspaceCommands && !canonicalWorkerDirectory) {
     throw new Error('Workspace commands require a registered directory');
   }
@@ -654,7 +926,10 @@ async function run(
           token: createHmac(
             'sha256',
             pairedIdentity?.privateKey ??
-              required('LIBRECHAT_CODE_WORKER_TOKEN', configuredToken),
+                          required(
+                              'LIBRECHAT_CODE_WORKER_TOKEN',
+                              configuredToken,
+                          ),
           )
             .update('librechat-code-file-relay-v1')
             .digest('hex'),
@@ -690,8 +965,11 @@ async function run(
           image: runtimeImage,
           ...(nsjailDockerMode && runtimeSessionId == null
             ? (() => {
-                const { seccompProfile, packagesPath, profileRevision } =
-                  nsjailLaunchProfile!;
+                            const {
+                                seccompProfile,
+                                packagesPath,
+                                profileRevision,
+                            } = nsjailLaunchProfile!;
                 return {
                   capabilities: MACOS_NSJAIL_CAPABILITIES,
                   securityOptions: [`seccomp=${seccompProfile}`],
@@ -711,10 +989,12 @@ async function run(
                   httpClient: 'bun' as const,
                   environment: {
                     SANDBOX_USE_CGROUPV2: 'false',
-                    SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP: 'false',
+                                    SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP:
+                                        'false',
                     ...(workspaceMount
                       ? {
-                          SANDBOX_EXTERNAL_WORKSPACE_ENABLED: 'true',
+                                              SANDBOX_EXTERNAL_WORKSPACE_ENABLED:
+                                                  'true',
                           SANDBOX_EXTERNAL_WORKSPACE_ROOT:
                             workspaceMount.target,
                           SANDBOX_EXTERNAL_WORKSPACE_TOKEN:
@@ -723,15 +1003,21 @@ async function run(
                       : {}),
                     ...(fileRelayProfile
                       ? {
-                          EGRESS_GATEWAY_URL: fileRelayProfile.url,
+                                              EGRESS_GATEWAY_URL:
+                                                  fileRelayProfile.url,
                           SANDBOX_PRIME_CONCURRENCY: String(
-                            fileRelayLimits!.maxConcurrentRequests,
+                                                  fileRelayLimits!
+                                                      .maxConcurrentRequests,
                           ),
-                          SANDBOX_UPLOAD_CONCURRENCY: String(
-                            fileRelayLimits!.maxConcurrentRequests,
+                                              SANDBOX_UPLOAD_CONCURRENCY:
+                                                  String(
+                                                      fileRelayLimits!
+                                                          .maxConcurrentRequests,
                           ),
-                          SANDBOX_FILE_RELAY_TOKEN: fileRelayProfile.token,
-                          SANDBOX_REQUIRE_EGRESS_MANIFEST: 'true',
+                                              SANDBOX_FILE_RELAY_TOKEN:
+                                                  fileRelayProfile.token,
+                                              SANDBOX_REQUIRE_EGRESS_MANIFEST:
+                                                  'true',
                           SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY:
                             executionManifestPublicKey!,
                         }
@@ -744,8 +1030,10 @@ async function run(
                   bindMounts: [workspaceMount],
                   environment: {
                     SANDBOX_EXTERNAL_WORKSPACE_ENABLED: 'true',
-                    SANDBOX_EXTERNAL_WORKSPACE_ROOT: workspaceMount.target,
-                    SANDBOX_EXTERNAL_WORKSPACE_TOKEN: workspaceCommandToken!,
+                                  SANDBOX_EXTERNAL_WORKSPACE_ROOT:
+                                      workspaceMount.target,
+                                  SANDBOX_EXTERNAL_WORKSPACE_TOKEN:
+                                      workspaceCommandToken!,
                   },
                 }
               : {}),
@@ -756,32 +1044,52 @@ async function run(
         });
   const nativeOptions: NativeProcessSandboxOptions = {
     workspaceRoot: canonicalWorkerDirectory!,
+    workspaceIdentity: roots[0]?.identity,
+    commandPolicy,
     protectedPaths: [
       identityPath,
+            ...environments.map(environment => environment.path),
       ...rootQuarantinePaths.values(),
       github.privateKeyPath,
     ].filter((path): path is string => path != null),
     allowedDomains: commandAllowedDomains,
+    ...(nativeProgrammaticEnabled
+      ? { programmaticFileUpstream: fileRelayUpstream }
+      : {}),
     ...(github.provider
       ? {
           maskedEnvironment: {
-            variables: [
-              {
-                name: GITHUB_CREDENTIAL_ENV_NAME,
-                extract: '^(.+)$',
-                injectHosts: [github.host],
-              },
-            ],
-            async resolve(signal?: AbortSignal) {
-              return gitHubCredentialEnvironment(
-                await github.provider!.getCredential(signal),
+            variables: gitHubMaskedCredentialVariables(
+              github.host,
+            ),
+            async resolve(signal?: AbortSignal, cwd?: string) {
+              const repository = cwd && admittedGitHubRepositories
+                ? await gitHubRepositoryForCommand(
+                    cwd,
+                    admittedGitHubRepositories,
+                    github.checkoutRouting ? 'checkout' : 'admitted',
+                    github.host,
+                    signal,
+                  )
+                : undefined;
+              if (!repository && github.repositoryRouting) {
+                return {};
+              }
+              return gitHubCommandCredentialEnvironment(
+                await github.provider!.getCredential(signal, repository),
+                github.host,
               );
             },
-            wrapCommand(command: string, platform: NodeJS.Platform) {
+            wrapCommand(
+              command: string,
+              platform: NodeJS.Platform,
+              environment: Readonly<Record<string, string>>,
+            ) {
               return wrapGitHubCredentialCommand(
                 command,
                 github.host,
                 platform,
+                environment,
               );
             },
           },
@@ -790,12 +1098,12 @@ async function run(
   };
   const nativeCommandSandbox =
     allowWorkspaceCommands && commandSandboxMode === 'native-srt'
-      ? roots.length > 1 || workspaceLeaseSlots > 1
+      ? roots.length > 1 || workspaceLeaseSlots > 1 || conversationWorktreeRoot || linkedWorktreeLanes
         ? new NativeWorkspaceCommandPool(
             new Map(
-              roots.map((root) => [
+                          roots.map(root => [
                 root.id,
-                { ...nativeOptions, workspaceRoot: root.root },
+                { ...nativeOptions, workspaceRoot: root.root, workspaceIdentity: root.identity },
               ]),
             ),
             workspaceLeaseSlots,
@@ -805,7 +1113,10 @@ async function run(
   if (allowWorkspaceCommands && workspaceTools) {
     workspaceTools = new SandboxWorkspaceTools({
       workspaceTools,
-      commandWorkspaces: roots.map((root) => root.id),
+            commandWorkspaces: roots.map(root => root.id),
+      ...(nativeProgrammaticEnabled
+        ? { programmaticLanguages: ['bash'] }
+        : {}),
       commandSandbox:
         nativeCommandSandbox ??
         new RuntimeWorkspaceCommandSandbox({
@@ -815,12 +1126,154 @@ async function run(
         }),
     });
   }
+  const conversationWorktrees = conversationWorktreeRoot
+    ? new GitWorktreeManager({
+        cloneTimeoutMs: conversationWorktreeCloneTimeoutMs,
+        maxCount: conversationWorktreeMax,
+        root: conversationWorktreeRoot,
+        ...(nativeCommandSandbox instanceof NativeWorkspaceCommandPool
+          ? {
+              prepareInstance: async (instance, signal) => {
+                const setup = environments.find(
+                  (environment) =>
+                    environment.definition.name === instance.sourceWorkspaceId,
+                )?.definition.setup;
+                if (!setup) return;
+                if (admittedGitHubRepositories) {
+                  admittedGitHubRepositories.set(
+                    instance.root,
+                    repositoriesByWorkspace?.get(instance.sourceWorkspaceId),
+                  );
+                }
+                const id = internalWorkspaceId(instance.sourceWorkspaceId, instance.id);
+                await nativeCommandSandbox.registerRoot(id, {
+                  ...nativeOptions,
+                  workspaceIdentity: instance.identity,
+                  workspaceRoot: instance.root,
+                });
+                const result = await nativeCommandSandbox.execute(
+                  {
+                    protocolVersion: 1,
+                    operation: 'execute_command',
+                    workspaceId: id,
+                    command: setup.command,
+                    timeoutMs: setup.timeoutMs,
+                    maxOutputBytes: 8192,
+                  },
+                  signal,
+                );
+                if (result.exitCode !== 0 || result.timedOut) {
+                  throw new Error(
+                    `Environment ${instance.sourceWorkspaceId} setup failed for its conversation worktree`,
+                  );
+                }
+              },
+              discardInstance: async (instance) => {
+                await nativeCommandSandbox.unregisterRoot(
+                  internalWorkspaceId(instance.sourceWorkspaceId, instance.id),
+                );
+                admittedGitHubRepositories?.delete(instance.root);
+              },
+            }
+          : {}),
+        sources: new Map(
+          await Promise.all(
+            roots.map(async (root) => [
+              root.id,
+              {
+                root: root.root,
+                identity:
+                  root.identity ??
+                  (await captureWorkspaceRootIdentity(root.root)),
+              },
+            ] as const),
+          ),
+        ),
+      })
+    : undefined;
+  let conversationWorkspaceTools: GitWorktreeWorkspaceTools | undefined;
+  if (conversationWorktrees && workspaceTools) {
+    if (!(nativeCommandSandbox instanceof NativeWorkspaceCommandPool)) {
+      throw new Error('Conversation worktrees require a native command pool');
+    }
+    conversationWorkspaceTools = new GitWorktreeWorkspaceTools({
+      commandPool: nativeCommandSandbox,
+      delegate: workspaceTools,
+      manager: conversationWorktrees,
+      onResolve(workspaceId, root) {
+        if (admittedGitHubRepositories) {
+          admittedGitHubRepositories.set(
+            root,
+            repositoriesByWorkspace?.get(workspaceId),
+          );
+        }
+      },
+      sources: new Map(
+        roots.map((root) => [
+          root.id,
+          {
+            command: {
+              ...nativeOptions,
+              workspaceIdentity: root.identity,
+              workspaceRoot: root.root,
+            },
+            repositoryInstructions: args.includes('--repository-instructions'),
+            writable: root.writable ?? false,
+          },
+        ]),
+      ),
+    });
+    workspaceTools = conversationWorkspaceTools;
+  }
+  let linkedWorktreeTools: LinkedWorktreeWorkspaceTools | undefined;
+  if (linkedWorktreeLanes && workspaceTools) {
+    if (!(nativeCommandSandbox instanceof NativeWorkspaceCommandPool)) {
+      throw new Error('Linked worktree lanes require a native command pool');
+    }
+    linkedWorktreeTools = new LinkedWorktreeWorkspaceTools({
+      commandPool: nativeCommandSandbox,
+      delegate: workspaceTools,
+      programmaticDelegate: conversationWorkspaceTools ?? nativeCommandSandbox,
+      onResolve(workspaceId, root) {
+        if (admittedGitHubRepositories) {
+          admittedGitHubRepositories.set(
+            root,
+            repositoriesByWorkspace?.get(workspaceId),
+          );
+        }
+      },
+      onRelease(root) {
+        admittedGitHubRepositories?.delete(root);
+      },
+      sources: new Map(
+        roots.map((root) => [
+          root.id,
+          {
+            root: root.root,
+            identity: root.identity,
+            command: nativeOptions,
+            repositoryInstructions: args.includes('--repository-instructions'),
+            writable: root.writable ?? false,
+          },
+        ]),
+      ),
+    });
+    workspaceTools = linkedWorktreeTools;
+  }
+    if (workspaceTools && environments.length) {
+        workspaceTools = new EnvironmentWorkspaceTools(
+            workspaceTools,
+            environments,
+        );
+    }
   const capabilities = {
     statefulWorkspace,
     sandboxProfile:
       process.env.LIBRECHAT_CODE_SANDBOX_PROFILE ??
       (allowWorkspaceCommands && commandSandboxMode === 'native-srt'
-        ? 'anthropic-srt'
+        ? commandPolicy.preset === 'restricted'
+          ? 'anthropic-srt'
+          : `anthropic-srt:${commandPolicy.preset}`
         : runtimeMode.startsWith('docker')
           ? 'oci-docker'
           : 'nsjail'),
@@ -828,8 +1281,13 @@ async function run(
     policyDigest: createHash('sha256')
       .update(policy)
       .update(
+                environments.length
+                    ? `\0environments\0${environments.map(environment => environment.fingerprint).join('\0')}`
+                    : '',
+            )
+            .update(
         allowWorkspaceCommands && commandSandboxMode === 'native-srt'
-          ? `\0native-srt\0${commandAllowedDomains.join('\0')}\0${github.policyIdentity}`
+          ? `\0native-srt\0${serializeNativeSrtCommandPolicy(commandPolicy)}\0${commandAllowedDomains.join('\0')}\0${github.policyIdentity}`
           : '',
       )
       .digest('hex'),
@@ -837,7 +1295,9 @@ async function run(
     ...(workspaceLeaseSlots > 1
       ? { workspaceLeaseSlots, requiresReadyConfirmation: true }
       : {}),
-    ...(workspaceTools ? { workspaceTools: workspaceTools.capabilities } : {}),
+        ...(workspaceTools
+            ? { workspaceTools: workspaceTools.capabilities }
+            : {}),
   };
   if (!isValidBridgeWorkerCapabilities(capabilities)) {
     await fileRelaySupervisor?.stop().catch(() => undefined);
@@ -846,8 +1306,45 @@ async function run(
     );
   }
   try {
-    await github.provider?.getCredential(controller.signal);
+    await github.provider?.validate?.(controller.signal);
+    if (github.provider && !github.provider.validate) {
+      await github.provider.getCredential(controller.signal);
+    }
+    await conversationWorktrees?.prepare();
     await nativeCommandSandbox?.prepare();
+        for (const environment of option(args, '--reset-workspace-quarantine') == null ? environments : []) {
+            const setup = environment.definition.setup;
+            if (!setup || !nativeCommandSandbox) continue;
+            const id = environment.definition.name;
+            const guard = workspaceMutationGuard(
+                rootQuarantinePaths.get(id)!,
+                workerId,
+                id,
+                incarnationId,
+            );
+            await guard.assertAvailable();
+            await guard.arm('Environment setup did not settle', 'setup');
+            const result = await nativeCommandSandbox.execute(
+                {
+                    protocolVersion: 1,
+                    operation: 'execute_command',
+                    workspaceId: id,
+                    command: setup.command,
+                    timeoutMs: setup.timeoutMs,
+                    maxOutputBytes: 8192,
+                },
+                controller.signal,
+            );
+            if (result.exitCode !== 0 || result.timedOut) {
+                throw new Error(
+                    `Environment ${id} setup failed; inspect the workspace and use clear-workspace-quarantine with its root and workspace ID before restarting`,
+                );
+            }
+            await guard.clear('setup');
+            process.stdout.write(
+                `librechat-code: environment ${id} prepared\n`,
+            );
+        }
   } catch (error) {
     await nativeCommandSandbox?.close().catch(() => undefined);
     await fileRelaySupervisor?.stop().catch(() => undefined);
@@ -855,6 +1352,7 @@ async function run(
   }
   try {
     const worker = new BridgeWorker({
+      instructionDescriptors: () => localWorkspaceTools?.instructionDescriptors() ?? Promise.resolve(undefined),
       codeApiUrl,
       token: configuredToken,
       identity: workerIdentity,
@@ -863,10 +1361,74 @@ async function run(
       runtimeSupervisor,
       capabilities,
       workspaceTools,
+      ...(nativeProgrammaticEnabled && nativeCommandSandbox
+        ? {
+            workspaceProgrammatic:
+              linkedWorktreeTools ?? conversationWorkspaceTools ?? nativeCommandSandbox,
+          }
+        : {}),
+      ...(conversationWorktrees
+        ? {
+            workspaceQuarantineResolver: async (
+              selectedWorkspaceId: string,
+              workspaceInstanceId: string,
+            ) =>
+              workspaceMutationGuard(
+                defaultWorkspaceQuarantinePath({
+                  codeApiUrl,
+                  workerId,
+                  workspaceRoot: await conversationWorktrees.plannedRoot(
+                    selectedWorkspaceId,
+                    workspaceInstanceId,
+                  ),
+                }),
+                workerId,
+                workspaceIsolationKey(
+                  selectedWorkspaceId,
+                  workspaceInstanceId,
+                ),
+                incarnationId,
+              ),
+          }
+        : {}),
+      ...(linkedWorktreeTools
+        ? {
+            linkedWorktreeQuarantineResolver: (
+              selectedWorkspaceId: string,
+              worktree: string,
+            ) => {
+              const source = roots.find((root) => root.id === selectedWorkspaceId);
+              if (!source) {
+                throw new BridgeProtocolError('Linked worktree source is not registered');
+              }
+              return workspaceMutationGuard(
+                defaultWorkspaceQuarantinePath({
+                  codeApiUrl,
+                  workerId,
+                  workspaceRoot: join(source.root, LINKED_WORKTREE_DIRECTORY, worktree),
+                }),
+                workerId,
+                workspaceIsolationKey(selectedWorkspaceId, undefined, worktree),
+                incarnationId,
+              );
+            },
+            linkedWorktreeNames: async (selectedWorkspaceId: string) => {
+              const source = roots.find((root) => root.id === selectedWorkspaceId);
+              if (!source) return [];
+              try {
+                const entries = await readdir(join(source.root, LINKED_WORKTREE_DIRECTORY));
+                return entries.filter(isValidLinkedWorktreeName);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+                throw error;
+              }
+            },
+          }
+        : {}),
       ...(workspaceLeaseSlots > 1 || roots.length > 1
         ? {
             workspaceQuarantines: new Map(
-              roots.map((root) => [
+                          roots.map(root => [
                 root.id,
                 workspaceMutationGuard(
                   rootQuarantinePaths.get(root.id)!,
@@ -884,7 +1446,8 @@ async function run(
         roots.length === 1
           ? {
               async assertAvailable() {
-                const record = await loadWorkspaceMutationQuarantine(
+                              const record =
+                                  await loadWorkspaceMutationQuarantine(
                   mutationQuarantinePath,
                 );
                 if (record != null) {
@@ -896,15 +1459,18 @@ async function run(
                 }
               },
               async arm(reason) {
-                await saveWorkspaceMutationQuarantine(mutationQuarantinePath, {
+                              await saveWorkspaceMutationQuarantine(
+                                  mutationQuarantinePath,
+                                  {
                   version: 1,
                   workerId,
                   workspaceId,
                   ownerId: incarnationId,
                   quarantinedAt: new Date().toISOString(),
                   reason,
-                });
               },
+                              );
+                          },
               async clear() {
                 await clearWorkspaceMutationQuarantine(
                   mutationQuarantinePath,
@@ -921,7 +1487,7 @@ async function run(
           : undefined,
       onIdentityChange:
         pairedIdentity && identityPath
-          ? async (identity) => {
+                    ? async identity => {
               await saveBridgeIdentity(identityPath, {
                 ...pairedIdentity,
                 credential: identity.credential,
@@ -930,10 +1496,12 @@ async function run(
             }
           : undefined,
       onRegistered: fileRelaySupervisor
-        ? async (registration) => {
+                ? async registration => {
             if (
               registration.registrationGeneration == null ||
-              !Number.isSafeInteger(registration.registrationGeneration) ||
+                          !Number.isSafeInteger(
+                              registration.registrationGeneration,
+                          ) ||
               registration.registrationGeneration < 1
             ) {
               throw new Error(
@@ -946,10 +1514,14 @@ async function run(
             );
           }
         : undefined,
-      onError: (error) => {
+            onError: error => {
         const message =
-          error instanceof Error ? error.message : 'unknown bridge error';
-        process.stderr.write(`librechat-code: reconnecting after ${message}\n`);
+                    error instanceof Error
+                        ? error.message
+                        : 'unknown bridge error';
+                process.stderr.write(
+                    `librechat-code: reconnecting after ${message}\n`,
+                );
       },
     });
     if (runtimeSessionId !== undefined) {
@@ -963,11 +1535,24 @@ async function run(
     }
     const resetNativeRoot = option(args, '--reset-workspace-quarantine');
     if (resetNativeRoot != null) {
+      const resetWorkspaceInstance = option(
+        args,
+        '--reset-workspace-instance',
+      );
+      const resetWorkspaceWorktree = option(
+        args,
+        '--reset-workspace-worktree',
+      );
       await worker.refreshCredential(controller.signal);
       await worker.registerForMaintenance(controller.signal);
-      await worker.resetNativeWorkspace(resetNativeRoot, controller.signal);
+            await worker.resetNativeWorkspace(
+                resetNativeRoot,
+                controller.signal,
+                resetWorkspaceInstance,
+                resetWorkspaceWorktree,
+            );
       process.stdout.write(
-        `librechat-code: reset acknowledged for native workspace ${resetNativeRoot}\n`,
+        `librechat-code: reset acknowledged for native workspace ${resetNativeRoot}${resetWorkspaceInstance ? ` instance ${resetWorkspaceInstance}` : ''}${resetWorkspaceWorktree ? ` worktree ${resetWorkspaceWorktree}` : ''}\n`,
       );
       return;
     }
@@ -1047,6 +1632,16 @@ async function clearMutationQuarantine(args: string[]): Promise<void> {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] === 'projects') {
+    const root = option(args, '--root');
+    if (!root || args.slice(1).some((arg, index, rest) =>
+        arg !== '--root' && rest[index - 1] !== '--root' && !arg.startsWith('--root='))) {
+      throw new Error('Usage: librechat-code projects --root <directory>');
+    }
+    const inventory = await discoverProjects({ root });
+    process.stdout.write(`${JSON.stringify(inventory, null, 2)}\n`);
+    return;
+  }
   if (args[0] === 'relay') {
     await relay();
     return;

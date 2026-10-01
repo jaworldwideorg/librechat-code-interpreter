@@ -4,20 +4,47 @@ import { Router } from 'express';
 import type { Response } from 'express';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
-import { executionLimiter } from '../middleware/limits';
+import { cancellationLimiter, executionLimiter } from '../middleware/limits';
 import {
   pyQueue,
   pyQueueEvents,
   connection,
+  jobCancellationRegistry,
   getExecutionQueueBinding,
+  getExistingExecutionJob,
 } from '../queue';
-import { createProgrammaticPayload, extractPendingFromStdout } from '../preamble';
+import {
+  JOB_CANCELLED_MESSAGE,
+  programmaticCancellationError,
+  removeJobIfWaiting,
+  requestJobCancellation,
+  fenceJobCancellation,
+  waitForJobWithCancellation,
+} from '../job-cancellation';
+import {
+  CODEAPI_PROGRAMMATIC_REQUEST_HEADER,
+  attachProgrammaticCancellationTarget,
+  cancelProgrammaticRequest,
+  normalizeProgrammaticRequestId,
+  programmaticCancellationOwner,
+  releaseProgrammaticCancellation,
+  reserveProgrammaticCancellation,
+} from '../programmatic-cancellation';
+import {
+    createProgrammaticPayload,
+    extractPendingFromControlPayload,
+    extractPendingFromStdout,
+} from '../preamble';
 import { findBashToolNameCollision } from '../preamble-bash';
 import type { LCTool } from '../preamble';
 import { isReservedPtcFilename } from '../ptc-constants';
 import { internalServiceHeaders } from '../internal-service-auth';
-import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
+import {
+    resolveOutputBucketSessionKey,
+    SessionKeyResolutionError,
+} from '../session-key';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
+import { principalWorkspaceInstanceId } from '../bridge/workspace-instance';
 import { getExecutionIdentity } from '../execution-identity';
 import { PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION } from '../runtime-session/job-policy';
 import {
@@ -31,27 +58,45 @@ import { Jobs } from '../enum';
 import { env, jobCompletionWaitTimeoutMs } from '../config';
 import { resolveQueuedSandboxBackend } from '../execution-profile';
 import { publicExecutionFailure } from '../utils';
+import { observeRequestDisconnect } from '../request-disconnect';
 import {
   normalizeEgressGatewayUrl,
   normalizeProgrammaticTimeoutMs,
+  normalizeSelectedWorkspaceProgrammaticTimeoutMs,
   prepareSandboxJobSecurity,
   sealPtcCallbackTokenForGateway,
   timeoutMsToGrantSeconds,
 } from '../sandbox-egress';
 import { findUnregisteredToolCall } from '../tool-scope';
 import { summarizeRequestedFiles } from '../execution-log';
-import { pollBlockingExecution, type BlockingPendingState } from './blocking-poll';
-import { clearSessionOwnership, recordSessionOwnership } from '../session-ownership';
-import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
 import {
+    pollBlockingExecution,
+    type BlockingPendingState,
+} from './blocking-poll';
+import {
+    clearSessionOwnership,
+    recordSessionOwnership,
+} from '../session-ownership';
+import {
+    FileRefAuthorizationError,
+    authorizeRequestedFiles,
+} from './file-authorization';
+import {
+  bindReplayWorkspaceInstance,
   buildReplayExecutionState,
   resolveReplayStateSandboxBackend,
 } from './programmatic-state';
 import {
   BridgeWorkerSelectionError,
   CODEAPI_BRIDGE_WORKER_HEADER,
+  CODEAPI_BRIDGE_WORKSPACE_HEADER,
   resolveBridgeWorkerSelection,
 } from '../bridge/selection';
+import {
+  isValidBridgeWorkerId,
+  isValidLinkedWorktreeName,
+  BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_INPUT_FILES,
+} from '../../../packages/code/src/protocol';
 import logger from '../logger';
 import {
   type ExecutionState,
@@ -88,6 +133,18 @@ const JOB_COMPLETION_WAIT_TIMEOUT_MS = jobCompletionWaitTimeoutMs(
   env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
   env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
 );
+const PROGRAMMATIC_CANCELLATION_TTL_SECONDS =
+  Math.ceil(JOB_COMPLETION_WAIT_TIMEOUT_MS / 1000) + 60;
+
+interface ReplayRequestCancellation {
+  signal: AbortSignal;
+  isDisconnected(): boolean;
+  request?: {
+    requestId: string;
+    owner: string;
+    cancelledBeforeStart: boolean;
+  };
+}
 
 const router = Router();
 
@@ -145,26 +202,41 @@ async function retryToolCallServerRequest<T>(
 ): Promise<T> {
   let lastError: Error | undefined;
 
-  for (let attempt = 1; attempt <= TOOL_CALL_SERVER_RETRY_ATTEMPTS; attempt++) {
+    for (
+        let attempt = 1;
+        attempt <= TOOL_CALL_SERVER_RETRY_ATTEMPTS;
+        attempt++
+    ) {
     try {
       return await requestFn();
     } catch (error) {
       lastError = error as Error;
       if (axios.isAxiosError(error)) {
-        if (error.response && error.response.status >= 400 && error.response.status < 500) {
+                if (
+                    error.response &&
+                    error.response.status >= 400 &&
+                    error.response.status < 500
+                ) {
           throw error;
         }
       }
       if (attempt < TOOL_CALL_SERVER_RETRY_ATTEMPTS) {
-        logger.warn(`${context} failed (attempt ${attempt}/${TOOL_CALL_SERVER_RETRY_ATTEMPTS}), retrying...`, {
+                logger.warn(
+                    `${context} failed (attempt ${attempt}/${TOOL_CALL_SERVER_RETRY_ATTEMPTS}), retrying...`,
+                    {
           error: lastError.message,
-        });
-        await new Promise(resolve => setTimeout(resolve, TOOL_CALL_SERVER_RETRY_DELAY * attempt));
+                    },
+                );
+                await new Promise(resolve =>
+                    setTimeout(resolve, TOOL_CALL_SERVER_RETRY_DELAY * attempt),
+                );
       }
     }
   }
 
-  logger.error(`${context} failed after ${TOOL_CALL_SERVER_RETRY_ATTEMPTS} attempts`);
+    logger.error(
+        `${context} failed after ${TOOL_CALL_SERVER_RETRY_ATTEMPTS} attempts`,
+    );
   throw lastError;
 }
 
@@ -179,7 +251,9 @@ setInterval(() => {
 }, STALE_CLEANUP_INTERVAL_MS);
 
 function generateContinuationToken(execution_id: string): string {
-  return Buffer.from(JSON.stringify({ execution_id, ts: Date.now() })).toString('base64');
+    return Buffer.from(
+        JSON.stringify({ execution_id, ts: Date.now() }),
+    ).toString('base64');
 }
 
 /** Map a replay-continuation HTTP status to its operational outcome
@@ -200,14 +274,21 @@ function classifyContinuationOutcome(statusCode: number): string {
  * timestamp is older than the execution-state TTL — without this, the
  * `ts` field was dead data and a client could replay an ancient token
  * against a freshly-reused-execution-id window. */
-function decodeContinuationToken(token: string): { execution_id: string } | null {
+function decodeContinuationToken(
+    token: string,
+): { execution_id: string } | null {
   try {
-    const parsed: unknown = JSON.parse(Buffer.from(token, 'base64').toString('utf-8'));
+        const parsed: unknown = JSON.parse(
+            Buffer.from(token, 'base64').toString('utf-8'),
+        );
     if (parsed === null || typeof parsed !== 'object') {
       return null;
     }
     const candidate = parsed as { execution_id?: unknown; ts?: unknown };
-    if (typeof candidate.execution_id !== 'string' || candidate.execution_id.length === 0) {
+        if (
+            typeof candidate.execution_id !== 'string' ||
+            candidate.execution_id.length === 0
+        ) {
       return null;
     }
     if (typeof candidate.ts === 'number' && Number.isFinite(candidate.ts)) {
@@ -226,13 +307,17 @@ function decodeContinuationToken(token: string): { execution_id: string } | null
 // Blocking mode (legacy path)
 // ---------------------------------------------------------------------------
 
-function waitForExecutionState(execution_id: string, timeout: number): ReturnType<typeof pollBlockingExecution> {
+function waitForExecutionState(
+    execution_id: string,
+    timeout: number,
+): ReturnType<typeof pollBlockingExecution> {
   return pollBlockingExecution(execution_id, timeout, {
     getExecutionState,
     getBlockingResult,
-    getPending: async (id) => {
+        getPending: async id => {
       const response = await retryToolCallServerRequest(
-        () => axios.get<BlockingPendingState>(
+                () =>
+                    axios.get<BlockingPendingState>(
           `${env.TOOL_CALL_SERVER_URL}/sessions/${id}/pending`,
           { headers: internalServiceHeaders() },
         ),
@@ -240,7 +325,8 @@ function waitForExecutionState(execution_id: string, timeout: number): ReturnTyp
       );
       return response.data;
     },
-    isNotFound: (error) => axios.isAxiosError(error) && error.response?.status === 404,
+        isNotFound: error =>
+            axios.isAxiosError(error) && error.response?.status === 404,
     sleep: () => new Promise(resolve => setTimeout(resolve, POLL_INTERVAL)),
     now: Date.now,
   });
@@ -255,7 +341,7 @@ function buildReplayPayload(
   state: ExecutionState,
   history: Record<string, HistoryEntry>,
 ): t.PayloadBody {
-  return createProgrammaticPayload({
+  const payload = createProgrammaticPayload({
     req,
     session_id: state.session_id,
     execution_id: state.execution_id,
@@ -267,6 +353,7 @@ function buildReplayPayload(
     filesOverride: state.files,
     language: state.language ?? 'python',
   });
+  return bindReplayWorkspaceInstance(payload, state);
 }
 
 async function runReplayIteration(
@@ -274,7 +361,10 @@ async function runReplayIteration(
   state: ExecutionState,
   apiKeyId: string,
   userId: string,
+  signal?: AbortSignal,
+  cancellation?: { requestId: string; owner: string },
 ): Promise<t.ExecuteResult> {
+  if (signal?.aborted) throw programmaticCancellationError();
   const history = await loadToolHistory(state.execution_id);
   const rawPayload = buildReplayPayload(req, state, history);
   const sessionKey = state.sessionKey ?? state.userId;
@@ -295,7 +385,8 @@ async function runReplayIteration(
   });
 
   if (DEBUG_MODE) {
-    const firstFile = rawPayload.files[0] as { content?: string } | undefined;
+        const firstFile = rawPayload.files[0] as
+            { content?: string } | undefined;
     logger.debug('Replay enqueue details', {
       execution_id: state.execution_id,
       historySize: Object.keys(history).length,
@@ -320,32 +411,83 @@ async function runReplayIteration(
     state.executionProfile ?? env.EXECUTION_PROFILE,
     state.executionProfileSource ?? env.EXECUTION_PROFILE_SOURCE,
   );
-  const job = await queue.add(Jobs.execute, {
-    code: state.userCode ?? '',
-    userId,
-    payload: sandboxSecurity.payload,
-    apiKeyId,
-    isPyPlot: state.isPyPlot ?? false,
-    principalSource: state.principalSource,
-    executionId: state.execution_id,
-    tenantId: state.tenantId,
-    canonicalUserId: state.canonicalUserId,
-    executionProfile: state.executionProfile ?? env.EXECUTION_PROFILE,
-    sandboxBackend: replayBackend,
-    ...(state.bridgeWorkerId != null ? { bridgeWorkerId: state.bridgeWorkerId } : {}),
-    runtimeSessionMode: 'stateless',
-    runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
-    executionManifestClaims: sandboxSecurity.executionManifestClaims,
-    egressGrantClaims: sandboxSecurity.egressGrantClaims,
-    egressGrantToken: sandboxSecurity.egressGrantToken,
-  }, {
-    removeOnComplete: { age: 60, count: 1 },
-    removeOnFail: { age: 180, count: 1 },
-    attempts: 1,
-  });
+  if (signal?.aborted) throw programmaticCancellationError();
+  const cancellationTarget = { queueName: queue.name, jobId: nanoid() };
+  if (cancellation != null) {
+    const attachment = await attachProgrammaticCancellationTarget({
+      redis: connection,
+      requestId: cancellation.requestId,
+      owner: cancellation.owner,
+      target: cancellationTarget,
+      ttlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+    });
+    if (attachment === 'forbidden') {
+      throw new Error('Programmatic cancellation request ownership changed');
+    }
+    if (attachment === 'cancelled') {
+      throw programmaticCancellationError();
+    }
+  }
+  const submittedAtMs = Date.now();
+  const deadlineAtMs = submittedAtMs + env.JOB_TIMEOUT;
+  let job: Awaited<ReturnType<typeof queue.add>>;
+  try {
+    job = await queue.add(
+      Jobs.execute,
+      {
+        code: state.userCode ?? '',
+        userId,
+        payload: sandboxSecurity.payload,
+        apiKeyId,
+        isPyPlot: state.isPyPlot ?? false,
+        principalSource: state.principalSource,
+        executionId: state.execution_id,
+        tenantId: state.tenantId,
+        canonicalUserId: state.canonicalUserId,
+        executionProfile: state.executionProfile ?? env.EXECUTION_PROFILE,
+        sandboxBackend: replayBackend,
+        ...(state.bridgeWorkerId != null ? { bridgeWorkerId: state.bridgeWorkerId } : {}),
+        ...(state.workspaceId != null ? { workspaceId: state.workspaceId } : {}),
+        cancellable: true,
+        deadlineAtMs,
+        cancellationTtlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+        runtimeSessionMode: 'stateless',
+        runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
+        executionManifestClaims: sandboxSecurity.executionManifestClaims,
+        egressGrantClaims: sandboxSecurity.egressGrantClaims,
+        egressGrantToken: sandboxSecurity.egressGrantToken,
+      },
+      {
+        removeOnComplete: { age: 60, count: 1 },
+        removeOnFail: { age: 180, count: 1 },
+        attempts: 1,
+        jobId: cancellationTarget.jobId,
+        timestamp: submittedAtMs,
+      },
+    );
+  } catch (error) {
+    // Redis may have enqueued the job even though its reply was lost.
+    // Preserve replay ownership until cancellation is durable or the job's
+    // fixed worker deadline prevents a late admission from executing.
+    const outcome = await fenceJobCancellation<t.ExecuteResult>({
+      commands: connection, target: cancellationTarget,
+      ttlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS, deadlineAtMs,
+    });
+    if (outcome.status === 'completed') return outcome.result;
+    throw error;
+  }
   jobsSubmitted.inc({ language });
 
-  return job.waitUntilFinished(events, JOB_COMPLETION_WAIT_TIMEOUT_MS);
+  return waitForJobWithCancellation({
+    commands: connection,
+    registry: jobCancellationRegistry,
+    job,
+    events,
+    timeoutMs: JOB_COMPLETION_WAIT_TIMEOUT_MS,
+    cancellationTtlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+    deadlineAtMs,
+    signal,
+  });
 }
 
 function isSandboxRunSuccess(result: t.ExecuteResult): boolean {
@@ -365,18 +507,34 @@ async function handleReplayInitial(
     apiKeyId: string;
     userId: string;
     bridgeWorkerId?: string;
+    workspaceId?: string;
+    workspaceInstanceId?: string;
+    workspaceWorktree?: string;
   },
+  cancellation: ReplayRequestCancellation,
 ): Promise<void> {
-  const { apiKeyId, userId, bridgeWorkerId } = params;
   const {
-    code,
-    tools,
-    user_id,
-    files,
-  } = req.body as t.ProgrammaticRequestBody;
+    apiKeyId,
+    userId,
+    bridgeWorkerId,
+    workspaceId,
+    workspaceInstanceId,
+    workspaceWorktree,
+  } = params;
+    const { code, tools, user_id, files } =
+        req.body as t.ProgrammaticRequestBody;
   let timeout: number;
   try {
-    timeout = normalizeProgrammaticTimeoutMs((req.body as t.ProgrammaticRequestBody).timeout);
+        if (workspaceId != null && Array.isArray(files) && files.length > BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_INPUT_FILES) {
+          throw new Error(`Selected-workspace execution allows at most ${BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_INPUT_FILES} input files; main and replay history occupy two reserved slots`);
+        }
+        timeout = workspaceId != null
+          ? normalizeSelectedWorkspaceProgrammaticTimeoutMs(
+              (req.body as t.ProgrammaticRequestBody).timeout,
+            )
+          : normalizeProgrammaticTimeoutMs(
+              (req.body as t.ProgrammaticRequestBody).timeout,
+            );
   } catch (error) {
     res.status(400).json({ error: (error as Error).message });
     return;
@@ -400,14 +558,23 @@ async function handleReplayInitial(
     });
     return;
   }
-  const language: 'python' | 'bash' = requestedLanguage === 'bash' ? 'bash' : 'python';
+    const language: 'python' | 'bash' =
+        requestedLanguage === 'bash' ? 'bash' : 'python';
+  if (workspaceId != null && language !== 'bash') {
+    res.status(400).json({
+      error: 'Selected-workspace programmatic execution supports bash only',
+    });
+    return;
+  }
 
   if (!code) {
     res.status(400).json({ error: 'Missing required field: code' });
     return;
   }
-  if (!tools || !Array.isArray(tools) || tools.length === 0) {
-    res.status(400).json({ error: 'Missing required field: tools (must be a non-empty array)' });
+  if (!Array.isArray(tools) || (tools.length === 0 && workspaceId == null)) {
+    res.status(400).json({
+            error: 'Missing required field: tools (must be non-empty unless a selected workspace executes bash)',
+    });
     return;
   }
   if (tools.length > MAX_TOOLS_PER_REQUEST) {
@@ -442,7 +609,8 @@ async function handleReplayInitial(
       files,
       store: connection,
     });
-    (req.body as t.ProgrammaticRequestBody).files = authorizedFiles.length > 0 ? authorizedFiles : undefined;
+        (req.body as t.ProgrammaticRequestBody).files =
+            authorizedFiles.length > 0 ? authorizedFiles : undefined;
   } catch (error) {
     if (sendFileRefAuthorizationError(error, res, req)) return;
     logger.error('Error authorizing replay file refs:', error);
@@ -456,19 +624,39 @@ async function handleReplayInitial(
   try {
     sessionKey = resolveOutputBucketSessionKey(req);
   } catch (error) {
-    if (sendSessionKeyResolutionError(error, res, req, 'programmatic /exec: resolveOutputBucketSessionKey')) {
+        if (
+            sendSessionKeyResolutionError(
+                error,
+                res,
+                req,
+                'programmatic /exec: resolveOutputBucketSessionKey',
+            )
+        ) {
       return;
     }
     throw error;
+  }
+
+  if (
+    cancellation.signal.aborted ||
+    cancellation.request?.cancelledBeforeStart === true
+  ) {
+    if (!cancellation.isDisconnected()) {
+      res.status(200).json({
+        status: 'error',
+        error: 'Programmatic execution request cancelled',
+      });
+    }
+    return;
   }
 
   const session_id = nanoid();
   const execution_id = nanoid();
   const authContext = req.codeApiAuthContext;
   const identity = getExecutionIdentity(req, userId);
-  const isPyPlot = language === 'python' && (
-    code.includes('import matplotlib') || code.includes('import seaborn')
-  );
+    const isPyPlot =
+        language === 'python' &&
+        (code.includes('import matplotlib') || code.includes('import seaborn'));
 
   await recordSessionOwnership(connection, session_id, sessionKey);
 
@@ -487,6 +675,9 @@ async function handleReplayInitial(
     timeout,
     language,
     bridgeWorkerId,
+    workspaceId,
+    workspaceInstanceId,
+    workspaceWorktree,
     executionProfile: env.EXECUTION_PROFILE,
     executionProfileSource: env.EXECUTION_PROFILE_SOURCE,
     sandboxBackend: resolveReplayStateSandboxBackend({
@@ -506,13 +697,16 @@ async function handleReplayInitial(
     await setExecutionState(state);
   } catch (err) {
     if (err instanceof ExecutionStateTooLargeError) {
-      logger.warn('Rejecting replay request: ExecutionState exceeds Redis cap', {
+            logger.warn(
+                'Rejecting replay request: ExecutionState exceeds Redis cap',
+                {
         execution_id,
         userId,
         apiKeyId,
         bytes: err.bytes,
         cap: err.cap,
-      });
+                },
+            );
       await clearSessionOwnership(connection, session_id).catch(() => {});
       ptcReplayStateOversize.inc();
       res.status(413).json({
@@ -537,7 +731,7 @@ async function handleReplayInitial(
     timeout,
   });
 
-  await runAndRespond(req, res, state, apiKeyId, userId);
+  await runAndRespond(req, res, state, apiKeyId, userId, cancellation);
 }
 
 async function handleReplayContinuation(
@@ -549,6 +743,7 @@ async function handleReplayContinuation(
     decoded: { execution_id: string };
     tool_results: NonNullable<t.ProgrammaticRequestBody['tool_results']>;
   },
+  cancellation: ReplayRequestCancellation,
 ): Promise<void> {
   const { apiKeyId, userId, decoded, tool_results } = params;
 
@@ -568,9 +763,15 @@ async function handleReplayContinuation(
    *            adds outcome plumbing through `runAndRespond`. */
   const startMs = performance.now();
   res.once('finish', () => {
-    const labels = { mode: 'replay' as const, outcome: classifyContinuationOutcome(res.statusCode) };
+        const labels = {
+            mode: 'replay' as const,
+            outcome: classifyContinuationOutcome(res.statusCode),
+        };
     ptcReplayContinuations.inc(labels);
-    ptcReplayContinuationDuration.observe(labels, (performance.now() - startMs) / 1000);
+        ptcReplayContinuationDuration.observe(
+            labels,
+            (performance.now() - startMs) / 1000,
+        );
   });
 
   /** Reject oversized batches before we spend any CPU on per-entry
@@ -601,6 +802,20 @@ async function handleReplayContinuation(
       res.status(404).json({ error: 'Execution not found or expired' });
       return;
     }
+    if (
+      cancellation.signal.aborted ||
+      cancellation.request?.cancelledBeforeStart === true
+    ) {
+      await cleanupExecution(state.execution_id, 'replay');
+      if (!cancellation.isDisconnected()) {
+        res.status(200).json({
+          status: 'error',
+          error: 'Programmatic execution request cancelled',
+          session_id: state.session_id,
+        });
+      }
+      return;
+    }
     /** Compute the delta against already-persisted history first so the
      * cap checks see the real impact of this batch (new call_ids only
      * advance `callCount`; overwrites may shrink or grow `historyBytes`
@@ -621,9 +836,14 @@ async function handleReplayContinuation(
         call_site: emitted.call_site,
       };
     });
-    const deltaOrError = await computeToolHistoryDelta(state.execution_id, enrichedResults);
+        const deltaOrError = await computeToolHistoryDelta(
+            state.execution_id,
+            enrichedResults,
+        );
     if ('error' in deltaOrError) {
-      res.status(deltaOrError.status ?? 400).json({ error: deltaOrError.error });
+            res.status(deltaOrError.status ?? 400).json({
+                error: deltaOrError.error,
+            });
       return;
     }
     const delta = deltaOrError;
@@ -642,7 +862,9 @@ async function handleReplayContinuation(
     });
     if (!pre.ok) {
       if (pre.status === 403) {
-        logger.warn('Unauthorized replay continuation request rejected', {
+                logger.warn(
+                    'Unauthorized replay continuation request rejected',
+                    {
           execution_id: state.execution_id,
           requestUserId: userId,
           requestApiKeyId: apiKeyId,
@@ -650,7 +872,8 @@ async function handleReplayContinuation(
           executionUserId: state.userId,
           executionApiKeyId: state.apiKeyId,
           executionTenantId: state.tenantId,
-        });
+                    },
+                );
       }
       if (pre.cleanupOnReject === true) {
         await cleanupExecution(state.execution_id, 'replay');
@@ -672,7 +895,10 @@ async function handleReplayContinuation(
      * Redis MULTI/EXEC so counters and the hash can't drift out of sync
      * on a partial failure. */
     state.callCount = (state.callCount ?? 0) + delta.newCallIds.length;
-    state.historyBytes = Math.max(0, (state.historyBytes ?? 0) + delta.bytesDelta);
+        state.historyBytes = Math.max(
+            0,
+            (state.historyBytes ?? 0) + delta.bytesDelta,
+        );
     state.lastActivity = Date.now();
     try {
       await commitToolHistoryAndState(state, delta);
@@ -687,14 +913,19 @@ async function handleReplayContinuation(
          * forward is a fresh execution with smaller inputs. Reap the
          * old execution to free the lock and Redis keys, then return
          * an actionable 413 instead of a generic 500. */
-        logger.warn('Replay continuation rejected: ExecutionState exceeds Redis cap', {
+                logger.warn(
+                    'Replay continuation rejected: ExecutionState exceeds Redis cap',
+                    {
           execution_id: state.execution_id,
           bytes: err.bytes,
           cap: err.cap,
           callCount: state.callCount,
           historyBytes: state.historyBytes,
-        });
-        await cleanupExecution(state.execution_id, 'replay').catch(() => {});
+                    },
+                );
+                await cleanupExecution(state.execution_id, 'replay').catch(
+                    () => {},
+                );
         ptcReplayStateOversize.inc();
         res.status(413).json({
           status: 'error',
@@ -715,10 +946,13 @@ async function handleReplayContinuation(
        * the throw bubble to the top-level catch and become an opaque
        * 500 — clients (and load balancers) treat 5xx classes very
        * differently for retry policy. */
-      logger.error('Failed to commit replay continuation; returning retryable 503', {
+            logger.error(
+                'Failed to commit replay continuation; returning retryable 503',
+                {
         execution_id: state.execution_id,
         err: (err as Error).message,
-      });
+                },
+            );
       res.status(503).json({
         status: 'error',
         error: 'Failed to persist replay continuation; please retry the same request',
@@ -735,7 +969,14 @@ async function handleReplayContinuation(
       });
     }
 
-    await runAndRespond(req, res, state, apiKeyId, userId);
+    await runAndRespond(
+      req,
+      res,
+      state,
+      apiKeyId,
+      userId,
+      cancellation,
+    );
   } finally {
     await releaseExecutionLock(decoded.execution_id, lockToken);
   }
@@ -747,28 +988,32 @@ async function runAndRespond(
   state: ExecutionState,
   apiKeyId: string,
   userId: string,
+  cancellation: ReplayRequestCancellation,
 ): Promise<void> {
-  /** Read disconnect state through `isDisconnected()` rather than a
-   * direct boolean. The `req.on('close', ...)` handler flips the flag
-   * during awaits, but `@typescript-eslint/no-unnecessary-condition`
-   * (correctly per TS semantics) narrows a directly-mutated `let`/object
-   * member to its literal value after an early-return `if (...) return`,
-   * even across awaits. A function call is opaque to that narrowing. */
-  let disconnected = false;
-  const isDisconnected = (): boolean => disconnected;
-  req.on('close', () => {
-    if (!res.writableEnded) disconnected = true;
-  });
-
   let result: t.ExecuteResult;
   try {
-    result = await runReplayIteration(req, state, apiKeyId, userId);
+    result = await runReplayIteration(
+      req,
+      state,
+      apiKeyId,
+      userId,
+      cancellation.signal,
+      cancellation.request,
+    );
   } catch (err) {
-    logger.error('Replay iteration failed', { execution_id: state.execution_id, err });
+    const cancelled =
+      (err as Error).name === 'AbortError' ||
+      (err as Error).message === JOB_CANCELLED_MESSAGE;
+    logger.log(cancelled ? 'info' : 'error', 'Replay iteration failed', {
+      execution_id: state.execution_id,
+      cancelled,
+      err,
+    });
     await cleanupExecution(state.execution_id, 'replay');
-    if (!isDisconnected()) {
+    if (!cancellation.isDisconnected()) {
       const publicFailure = publicExecutionFailure(err);
-      const message = publicFailure?.body.message ?? (err as Error).message;
+            const message =
+                publicFailure?.body.message ?? (err as Error).message;
       res.status(200).json({
         status: 'error',
         error: message !== '' ? message : 'Sandbox execution failed',
@@ -778,7 +1023,7 @@ async function runAndRespond(
     return;
   }
 
-  if (isDisconnected()) {
+  if (cancellation.isDisconnected()) {
     logger.info('Client disconnected during replay; cleaning up', {
       execution_id: state.execution_id,
     });
@@ -786,10 +1031,19 @@ async function runAndRespond(
     return;
   }
 
-  const { stdout: cleanStdout, pending } = extractPendingFromStdout(
+    const extracted = extractPendingFromStdout(
     result.stdout,
     state.execution_id,
   );
+    const cleanStdout = extracted.stdout;
+    const controlPayload = result.pending_tool_calls_payload;
+    const hasControlPayload = typeof controlPayload === 'string';
+    const controlPending = hasControlPayload
+        ? extractPendingFromControlPayload(controlPayload)
+        : null;
+    const pending = hasControlPayload
+        ? (controlPending ?? [])
+        : extracted.pending;
 
   if (pending != null) {
     if (pending.length === 0) {
@@ -806,7 +1060,10 @@ async function runAndRespond(
       });
       return;
     }
-    const unregisteredToolCall = findUnregisteredToolCall(pending, state.tools);
+        const unregisteredToolCall = findUnregisteredToolCall(
+            pending,
+            state.tools,
+        );
     if (unregisteredToolCall != null) {
       logger.warn('Sandbox requested unregistered replay tool call', {
         execution_id: state.execution_id,
@@ -866,12 +1123,17 @@ async function runAndRespond(
       await setExecutionState(state);
       await refreshExecutionTtl(state.execution_id);
     } catch (err) {
-      logger.error('Failed to persist execution state before continuation; aborting', {
+            logger.error(
+                'Failed to persist execution state before continuation; aborting',
+                {
         execution_id: state.execution_id,
         err: (err as Error).message,
-      });
-      await cleanupExecution(state.execution_id, 'replay').catch(() => {});
-      if (!isDisconnected()) {
+                },
+            );
+            await cleanupExecution(state.execution_id, 'replay').catch(
+                () => {},
+            );
+      if (!cancellation.isDisconnected()) {
         if (err instanceof ExecutionStateTooLargeError) {
           /** A continuation that pushes `emittedCallIds` past the
            * `MAX_EXECUTION_STATE_BYTES` cap is a client-input sizing
@@ -887,8 +1149,7 @@ async function runAndRespond(
         } else {
           res.status(503).json({
             status: 'error',
-            error:
-              'Failed to persist replay state; please retry the request from scratch',
+                        error: 'Failed to persist replay state; please retry the request from scratch',
             session_id: state.session_id,
           });
         }
@@ -912,7 +1173,8 @@ async function runAndRespond(
 
   if (!isSandboxRunSuccess(result)) {
     await cleanupExecution(state.execution_id, 'replay');
-    const errorMessage = result.message != null && result.message !== ''
+        const errorMessage =
+            result.message != null && result.message !== ''
       ? result.message
       : `Sandbox exited with code ${result.code ?? 'unknown'}`;
     res.status(200).json({
@@ -920,6 +1182,10 @@ async function runAndRespond(
       error: errorMessage,
       stdout: cleanStdout,
       stderr: result.stderr,
+      files: result.files,
+      deleted_files: result.deleted_files,
+      artifact_delivery: result.artifact_delivery,
+      artifact_truncation: result.artifact_truncation,
       session_id: state.session_id,
     });
     return;
@@ -932,7 +1198,9 @@ async function runAndRespond(
     stdout: cleanStdout,
     stderr: result.stderr,
     files: result.files,
+    deleted_files: result.deleted_files,
     artifact_delivery: result.artifact_delivery,
+    artifact_truncation: result.artifact_truncation,
     session_id: state.session_id,
   });
 }
@@ -941,7 +1209,71 @@ async function runAndRespond(
 // Request entrypoint
 // ---------------------------------------------------------------------------
 
-router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
+router.post(
+  '/exec/programmatic/cancel',
+  cancellationLimiter,
+  async (req: t.AuthenticatedRequest, res) => {
+    const principal = getPrincipalOrReject(req, res);
+    if (!principal) return;
+    const requestId = normalizeProgrammaticRequestId(
+      (req.body as Record<string, unknown>)?.request_id,
+    );
+    if (requestId == null) {
+      res.status(400).json({ error: 'Invalid or missing request_id' });
+      return;
+    }
+    try {
+      const owner = programmaticCancellationOwner(req, principal.userId);
+      const cancellation = await cancelProgrammaticRequest({
+        redis: connection,
+        requestId,
+        owner,
+        ttlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+      });
+      if (cancellation.status === 'forbidden') {
+        res.status(403).json({ error: 'Programmatic request belongs to another principal' });
+        return;
+      }
+      if (cancellation.target != null) {
+        const accepted = await requestJobCancellation(
+          connection,
+          cancellation.target,
+          PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+        );
+        if (!accepted) {
+          res.status(200).json({ status: 'already_completed' });
+          return;
+        }
+        try {
+          const queuedJob = await getExistingExecutionJob(
+            cancellation.target.queueName,
+            cancellation.target.jobId,
+          );
+          if (queuedJob != null) await removeJobIfWaiting(queuedJob);
+        } catch (error) {
+            logger.warn('Failed to remove cancelled waiting execution', {
+              requestId,
+              queueName: cancellation.target?.queueName,
+              jobId: cancellation.target?.jobId,
+              error: (error as Error).message,
+            });
+        }
+      }
+      res.status(202).json({ status: 'cancellation_requested' });
+    } catch (error) {
+      logger.error('Failed to request programmatic execution cancellation', {
+        requestId,
+        error: (error as Error).message,
+      });
+      res.status(503).json({ error: 'Cancellation service unavailable' });
+    }
+  },
+);
+
+router.post(
+    '/exec/programmatic',
+    executionLimiter,
+    async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
   const apiKeyId = getCredentialId(req);
@@ -954,13 +1286,19 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
     return res.status(503).json({ error: 'Service is starting up' });
   }
 
-  const {
-    continuation_token,
-    tool_results,
-  } = req.body as t.ProgrammaticRequestBody;
+        const { continuation_token, tool_results } =
+            req.body as t.ProgrammaticRequestBody;
   const rawBody = req.body as Record<string, unknown>;
+  const rawRequestId = req.header(CODEAPI_PROGRAMMATIC_REQUEST_HEADER);
+  const requestId = normalizeProgrammaticRequestId(rawRequestId);
+  if (rawRequestId != null && requestId == null) {
+    return res.status(400).json({ error: 'Invalid programmatic request ID' });
+  }
   const requestedLanguage: unknown = rawBody.language ?? rawBody.lang;
   let bridgeWorkerId: string | undefined;
+  let workspaceId: string | undefined;
+  let workspaceInstanceId: string | undefined;
+  let workspaceWorktree: string | undefined;
   if (continuation_token == null || continuation_token === '') {
     try {
       const bridgeSelection = resolveBridgeWorkerSelection({
@@ -970,12 +1308,61 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
         requestedWorkerId: req.header(CODEAPI_BRIDGE_WORKER_HEADER),
         trustedWorkerId: principal.codeWorkerId,
       });
-      bridgeWorkerId = bridgeSelection?.explicit === true
-        ? bridgeSelection.workerId
-        : undefined;
+      bridgeWorkerId =
+        bridgeSelection?.explicit === true ||
+        (bridgeSelection != null && !env.BRIDGE_DYNAMIC_WORKERS)
+          ? bridgeSelection.workerId
+          : undefined;
+      const requestedWorkspaceId = req
+        .header(CODEAPI_BRIDGE_WORKSPACE_HEADER)
+        ?.trim();
+                if (
+                    requestedWorkspaceId != null &&
+                    requestedWorkspaceId !== ''
+                ) {
+        if (bridgeWorkerId == null) {
+          return res.status(400).json({
+            error: 'Workspace selection requires an authenticated bridge worker',
+          });
+        }
+        if (!isValidBridgeWorkerId(requestedWorkspaceId)) {
+                        return res
+                            .status(400)
+                            .json({ error: 'Invalid code workspace ID' });
+        }
+        workspaceId = requestedWorkspaceId;
+      }
+      const requestedWorkspaceInstanceId = rawBody.workspace_instance_id;
+      if (requestedWorkspaceInstanceId !== undefined) {
+        if (
+          workspaceId == null ||
+          typeof requestedWorkspaceInstanceId !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(requestedWorkspaceInstanceId)
+        ) {
+          return res.status(400).json({
+            error: 'Invalid code workspace instance ID',
+          });
+        }
+        workspaceInstanceId = principalWorkspaceInstanceId({
+          instanceId: requestedWorkspaceInstanceId,
+          tenantId: principal.tenantId,
+          principalId: principal.userId,
+        });
+      }
+      const requestedWorktree = rawBody.workspace_worktree;
+      if (requestedWorktree !== undefined) {
+        if (workspaceId == null || !isValidLinkedWorktreeName(requestedWorktree)) {
+          return res.status(400).json({
+            error: 'Invalid code workspace worktree',
+          });
+        }
+        workspaceWorktree = requestedWorktree;
+      }
     } catch (error) {
       if (error instanceof BridgeWorkerSelectionError) {
-        return res.status(error.status).json({ error: error.message });
+                    return res
+                        .status(error.status)
+                        .json({ error: error.message });
       }
       throw error;
     }
@@ -991,7 +1378,51 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
     });
   }
 
+  const disconnectObserver = observeRequestDisconnect(req, res);
+
+  const cancellation: ReplayRequestCancellation = {
+    signal: disconnectObserver.signal,
+    isDisconnected: disconnectObserver.isDisconnected,
+  };
+  let reservedCancellation: { requestId: string; owner: string } | undefined;
+
   try {
+    if (requestId != null) {
+      const owner = programmaticCancellationOwner(req, userId);
+      let reservation: Awaited<ReturnType<typeof reserveProgrammaticCancellation>>;
+      try {
+        reservation = await reserveProgrammaticCancellation({
+          redis: connection,
+          requestId,
+          owner,
+          ttlSeconds: PROGRAMMATIC_CANCELLATION_TTL_SECONDS,
+        });
+      } catch (error) {
+        logger.error('Failed to reserve programmatic cancellation request', {
+          requestId,
+          error: (error as Error).message,
+        });
+        if (!cancellation.isDisconnected()) {
+          return res.status(503).json({ error: 'Cancellation service unavailable' });
+        }
+        return;
+      }
+      if (reservation === 'forbidden' || reservation === 'duplicate') {
+        if (!cancellation.isDisconnected()) {
+          return res.status(409).json({
+            error: 'Programmatic request ID is already in use',
+          });
+        }
+        return;
+      }
+      reservedCancellation = { requestId, owner };
+      cancellation.request = {
+        requestId,
+        owner,
+        cancelledBeforeStart: reservation === 'cancelled',
+      };
+    }
+
     /** For continuations, peek at the stored execution to route by the
      * mode it was started in rather than the current process default.
      * Without this, a replay-mode execution resumed via an instance
@@ -1013,7 +1444,9 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
       }
       const decoded = decodeContinuationToken(continuation_token);
       if (!decoded) {
-        return res.status(400).json({ error: 'Invalid continuation token' });
+                    return res
+                        .status(400)
+                        .json({ error: 'Invalid continuation token' });
       }
       const existing = await getExecutionState(decoded.execution_id);
       if (existing?.mode === 'replay') {
@@ -1022,7 +1455,7 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
           userId,
           decoded,
           tool_results,
-        });
+        }, cancellation);
       }
       return await handleBlocking(req, res, { apiKeyId, userId });
     }
@@ -1036,17 +1469,48 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
       });
     }
     if (env.PTC_MODE === 'replay') {
-      return await handleReplayInitial(req, res, { apiKeyId, userId, bridgeWorkerId });
+      return await handleReplayInitial(req, res, {
+        apiKeyId,
+        userId,
+        bridgeWorkerId,
+        workspaceId,
+        workspaceInstanceId,
+        workspaceWorktree,
+      }, cancellation);
     }
-    return await handleBlocking(req, res, { apiKeyId, userId, bridgeWorkerId });
+    if (workspaceId != null) {
+      return res.status(400).json({
+        error: 'Selected-workspace programmatic execution requires replay mode',
+      });
+    }
+            return await handleBlocking(req, res, {
+                apiKeyId,
+                userId,
+                bridgeWorkerId,
+            });
   } catch (err) {
     logger.error(`[${INSTANCE_ID}] Programmatic routing error:`, err);
     if (!res.headersSent) {
       return res.status(500).json({ error: 'Internal server error' });
     }
     return;
+  } finally {
+    disconnectObserver.dispose();
+    if (reservedCancellation != null) {
+      await releaseProgrammaticCancellation({
+        redis: connection,
+        requestId: reservedCancellation.requestId,
+        owner: reservedCancellation.owner,
+      }).catch(error => {
+        logger.warn('Failed to release programmatic cancellation request', {
+          requestId: reservedCancellation?.requestId,
+          error: (error as Error).message,
+        });
+      });
+    }
   }
-});
+    },
+);
 
 // ---------------------------------------------------------------------------
 // Blocking-mode handler (extracted from the original implementation).
@@ -1059,46 +1523,47 @@ async function handleBlocking(
   params: { apiKeyId: string; userId: string; bridgeWorkerId?: string },
 ): Promise<void | ReturnType<typeof res.status>> {
   const { apiKeyId, userId, bridgeWorkerId } = params;
-  const {
-    code,
-    tools,
-    user_id,
-    files,
-    continuation_token,
-    tool_results,
-  } = req.body as t.ProgrammaticRequestBody;
+    const { code, tools, user_id, files, continuation_token, tool_results } =
+        req.body as t.ProgrammaticRequestBody;
   let timeout: number;
   try {
-    timeout = normalizeProgrammaticTimeoutMs((req.body as t.ProgrammaticRequestBody).timeout);
+        timeout = normalizeProgrammaticTimeoutMs(
+            (req.body as t.ProgrammaticRequestBody).timeout,
+        );
   } catch (error) {
     return res.status(400).json({ error: (error as Error).message });
   }
 
   // CASE 1: Continuation
-  if (continuation_token != null && continuation_token !== '' && tool_results) {
+    if (
+        continuation_token != null &&
+        continuation_token !== '' &&
+        tool_results
+    ) {
     const decoded = decodeContinuationToken(continuation_token);
     if (!decoded) {
-      return res.status(400).json({ error: 'Invalid continuation token' });
+            return res
+                .status(400)
+                .json({ error: 'Invalid continuation token' });
     }
 
     const { execution_id } = decoded;
     const execution = await getExecutionState(execution_id);
     if (!execution) {
-      return res.status(404).json({ error: 'Execution not found or expired' });
+            return res
+                .status(404)
+                .json({ error: 'Execution not found or expired' });
     }
 
     const identity = getExecutionIdentity(req, userId);
     if (
       execution.userId !== userId ||
       (execution.apiKeyId != null && execution.apiKeyId !== apiKeyId) ||
-      (
-        execution.tenantId != null &&
-        execution.tenantId !== identity.storageNamespace
-      ) ||
-      (
-        execution.authContextHash != null &&
-        execution.authContextHash !== req.codeApiAuthContext?.authContextHash
-      )
+            (execution.tenantId != null &&
+                execution.tenantId !== identity.storageNamespace) ||
+            (execution.authContextHash != null &&
+                execution.authContextHash !==
+                    req.codeApiAuthContext?.authContextHash)
     ) {
       logger.warn('Unauthorized blocking continuation request rejected', {
         execution_id,
@@ -1122,14 +1587,19 @@ async function handleBlocking(
 
     try {
       await retryToolCallServerRequest(
-        () => axios.post(`${env.TOOL_CALL_SERVER_URL}/sessions/${execution_id}/results`, {
+                () =>
+                    axios.post(
+                        `${env.TOOL_CALL_SERVER_URL}/sessions/${execution_id}/results`,
+                        {
           results: tool_results.map(r => ({
             call_id: r.call_id,
             result: r.result,
             is_error: r.is_error ?? false,
             error_message: r.error_message,
           })),
-        }, { headers: internalServiceHeaders() }),
+                        },
+                        { headers: internalServiceHeaders() },
+                    ),
         'Submit tool results',
       );
 
@@ -1151,7 +1621,9 @@ async function handleBlocking(
           stdout: state.stdout ?? '',
           stderr: state.stderr ?? '',
           files: state.files ?? [],
+          deleted_files: state.deleted_files,
           artifact_delivery: state.artifact_delivery,
+          artifact_truncation: state.artifact_truncation,
           session_id: execution.session_id,
         });
       }
@@ -1174,14 +1646,21 @@ async function handleBlocking(
     return res.status(400).json({ error: 'Missing required field: code' });
   }
   if (!tools || !Array.isArray(tools) || tools.length === 0) {
-    return res.status(400).json({ error: 'Missing required field: tools (must be a non-empty array)' });
+        return res
+            .status(400)
+            .json({
+                error: 'Missing required field: tools (must be a non-empty array)',
+            });
   }
   if (tools.length > MAX_TOOLS_PER_REQUEST) {
-    logger.warn(`Too many tools provided: ${tools.length}, limit is ${MAX_TOOLS_PER_REQUEST}`, {
+        logger.warn(
+            `Too many tools provided: ${tools.length}, limit is ${MAX_TOOLS_PER_REQUEST}`,
+            {
       execution_id: 'pre-creation',
       userId,
       toolCount: tools.length,
-    });
+            },
+        );
     return res.status(400).json({
       error: `Too many tools provided (${tools.length}). Maximum is ${MAX_TOOLS_PER_REQUEST}.`,
     });
@@ -1202,7 +1681,8 @@ async function handleBlocking(
       files,
       store: connection,
     });
-    (req.body as t.ProgrammaticRequestBody).files = authorizedFiles.length > 0 ? authorizedFiles : undefined;
+        (req.body as t.ProgrammaticRequestBody).files =
+            authorizedFiles.length > 0 ? authorizedFiles : undefined;
   } catch (error) {
     if (sendFileRefAuthorizationError(error, res, req)) return;
     logger.error('Error authorizing programmatic file refs:', error);
@@ -1215,7 +1695,14 @@ async function handleBlocking(
   try {
     sessionKey = resolveOutputBucketSessionKey(req);
   } catch (error) {
-    if (sendSessionKeyResolutionError(error, res, req, 'programmatic /exec-blocking: resolveOutputBucketSessionKey')) {
+        if (
+            sendSessionKeyResolutionError(
+                error,
+                res,
+                req,
+                'programmatic /exec-blocking: resolveOutputBucketSessionKey',
+            )
+        ) {
       return;
     }
     throw error;
@@ -1270,24 +1757,34 @@ async function handleBlocking(
     try {
       callbackUrl = normalizeEgressGatewayUrl(env.EGRESS_GATEWAY_URL);
     } catch (error) {
-      logger.error('Blocking PTC requires egress gateway callback URL:', error);
+            logger.error(
+                'Blocking PTC requires egress gateway callback URL:',
+                error,
+            );
       await cleanupExecution(execution_id, 'blocking');
-      return res.status(503).json({ error: 'Egress gateway unavailable' });
+            return res
+                .status(503)
+                .json({ error: 'Egress gateway unavailable' });
     }
 
     let callbackToken: string;
 
     try {
       const toolCallResponse = await retryToolCallServerRequest(
-        () => axios.post<{
+                () =>
+                    axios.post<{
           success: boolean;
           callback_token: string;
-        }>(`${env.TOOL_CALL_SERVER_URL}/sessions`, {
+                    }>(
+                        `${env.TOOL_CALL_SERVER_URL}/sessions`,
+                        {
           execution_id,
           session_id,
           timeout,
           tools,
-        }, { headers: internalServiceHeaders() }),
+                        },
+                        { headers: internalServiceHeaders() },
+                    ),
         'Create Tool Call Server session',
       );
 
@@ -1299,9 +1796,14 @@ async function handleBlocking(
         allowedToolNames: tools.map(tool => tool.name),
       });
     } catch (error) {
-      logger.error('Failed to create Tool Call Server session or callback token:', error);
+            logger.error(
+                'Failed to create Tool Call Server session or callback token:',
+                error,
+            );
       await cleanupExecution(execution_id, 'blocking');
-      return res.status(503).json({ error: 'Tool Call Server unavailable' });
+            return res
+                .status(503)
+                .json({ error: 'Tool Call Server unavailable' });
     }
 
     let rawPayload: t.PayloadBody;
@@ -1316,10 +1818,15 @@ async function handleBlocking(
         timeout,
       });
     } catch (error) {
-      logger.error('Failed to create payload', { execution_id, error: (error as Error).message });
+            logger.error('Failed to create payload', {
+                execution_id,
+                error: (error as Error).message,
+            });
       await cleanupExecution(execution_id, 'blocking');
       return res.status(400).json({
-        error: (error as Error).message || 'Failed to generate code payload',
+                error:
+                    (error as Error).message ||
+                    'Failed to generate code payload',
       });
     }
     const sandboxSecurity = prepareSandboxJobSecurity({
@@ -1331,7 +1838,9 @@ async function handleBlocking(
       payload: rawPayload,
     });
 
-    const job = await pyQueue.add(Jobs.execute, {
+        const job = await pyQueue.add(
+            Jobs.execute,
+            {
       code,
       userId,
       payload: sandboxSecurity.payload,
@@ -1350,18 +1859,24 @@ async function handleBlocking(
       ...(bridgeWorkerId != null ? { bridgeWorkerId } : {}),
       runtimeSessionMode: 'stateless',
       runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
-      executionManifestClaims: sandboxSecurity.executionManifestClaims,
+                executionManifestClaims:
+                    sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
       egressGrantToken: sandboxSecurity.egressGrantToken,
-    }, {
+            },
+            {
       removeOnComplete: { age: 60, count: 1 },
       removeOnFail: { age: 180, count: 1 },
       attempts: 1,
       jobId: session_id,
-    });
+            },
+        );
     jobsSubmitted.inc({ language: 'python' });
 
-    logger.info('Job queued, polling for tool calls', { execution_id, session_id });
+        logger.info('Job queued, polling for tool calls', {
+            execution_id,
+            session_id,
+        });
 
     let clientDisconnected = false;
     req.on('close', async () => {
@@ -1372,21 +1887,27 @@ async function handleBlocking(
         await job.remove();
         await cleanupExecution(execution_id, 'blocking');
       } catch (error) {
-        logger.error('Error cleaning up after client disconnect:', error);
+                logger.error(
+                    'Error cleaning up after client disconnect:',
+                    error,
+                );
       }
     });
 
     job.waitUntilFinished(pyQueueEvents, JOB_COMPLETION_WAIT_TIMEOUT_MS)
-      .then(async (result) => {
+            .then(async result => {
         if (clientDisconnected) return;
         await setExecutionResult(execution_id, result);
       })
-      .catch(async (error) => {
+            .catch(async error => {
         if (clientDisconnected) return;
         await setExecutionError(execution_id, error);
       });
 
-    const state = await waitForExecutionState(execution_id, Math.min(timeout, MAX_POLL_TIME));
+        const state = await waitForExecutionState(
+            execution_id,
+            Math.min(timeout, MAX_POLL_TIME),
+        );
 
     if (state.status === 'waiting' && state.pending_calls) {
       return res.status(200).json({
@@ -1404,7 +1925,9 @@ async function handleBlocking(
         stdout: state.stdout ?? '',
         stderr: state.stderr ?? '',
         files: state.files ?? [],
+        deleted_files: state.deleted_files,
         artifact_delivery: state.artifact_delivery,
+        artifact_truncation: state.artifact_truncation,
         session_id,
       });
     }
@@ -1416,7 +1939,10 @@ async function handleBlocking(
       session_id,
     });
   } catch (error) {
-    logger.error(`[${INSTANCE_ID}] Session ID: ${session_id} | Execution ID: ${execution_id} | Error:`, error);
+        logger.error(
+            `[${INSTANCE_ID}] Session ID: ${session_id} | Execution ID: ${execution_id} | Error:`,
+            error,
+        );
     await cleanupExecution(execution_id, 'blocking');
     return res.status(500).json({ error: 'Internal server error' });
   }

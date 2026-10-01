@@ -40,11 +40,20 @@ jobs:
       - name: Document-tooling package and mount checks
         run: tests/document_tooling_manifest.sh
 
+      - name: Sandbox-runner metrics discovery and network policy
+        run: tests/sandbox_runner_metrics.sh
+
       - name: Bridge pairing rollout safety
         run: tests/bridge_pairing_rollout.sh
 
       - name: Compose bridge configuration
         run: node tests/compose-bridge-config.cjs
+
+      - name: Release versioning
+        run: tests/release-versioning.sh
+
+      - name: Release version resolution
+        run: tests/release-version-resolution.sh
 
       - name: Validate sandbox Dockerfiles
         run: |
@@ -118,6 +127,17 @@ jobs:
       - name: Bun tests
         run: bun run test
 
+      - name: File-heavy workspace cleanup on tmpfs
+        run: |
+          docker run --rm --user 0 \
+            --tmpfs /tmp:rw,size=1g \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work,readonly" \
+            --workdir /work/api \
+            --env SANDBOX_CLEANUP_TMPFS_TEST=1 \
+            --env SANDBOX_LOG_LEVEL=error \
+            oven/bun:1.3.14-debian \
+            bun test src/cleanup.integration.test.ts
+
   service-unit-tests:
     name: Service Unit Tests
     runs-on: ubuntu-latest
@@ -141,6 +161,16 @@ jobs:
 
       - name: Install dependencies
         run: bun ci
+
+      - name: Install Redis for ledger integration tests
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - name: Verify fleet admission with isolated Redis
+        run: |
+          redis_socket="$RUNNER_TEMP/byom-admission.sock"
+          redis-server --port 0 --unixsocket "$redis_socket" --save '' --appendonly no --daemonize yes
+          trap 'redis-cli -s "$redis_socket" shutdown nosave' EXIT
+          BRIDGE_TEST_REDIS_URL="$redis_socket" bun test src/bridge/fleet.test.ts
 
       - name: Build service
         run: bun run build
@@ -194,8 +224,46 @@ jobs:
           node-version: 24.16.0
       - run: npm ci
       - run: npm run build
+      - name: Selected project root containment tests
+        run: |
+          command -v rg || brew install ripgrep
+          node --test dist/root-access.test.js
+          node --test --test-name-pattern='selected command|selected replay copy|programmatic probes reject' dist/native-sandbox.test.js
+      - name: Native environment containment tests
+        run: node --test dist/environment.test.js
       - name: Native ACL and credential lifecycle tests
         run: node --test dist/macos-storage.test.js dist/private-storage.test.js dist/storage.test.js dist/github.test.js
+      - name: Native environment setup lifecycle tests
+        env:
+          LIBRECHAT_CODE_LIVE_SRT_TESTS: '1'
+        run: node --test dist/environment-live.test.js
+
+  linux-native-sandbox-tests:
+    name: Linux Native Sandbox Tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: packages/code
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.16.0
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap socat ripgrep
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; bwrap needs them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: npm ci
+      - run: npm run build
+      - name: Linked worktree lane and root Git metadata containment
+        env:
+          LIBRECHAT_CODE_LIVE_SRT_TESTS: '1'
+        run: >-
+          node --test
+          dist/linked-worktrees-live.test.js
+          dist/root-git-denies-live.test.js
 
   lambda-microvm-provisioning:
     name: Lambda MicroVM Provisioning

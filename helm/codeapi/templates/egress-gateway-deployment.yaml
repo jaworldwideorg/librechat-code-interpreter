@@ -24,6 +24,12 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if or .Values.egressGrant.ledgerRequired .Values.hardenedSandboxMode }}
+      initContainers:
+        - name: wait-for-redis
+          image: busybox:1.36.1
+          command: ['sh', '-c', 'until nc -z {{ include "codeapi.redis.host" . }} {{ include "codeapi.redis.port" . }}; do echo waiting for redis; sleep 2; done']
+      {{- end }}
       containers:
         - name: egress-gateway
           image: "{{ .Values.egressGateway.image.repository }}:{{ .Values.egressGateway.image.tag }}"
@@ -40,6 +46,14 @@ spec:
               value: {{ .Values.hardenedSandboxMode | quote }}
             - name: CODEAPI_EGRESS_LEDGER_REQUIRED
               value: {{ .Values.egressGrant.ledgerRequired | quote }}
+            - name: CODEAPI_INPUT_MANIFEST_MAX_FILES
+              value: {{ .Values.egressGrant.inputManifestMaxFiles | quote }}
+            - name: CODEAPI_INPUT_MANIFEST_CONCURRENCY
+              value: {{ .Values.egressGrant.inputManifestConcurrency | quote }}
+            - name: CODEAPI_INPUT_MANIFEST_TIMEOUT_MS
+              value: {{ .Values.egressGrant.inputManifestTimeoutMs | quote }}
+            - name: CODEAPI_EGRESS_LEDGER_COMPACT
+              value: {{ .Values.egressGrant.ledgerCompact | quote }}
             - name: CODEAPI_EGRESS_LEDGER_TTL_GRACE_SECONDS
               value: {{ .Values.egressGrant.ledgerTtlGraceSeconds | quote }}
             - name: EGRESS_GATEWAY_PORT

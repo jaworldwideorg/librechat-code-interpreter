@@ -6,6 +6,7 @@ import { Readable } from 'stream';
 import { env } from './config';
 import {
   EGRESS_GRANT_HEADER,
+  EGRESS_ERROR_CODE_HEADER,
   EgressGrantError,
   egressGrantFromExecutionClaims,
   openEgressGrant,
@@ -25,7 +26,7 @@ import {
   isSyntheticInternalRequestHeader,
 } from './internal-synthetic';
 import {
-  assertEgressGrantActive,
+  checkEgressGrantActive,
   createEgressLedger,
   ensureEgressLedger,
   pingEgressLedger,
@@ -43,35 +44,14 @@ import logger from './logger';
 import { parseBoundedContentLength } from './http-limits';
 import { validateEgressGatewayHardenedConfig } from './secure-startup';
 import { isOpaqueObjectContentDisposition } from './file-metadata';
+import { mapObjectDetails } from './file-object-resolver';
+import { isSupportedBridgeArtifactName } from '../../packages/code/src/protocol';
 
 export const app: Express = express();
 app.disable('x-powered-by');
 validateEgressGatewayHardenedConfig();
 app.use(traceHttpRequest('codeapi.egress_gateway.request'));
 app.use(httpMetricsMiddleware);
-
-const SUPPORTED_OUTPUT_EXTENSIONS = new Set([
-  '.c', '.cs', '.cpp', '.go', '.java', '.js', '.kt', '.kts', '.lua',
-  '.php', '.pl', '.ps1', '.py', '.r', '.rb', '.rs', '.scala', '.sh',
-  '.sql', '.swift', '.ts', '.jsx', '.tsx', '.groovy',
-  '.css', '.htm', '.html', '.less', '.sass', '.scss', '.svg', '.svelte', '.vue',
-  '.adoc', '.asciidoc', '.md', '.rst', '.tex', '.txt', '.wiki',
-  '.csv', '.json', '.bson', '.json5', '.jsonl', '.parquet', '.tsv',
-  '.xml', '.yaml', '.yml',
-  '.ics', '.ical', '.ifb', '.icalendar',
-  '.conf', '.env', '.gitignore', '.ini', '.properties', '.toml',
-  '.doc', '.docx', '.pdf', '.ppt', '.pptx', '.xls', '.xlsx',
-  '.odt', '.ods', '.odp', '.rtf',
-  '.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png',
-  '.tif', '.tiff', '.webp',
-  '.eot', '.ttf', '.woff', '.woff2',
-  '.7z', '.bz2', '.gz', '.gzip', '.rar', '.tar', '.zip',
-  '.tf', '.tfvars', '.tfstate', '.hcl',
-  '.dockerfile', '.Dockerfile', '.dockerignore',
-  '.helmignore', '.helmfile', '.jenkinsfile', '.vagrantfile',
-  '.eslintrc', '.prettierrc', '.editorconfig', '.nomad',
-  '.bat', '.cmd', '.deb', '.log', '.rpm', '.vbs',
-]);
 
 type EgressAuditFields = {
   execHash?: string;
@@ -88,6 +68,8 @@ function routeFamily(req: Request): string {
   if (req.path === '/tool-call') return 'ptc-tool-call';
   if (req.path.startsWith('/sessions/')) {
     if (req.method === 'PUT') return 'file-upload';
+    if (req.method === 'POST' && req.path === '/input-manifest') return 'input-manifest';
+    if (req.method === 'GET' && req.path.endsWith('/metadata')) return 'input-metadata';
     if (req.method === 'GET' && req.path.includes('/objects/')) return 'file-download';
     if (req.method === 'GET' && req.path.endsWith('/objects')) return 'file-list';
     return 'file-unknown';
@@ -157,6 +139,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 function errorStatus(error: EgressGrantError): number {
   if (error.reason === 'missing_secret' || error.reason === 'weak_secret') return 500;
+  if (error.reason === 'ledger_conflict') return 503;
   if (error.reason === 'malformed') return 400;
   if (error.reason === 'expired') return 401;
   return 403;
@@ -165,6 +148,8 @@ function errorStatus(error: EgressGrantError): number {
 function sendEgressError(req: Request, res: Response, error: unknown): Response {
   if (error instanceof EgressGrantError) {
     const statusCode = errorStatus(error);
+    res.setHeader(EGRESS_ERROR_CODE_HEADER, error.reason);
+    if (error.reason === 'ledger_conflict') res.setHeader('Retry-After', '1');
     logger.warn('Rejected egress gateway request', {
       requestId: requestId(res),
       reason: error.reason,
@@ -195,7 +180,7 @@ async function getGrant(req: Request, res: Response): Promise<EgressGrantClaims>
   if (grant.legacy_grant) {
     await ensureEgressLedger(grant);
   }
-  await assertEgressGrantActive(grant);
+  await checkEgressGrantActive(grant);
   return grant;
 }
 
@@ -241,18 +226,7 @@ function assertOutputFilenameAllowed(name: string): void {
     throw new EgressGrantError('malformed', 'Output filename must be canonical');
   }
   if (!isDirkeepName(name)) {
-    const basename = path.posix.basename(name);
-    const ext = path.posix.extname(basename).toLowerCase();
-    const dottedBasename = `.${basename}`;
-    const allowed =
-      (ext !== '' && SUPPORTED_OUTPUT_EXTENSIONS.has(ext)) ||
-      SUPPORTED_OUTPUT_EXTENSIONS.has(basename) ||
-      SUPPORTED_OUTPUT_EXTENSIONS.has(basename.toLowerCase()) ||
-      (ext === '' && (
-        SUPPORTED_OUTPUT_EXTENSIONS.has(dottedBasename) ||
-        SUPPORTED_OUTPUT_EXTENSIONS.has(dottedBasename.toLowerCase())
-      ));
-    if (!allowed) {
+    if (!isSupportedBridgeArtifactName(name)) {
       throw new EgressGrantError('scope_mismatch', 'Output filename extension is not supported');
     }
   }
@@ -434,7 +408,7 @@ async function restoreInternalSandboxResult(args: {
   if (grant.legacy_grant) {
     await ensureEgressLedger(grant);
   }
-  await assertEgressGrantActive(grant);
+  await checkEgressGrantActive(grant);
   const restored = restoreSandboxExecuteResult(
     args.result as Parameters<typeof restoreSandboxExecuteResult>[0],
     args.egressGrantToken,
@@ -620,6 +594,88 @@ app.get('/sessions/:sessionHandle/objects', async (req, res) => {
   }
 });
 
+function inputMetadata(
+  metadata: { version?: unknown; size?: unknown; originalFilename?: unknown; readOnly?: unknown },
+  grant: EgressGrantClaims, sessionId: string, objectId: string,
+) {
+  if (typeof metadata.version !== 'string' || !/^[0-9a-f-]{36}$/.test(metadata.version) ||
+    !Number.isSafeInteger(metadata.size) || (metadata.size as number) < 0) {
+    return { cacheable: false };
+  }
+  const name = typeof metadata.originalFilename === 'string' ? metadata.originalFilename : undefined;
+  const readOnly = metadata.readOnly === true;
+  const cacheKey = crypto.createHash('sha256').update(JSON.stringify([
+    'authorized-http-input-v1', grant.tenant_id, grant.user_id, sessionId, objectId,
+    metadata.version, metadata.size, name, readOnly,
+  ])).digest('hex');
+  return { cacheable: true, cacheKey, version: metadata.version, size: metadata.size, name, readOnly };
+}
+
+/** One budgeted HTTP read, with every handle checked before any storage access.
+ * Results belong only to this execution; the manifest is not an auth token. */
+app.post('/input-manifest', express.json({ limit: '4mb' }), async (req, res) => {
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  const timeout = setTimeout(cancel, env.INPUT_MANIFEST_TIMEOUT_MS);
+  res.once('close', cancel);
+  try {
+    if (Object.keys(req.query).length || !Array.isArray(req.body?.files) ||
+      req.body.files.length > env.INPUT_MANIFEST_MAX_FILES ||
+      req.body.files.some((file: unknown) => !file || typeof file !== 'object' ||
+        typeof (file as { sessionHandle?: unknown }).sessionHandle !== 'string' ||
+        typeof (file as { objectHandle?: unknown }).objectHandle !== 'string')) {
+      return res.status(400).json({ error: 'Invalid input manifest' });
+    }
+    const grant = await getGrant(req, res);
+    const files: Array<{ sessionId: string; objectId: string }> = req.body.files.map((file: { sessionHandle: string; objectHandle: string }) => {
+      const sessionId = openSessionParam(file.sessionHandle, grant, 'read');
+      const object = openObjectParam(file.objectHandle, grant, sessionId);
+      return { sessionId, objectId: object.id };
+    });
+    await recordEgressRead(grant);
+    async function* inputs() { yield* files; }
+    const metadata = await mapObjectDetails(inputs(), async ({ sessionId, objectId }) => {
+      controller.signal.throwIfAborted();
+      const upstream = await fetch(forwardUrl(env.EGRESS_GATEWAY_FILE_SERVER_URL,
+        `/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(objectId)}/metadata`),
+      { headers: injectTraceHeaders(internalServiceHeaders()), signal: controller.signal });
+      if (!upstream.ok) {
+        await upstream.body?.cancel();
+        // Recheck failures individually through the existing retry/classification path.
+        return { cacheable: false, retry: true };
+      }
+      return inputMetadata(await upstream.json(), grant, sessionId, objectId);
+    }, env.INPUT_MANIFEST_CONCURRENCY);
+    // Do not publish a manifest after revocation/expiry during storage resolution.
+    await checkEgressGrantActive(grant);
+    return res.json({ files: metadata });
+  } catch (error) {
+    return sendEgressError(req, res, error);
+  } finally {
+    clearTimeout(timeout);
+    res.removeListener('close', cancel);
+    controller.abort();
+  }
+});
+
+/** Cache preflight is a scoped, budgeted read, never a reusable authorization grant. */
+app.get('/sessions/:sessionHandle/objects/:objectHandle/metadata', async (req, res) => {
+  try {
+    if (Object.keys(req.query).length) return res.status(400).json({ error: 'Metadata query parameters are not supported' });
+    const grant = await getGrant(req, res);
+    const sessionId = openSessionParam(req.params.sessionHandle, grant, 'read');
+    const object = openObjectParam(req.params.objectHandle, grant, sessionId);
+    await recordEgressRead(grant);
+    const upstream = await fetch(forwardUrl(env.EGRESS_GATEWAY_FILE_SERVER_URL,
+      `/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(object.id)}/metadata`),
+    { headers: injectTraceHeaders(internalServiceHeaders()) });
+    if (!upstream.ok) return pipeFetchResponse(upstream, res);
+    return res.json(inputMetadata(await upstream.json(), grant, sessionId, object.id));
+  } catch (error) {
+    return sendEgressError(req, res, error);
+  }
+});
+
 app.get('/sessions/:sessionHandle/objects/:objectHandle', async (req, res) => {
   try {
     if (Object.keys(req.query).length > 0) {
@@ -629,12 +685,16 @@ app.get('/sessions/:sessionHandle/objects/:objectHandle', async (req, res) => {
     const sessionId = openSessionParam(req.params.sessionHandle, grant, 'read');
     const object = openObjectParam(req.params.objectHandle, grant, sessionId);
     await recordEgressRead(grant);
+    const expectedVersion = req.header('x-codeapi-input-version');
+    if (expectedVersion && !/^[0-9a-f-]{36}$/.test(expectedVersion)) {
+      return res.status(400).json({ error: 'Invalid input version' });
+    }
     const upstream = await fetch(
       forwardUrl(
         env.EGRESS_GATEWAY_FILE_SERVER_URL,
         `/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(object.id)}`,
       ),
-      { headers: injectTraceHeaders(internalServiceHeaders()) },
+      { headers: injectTraceHeaders(internalServiceHeaders(expectedVersion ? { 'X-CodeAPI-Input-Version': expectedVersion } : {})) },
     );
     const headerOverrides = isOpaqueObjectContentDisposition(
       upstream.headers.get('content-disposition'),

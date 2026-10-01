@@ -252,7 +252,10 @@ test('worker asks its supervisor to quarantine an ambiguous stateful runtime', a
   const quarantined: Array<{ sessionId: string; reason: string }> = [];
   const supervisor: RuntimeSupervisor = {
     async acquire() {
-      return { endpoint: 'http://127.0.0.1:3000/runtime', sessionId: 'rt-user-1' };
+      return {
+        endpoint: 'http://127.0.0.1:3000/runtime',
+        sessionId: 'rt-user-1',
+      };
     },
     async reset() {},
     async quarantine(sessionId, reason) {
@@ -388,7 +391,10 @@ test('worker continues after an assignment-scoped settlement conflict', async ()
           registeredAt: new Date().toISOString(),
           leaseTtlMs: 60_000,
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (init?.signal?.aborted === true) {
@@ -397,15 +403,25 @@ test('worker continues after an assignment-scoped settlement conflict', async ()
     if (url.endsWith('/lease')) {
       leases += 1;
       return new Response(
-        JSON.stringify({ protocolVersion: 1, serverElapsedMs: 0, assignment }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        JSON.stringify({
+          protocolVersion: 1,
+          serverElapsedMs: 0,
+          assignment,
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/ack')) {
       leaseAcknowledged = true;
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/execute')) {
@@ -511,7 +527,10 @@ test('worker refreshes its registration during a long assignment', async () => {
           registeredAt: new Date().toISOString(),
           leaseTtlMs: 100,
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/execute')) {
@@ -576,7 +595,10 @@ test('worker schedules registration freshness from request start', async () => {
           registeredAt: new Date().toISOString(),
           leaseTtlMs: 50,
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/execute')) {
@@ -589,7 +611,10 @@ test('worker schedules registration freshness from request start', async () => {
     if (url.endsWith('/cancelled')) {
       return new Response(
         JSON.stringify({ protocolVersion: 1, cancelled: false }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     return new Response(
@@ -658,10 +683,13 @@ test('worker continues cancellation polling after a stalled response', async () 
       });
     }
     settlementAttempted = true;
-    return new Response(JSON.stringify({ protocolVersion: 1, accepted: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ protocolVersion: 1, accepted: true }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
   };
   const worker = new BridgeWorker({
     codeApiUrl: 'https://code.example/v1',
@@ -691,6 +719,175 @@ test('worker continues cancellation polling after a stalled response', async () 
     request: { body: { language: 'bash' }, headers: {} },
   });
   assert.equal(cancellationAttempts, 2);
+  assert.equal(settlementAttempted, true);
+});
+
+test('worker stops an outstanding cancellation request before settling completed work', async () => {
+  let startCancellation!: () => void;
+  const cancellationStarted = new Promise<void>((resolve) => {
+    startCancellation = resolve;
+  });
+  let cancellationAborted = false;
+  let settlementAttempted = false;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith('/execute')) {
+      await cancellationStarted;
+      return Response.json({ session_id: 'run-1', files: [] });
+    }
+    if (url.endsWith('/cancellation')) {
+      startCancellation();
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            cancellationAborted = true;
+            reject(new DOMException('aborted', 'AbortError'));
+          },
+          { once: true },
+        );
+      });
+    }
+    settlementAttempted = true;
+    return Response.json({ protocolVersion: 1, accepted: true });
+  };
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1',
+    token: 'worker-secret',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'nsjail',
+      runtimes: ['bash'],
+    },
+    cancellationPollIntervalMs: 1,
+    cancellationTransportTimeoutMs: 10_000,
+    fetchImpl,
+  });
+
+  await worker.executeAndSettle({
+    protocolVersion: 1,
+    assignmentId: 'complete-while-cancellation-polling',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    generation: 1,
+    leaseToken: 'lease-token-that-is-long-enough-for-testing',
+    expiresAt: new Date(Date.now() + 1_000).toISOString(),
+    remainingMs: 1_000,
+    request: { body: { language: 'bash' }, headers: {} },
+  });
+
+  assert.equal(cancellationAborted, true);
+  assert.equal(settlementAttempted, true);
+});
+
+test('worker aborts a retryable cancellation error body before settling completed work', async () => {
+  let cancellationBodyStarted!: () => void;
+  const cancellationStarted = new Promise<void>((resolve) => {
+    cancellationBodyStarted = resolve;
+  });
+  let cancellationBodyAborted = false;
+  let settlementAttempted = false;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith('/execute')) {
+      await cancellationStarted;
+      return Response.json({ session_id: 'run-1', files: [] });
+    }
+    if (url.endsWith('/cancellation')) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            cancellationBodyStarted();
+            init?.signal?.addEventListener(
+              'abort',
+              () => {
+                cancellationBodyAborted = true;
+                controller.error(new DOMException('aborted', 'AbortError'));
+              },
+              { once: true },
+            );
+          },
+        }),
+        { status: 500 },
+      );
+    }
+    settlementAttempted = true;
+    return Response.json({ protocolVersion: 1, accepted: true });
+  };
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1',
+    token: 'worker-secret',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'nsjail',
+      runtimes: ['bash'],
+    },
+    cancellationPollIntervalMs: 1,
+    cancellationTransportTimeoutMs: 10_000,
+    fetchImpl,
+  });
+
+  await worker.executeAndSettle({
+    protocolVersion: 1,
+    assignmentId: 'complete-during-retryable-cancellation-response',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    generation: 1,
+    leaseToken: 'lease-token-that-is-long-enough-for-testing',
+    expiresAt: new Date(Date.now() + 1_000).toISOString(),
+    remainingMs: 1_000,
+    request: { body: { language: 'bash' }, headers: {} },
+  });
+
+  assert.equal(cancellationBodyAborted, true);
+  assert.equal(settlementAttempted, true);
+});
+
+test('worker stops its cancellation delay before settling immediately completed work', async () => {
+  let settlementAttempted = false;
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1',
+    token: 'worker-secret',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'nsjail',
+      runtimes: ['bash'],
+    },
+    cancellationPollIntervalMs: 10_000,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith('/execute')) {
+        return Response.json({ session_id: 'run-1', files: [] });
+      }
+      if (url.endsWith('/cancellation')) {
+        throw new Error('cancellation transport should not start');
+      }
+      settlementAttempted = true;
+      return Response.json({ protocolVersion: 1, accepted: true });
+    },
+  });
+
+  await worker.executeAndSettle({
+    protocolVersion: 1,
+    assignmentId: 'complete-before-cancellation-polling',
+    workerId: 'vm-1',
+    incarnationId: 'incarnation-00000001',
+    generation: 1,
+    leaseToken: 'lease-token-that-is-long-enough-for-testing',
+    expiresAt: new Date(Date.now() + 1_000).toISOString(),
+    remainingMs: 1_000,
+    request: { body: { language: 'bash' }, headers: {} },
+  });
+
   assert.equal(settlementAttempted, true);
 });
 
@@ -852,10 +1049,13 @@ test('worker preserves status for a non-JSON settlement rejection', async () => 
     },
     fetchImpl: async (input) => {
       if (String(input).endsWith('/execute')) {
-        return new Response(JSON.stringify({ session_id: 'run-1', files: [] }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return new Response(
+          JSON.stringify({ session_id: 'run-1', files: [] }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
       }
       settlementAttempts += 1;
       return new Response('<html>assignment fenced</html>', {
@@ -1032,7 +1232,10 @@ test('worker retries a known-clean rejection after shutdown until acknowledged',
           registeredAt: new Date().toISOString(),
           leaseTtlMs: 50,
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (String(input).endsWith('/execute')) {
@@ -1046,18 +1249,20 @@ test('worker retries a known-clean rejection after shutdown until acknowledged',
       controller.abort();
       throw new TypeError('connection reset');
     }
-    return new Response(JSON.stringify({ protocolVersion: 1, accepted: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ protocolVersion: 1, accepted: true }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
   };
   const worker = new BridgeWorker({
     codeApiUrl: 'https://code.example/v1',
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1097,8 +1302,7 @@ test('worker preserves a definite rejection when its heartbeat fails', async () 
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1118,7 +1322,10 @@ test('worker preserves a definite rejection when its heartbeat fails', async () 
             registeredAt: new Date().toISOString(),
             leaseTtlMs: 50,
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       }
       if (String(input).endsWith('/execute')) {
@@ -1139,7 +1346,10 @@ test('worker preserves a definite rejection when its heartbeat fails', async () 
       }
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1170,8 +1380,7 @@ test('worker quarantines a stateful workspace after a sandbox 5xx response', asy
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1187,7 +1396,10 @@ test('worker quarantines a stateful workspace after a sandbox 5xx response', asy
       settlementAttempted = true;
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1217,8 +1429,7 @@ test('worker treats a non-JSON sandbox 4xx as a definite rejection', async () =>
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1235,7 +1446,10 @@ test('worker treats a non-JSON sandbox 4xx as a definite rejection', async () =>
         JSON.parse(String(init?.body) || '{}').status === 'rejected';
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1268,18 +1482,20 @@ test('worker quarantines a stateful workspace after the sandbox request aborts',
       });
     }
     settlementAttempted = true;
-    return new Response(JSON.stringify({ protocolVersion: 1, accepted: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ protocolVersion: 1, accepted: true }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
   };
   const worker = new BridgeWorker({
     codeApiUrl: 'https://code.example/v1',
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1331,13 +1547,23 @@ test('worker surfaces quarantine when shutdown aborts stateful execution', async
           registeredAt: new Date().toISOString(),
           leaseTtlMs: 60_000,
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/lease')) {
       return new Response(
-        JSON.stringify({ protocolVersion: 1, serverElapsedMs: 0, assignment }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        JSON.stringify({
+          protocolVersion: 1,
+          serverElapsedMs: 0,
+          assignment,
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     }
     if (url.endsWith('/execute')) {
@@ -1351,18 +1577,20 @@ test('worker surfaces quarantine when shutdown aborts stateful execution', async
         );
       });
     }
-    return new Response(JSON.stringify({ protocolVersion: 1, accepted: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ protocolVersion: 1, accepted: true }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
   };
   const worker = new BridgeWorker({
     codeApiUrl: 'https://code.example/v1',
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1510,7 +1738,10 @@ test('worker subtracts lease response transit from the server budget', async () 
         if (String(input).endsWith('/ack')) {
           return new Response(
             JSON.stringify({ protocolVersion: 1, accepted: true }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
           );
         }
         now += 50;
@@ -1527,10 +1758,16 @@ test('worker subtracts lease response transit from the server budget', async () 
               leaseToken: 'lease-token-that-is-long-enough-for-testing',
               expiresAt: new Date(0).toISOString(),
               remainingMs: 1_000,
-              request: { body: { language: 'bash' }, headers: {} },
+              request: {
+                body: { language: 'bash' },
+                headers: {},
+              },
             },
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       },
     });
@@ -1572,21 +1809,28 @@ test('worker rejects a lease whose acknowledgement exhausts its budget', async (
               registeredAt: new Date().toISOString(),
               leaseTtlMs: 50,
             }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
           );
         }
         if (String(input).endsWith('/ack')) {
           now += 10;
           return new Response(
             JSON.stringify({ protocolVersion: 1, accepted: true }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
           );
         }
         if (String(input).endsWith('/settle')) {
           settlementAttempts += 1;
-          abandonedSettlement = JSON.parse(
-            String(init?.body),
-          ) as Record<string, unknown>;
+          abandonedSettlement = JSON.parse(String(init?.body)) as Record<
+            string,
+            unknown
+          >;
           if (settlementAttempts === 1) {
             return new Response(JSON.stringify({ error: 'unavailable' }), {
               status: 503,
@@ -1595,7 +1839,10 @@ test('worker rejects a lease whose acknowledgement exhausts its budget', async (
           }
           return new Response(
             JSON.stringify({ protocolVersion: 1, accepted: true }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
           );
         }
         return new Response(
@@ -1611,15 +1858,24 @@ test('worker rejects a lease whose acknowledgement exhausts its budget', async (
               leaseToken: 'lease-token-that-is-long-enough-for-testing',
               expiresAt: new Date(0).toISOString(),
               remainingMs: 10,
-              request: { body: { language: 'bash' }, headers: {} },
+              request: {
+                body: { language: 'bash' },
+                headers: {},
+              },
             },
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       },
     });
 
-    await assert.rejects(worker.lease(), /expired during lease acknowledgement/);
+    await assert.rejects(
+      worker.lease(),
+      /expired during lease acknowledgement/,
+    );
     assert.equal(abandonedSettlement?.status, 'rejected');
     assert.ok(registrations > 0);
     assert.equal(settlementAttempts, 2);
@@ -1653,7 +1909,10 @@ test('worker rejects an assignment after ambiguous acknowledgement delivery', as
           JSON.parse(String(init?.body) || '{}').status === 'rejected';
         return new Response(
           JSON.stringify({ protocolVersion: 1, accepted: true }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       }
       if (String(input).endsWith('/workers/register')) {
@@ -1665,7 +1924,10 @@ test('worker rejects an assignment after ambiguous acknowledgement delivery', as
             registeredAt: new Date().toISOString(),
             leaseTtlMs: 60_000,
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       }
       return new Response(
@@ -1685,7 +1947,10 @@ test('worker rejects an assignment after ambiguous acknowledgement delivery', as
             request: { body: { language: 'bash' }, headers: {} },
           },
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1702,8 +1967,7 @@ test('worker clamps rejected settlement errors to the protocol limit', async () 
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1716,11 +1980,16 @@ test('worker clamps rejected settlement errors to the protocol limit', async () 
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      const settlement = JSON.parse(String(init?.body)) as { error: string };
+      const settlement = JSON.parse(String(init?.body)) as {
+        error: string;
+      };
       rejection = settlement.error;
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1747,8 +2016,7 @@ test('worker quarantines an explicitly dirty stateful sandbox response', async (
     token: 'worker-secret',
     workerId: 'vm-1',
     incarnationId: 'incarnation-00000001',
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     capabilities: {
       statefulWorkspace: true,
       sandboxProfile: 'nsjail',
@@ -1761,13 +2029,19 @@ test('worker quarantines an explicitly dirty stateful sandbox response', async (
             error: 'session_workspace_dirty',
             message: 'restore required',
           }),
-          { status: 409, headers: { 'Content-Type': 'application/json' } },
+          {
+            status: 409,
+            headers: { 'Content-Type': 'application/json' },
+          },
         );
       }
       settlementAttempted = true;
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1859,15 +2133,21 @@ test('worker uses the server-relative lease budget despite VM clock skew', async
     },
     fetchImpl: async (input) => {
       if (String(input).endsWith('/execute')) {
-        return new Response(JSON.stringify({ session_id: 'run-1', files: [] }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return new Response(
+          JSON.stringify({ session_id: 'run-1', files: [] }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
       }
       settlementAttempted = true;
       return new Response(
         JSON.stringify({ protocolVersion: 1, accepted: true }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
       );
     },
   });
@@ -1885,7 +2165,6 @@ test('worker uses the server-relative lease budget despite VM clock skew', async
   });
   assert.equal(settlementAttempted, true);
 });
-
 
 test('worker continues after an expired assignment settlement conflict', async () => {
   const controller = new AbortController();
@@ -1921,18 +2200,22 @@ test('worker continues after an expired assignment settlement conflict', async (
         leases += 1;
         return Response.json({
           protocolVersion: 1,
-          assignment: leases === 1
-            ? {
-                protocolVersion: 1,
-                assignmentId: 'assignment-expired',
-                workerId: 'vm-1',
-                incarnationId,
-                generation: 1,
-                leaseToken: 'lease-token-that-is-long-enough-for-testing',
-                expiresAt: new Date(Date.now() + 10_000).toISOString(),
-                request: { body: { language: 'bash' }, headers: {} },
-              }
-            : undefined,
+          assignment:
+            leases === 1
+              ? {
+                  protocolVersion: 1,
+                  assignmentId: 'assignment-expired',
+                  workerId: 'vm-1',
+                  incarnationId,
+                  generation: 1,
+                  leaseToken: 'lease-token-that-is-long-enough-for-testing',
+                  expiresAt: new Date(Date.now() + 10_000).toISOString(),
+                  request: {
+                    body: { language: 'bash' },
+                    headers: {},
+                  },
+                }
+              : undefined,
         });
       }
       if (url.endsWith('/execute')) {
@@ -1940,7 +2223,10 @@ test('worker continues after an expired assignment settlement conflict', async (
       }
       if (url.endsWith('/settle')) {
         return Response.json(
-          { error: 'Bridge assignment has expired', code: 'ASSIGNMENT_EXPIRED' },
+          {
+            error: 'Bridge assignment has expired',
+            code: 'ASSIGNMENT_EXPIRED',
+          },
           { status: 409 },
         );
       }
@@ -2172,7 +2458,10 @@ test('paired worker rotates credentials throughout a long assignment', async () 
     }
     if (url.endsWith('/execute')) {
       await new Promise((resolve) => setTimeout(resolve, 55));
-      return Response.json({ session_id: 'run-long-rotation', files: [] });
+      return Response.json({
+        session_id: 'run-long-rotation',
+        files: [],
+      });
     }
     return Response.json({ protocolVersion: 1, accepted: true });
   };
@@ -2276,6 +2565,117 @@ test('paired worker cancels a stalled credential refresh after execution', async
   assert.equal(refreshAborted, true);
 });
 
+test('one concurrent caller cannot abort a credential refresh another caller still needs', async () => {
+  const key = createBridgeIdentity();
+  const first = new AbortController();
+  const second = new AbortController();
+  let releaseRefresh!: () => void;
+  let refreshStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    refreshStarted = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  let transportAborted = false;
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1',
+    workerId: 'vm-1',
+    incarnationId,
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    identity: {
+      privateKey: key.privateKey,
+      credential: 'credential-before-shared-refresh',
+      expiresAt: new Date(Date.now() + 5).toISOString(),
+    },
+    credentialRefreshWindowMs: 10,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'nsjail',
+      runtimes: ['bash'],
+    },
+    fetchImpl: async (input, init) => {
+      assert.match(String(input), /credentials\/refresh$/);
+      refreshStarted();
+      init?.signal?.addEventListener('abort', () => {
+        transportAborted = true;
+      });
+      await released;
+      return Response.json({
+        protocolVersion: 1,
+        workerId: 'vm-1',
+        credential: 'credential-after-shared-refresh-value',
+        expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      });
+    },
+  });
+
+  const firstRefresh = worker.refreshCredential(first.signal);
+  await started;
+  const secondRefresh = worker.refreshCredential(second.signal);
+  first.abort();
+
+  await assert.rejects(firstRefresh, { name: 'AbortError' });
+  assert.equal(transportAborted, false);
+  releaseRefresh();
+  await secondRefresh;
+  assert.equal(transportAborted, false);
+});
+
+test('a new caller starts a fresh credential refresh after the last waiter aborts', async () => {
+  const key = createBridgeIdentity();
+  const first = new AbortController();
+  let refreshCount = 0;
+  let firstRefreshStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    firstRefreshStarted = resolve;
+  });
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1',
+    workerId: 'vm-1',
+    incarnationId,
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    identity: {
+      privateKey: key.privateKey,
+      credential: 'credential-before-replacement-refresh',
+      expiresAt: new Date(Date.now() + 5).toISOString(),
+    },
+    credentialRefreshWindowMs: 10,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'nsjail',
+      runtimes: ['bash'],
+    },
+    fetchImpl: async (_input, init) => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        firstRefreshStarted();
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true },
+          );
+        });
+      }
+      return Response.json({
+        protocolVersion: 1,
+        workerId: 'vm-1',
+        credential: 'credential-after-replacement-refresh',
+        expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      });
+    },
+  });
+
+  const abandoned = worker.refreshCredential(first.signal, Date.now() + 1_000);
+  await started;
+  first.abort();
+  await assert.rejects(abandoned, { name: 'AbortError' });
+  await worker.refreshCredential(undefined, Date.now() + 1_000);
+
+  assert.equal(refreshCount, 2);
+});
+
 test('paired worker refreshes conservatively before server clock calibration', async () => {
   const key = createBridgeIdentity();
   let refreshCount = 0;
@@ -2347,8 +2747,7 @@ test('paired worker charges initial credential refresh against the assignment de
         sandboxStarted = true;
       }
       if (url.endsWith('/settle')) {
-        rejected =
-          JSON.parse(String(init?.body)).status === 'rejected';
+        rejected = JSON.parse(String(init?.body)).status === 'rejected';
       }
       return Response.json({
         protocolVersion: 1,
@@ -2389,8 +2788,7 @@ test('paired worker rechecks the deadline after request serialization', async ()
     codeApiUrl: 'https://code.example/v1',
     workerId: 'vm-1',
     incarnationId,
-    sandboxEndpoint:
-      'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
+    sandboxEndpoint: 'http://127.0.0.1:2000/sessions/{runtimeSessionId}/api/v2',
     identity: {
       privateKey: key.privateKey,
       credential: 'credential-valid-during-serialization',
@@ -2408,8 +2806,7 @@ test('paired worker rechecks the deadline after request serialization', async ()
         sandboxStarted = true;
       }
       if (url.endsWith('/settle')) {
-        rejected =
-          JSON.parse(String(init?.body)).status === 'rejected';
+        rejected = JSON.parse(String(init?.body)).status === 'rejected';
       }
       return Response.json({
         protocolVersion: 1,
@@ -2471,8 +2868,7 @@ test('paired worker keeps endpoint validation failures known-clean', async () =>
       const url = String(input);
       if (url.endsWith('/execute')) sandboxStarted = true;
       if (url.endsWith('/settle')) {
-        rejected =
-          JSON.parse(String(init?.body)).status === 'rejected';
+        rejected = JSON.parse(String(init?.body)).status === 'rejected';
       }
       return Response.json({
         protocolVersion: 1,
@@ -2758,11 +3154,13 @@ test('sandbox completion does not cancel an in-flight credential rotation', asyn
     }
     if (url.endsWith('/execute')) {
       await refreshStartedPromise;
-      return Response.json({ session_id: 'run-rotation-race', files: [] });
+      return Response.json({
+        session_id: 'run-rotation-race',
+        files: [],
+      });
     }
-    settleAuthorization = (
-      init?.headers as Record<string, string>
-    ).Authorization;
+    settleAuthorization = (init?.headers as Record<string, string>)
+      .Authorization;
     return Response.json({ protocolVersion: 1, accepted: true });
   };
   const worker = new BridgeWorker({
@@ -2799,8 +3197,41 @@ test('sandbox completion does not cancel an in-flight credential rotation', asyn
   );
 });
 
+test('settlement does not drain another lane credential renewal', async () => {
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1', workerId: 'vm-1', token: 'fixture',
+    incarnationId, sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    capabilities: { statefulWorkspace: true, sandboxProfile: 'nsjail', runtimes: ['bash'] },
+    fetchImpl: async (input) => String(input).endsWith('/execute')
+      ? Response.json({ session_id: 'independent-lane', files: [] })
+      : Response.json({ protocolVersion: 1, accepted: true }),
+  });
+  // A different lane owns this pending renewal. The settling lane has no
+  // maintenance waiter and must not consume its own lease on that promise.
+  Object.assign(worker, { credentialInFlight: {
+    promise: new Promise<void>(() => {}), controller: new AbortController(), waiters: 1,
+  }, refreshCredential: async () => {} });
+  const startedAt = Date.now();
+  await worker.executeAndSettle({
+    protocolVersion: 1, assignmentId: 'independent-lane', workerId: 'vm-1',
+    incarnationId, generation: 5, leaseToken: 'independent-lane-lease-token',
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    request: { body: { language: 'bash' }, headers: {} },
+  });
+  assert.ok(Date.now() - startedAt < 500, 'unrelated renewal must not add a one-second drain');
+});
+
 test('reconnect delay uses bounded exponential jitter', () => {
-  assert.equal(reconnectDelayMs(0, 1_000, 30_000, () => 0), 500);
-  assert.equal(reconnectDelayMs(0, 1_000, 30_000, () => 1), 1_000);
-  assert.equal(reconnectDelayMs(10, 1_000, 30_000, () => 1), 30_000);
+  assert.equal(
+    reconnectDelayMs(0, 1_000, 30_000, () => 0),
+    500,
+  );
+  assert.equal(
+    reconnectDelayMs(0, 1_000, 30_000, () => 1),
+    1_000,
+  );
+  assert.equal(
+    reconnectDelayMs(10, 1_000, 30_000, () => 1),
+    30_000,
+  );
 });

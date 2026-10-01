@@ -11,15 +11,12 @@ import {
   sep,
 } from 'node:path';
 import { constants as fsConstants } from 'node:fs';
-import {
-  access,
-  mkdtemp,
-  open,
-  realpath,
-  rm,
-  stat,
-} from 'node:fs/promises';
+import type { Dirent, Stats } from 'node:fs';
+import { access, mkdtemp, open, readdir, realpath, rm, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
+import { matchesWorkspaceRoot } from './root-identity.js';
+import type { WorkspaceRootIdentity } from './root-identity.js';
+import { withWorkspaceRoot, WorkspaceRootAccessError, spawnWithinWorkspace, realpath as rootedRealpath, stat as rootedStat } from './root-access.js';
 
 import { SandboxManager } from '@anthropic-ai/sandbox-runtime';
 
@@ -36,12 +33,18 @@ import {
 } from './private-storage.js';
 import { WorkspaceToolError } from './workspace.js';
 import { restoreScratchTraversal } from './native-scratch.js';
+import { writeLinkedWorktreeGitGuard } from './linked-worktree-git-guard.js';
 
 import type {
   ChildProcessWithoutNullStreams,
   SpawnOptionsWithoutStdio,
 } from 'node:child_process';
-import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
+import type {
+  SandboxAskCallback,
+  SandboxRuntimeConfig,
+} from '@anthropic-ai/sandbox-runtime';
+import { normalizeNativeSrtCommandPolicy } from './native-policy.js';
+import type { NativeSrtCommandPolicy } from './native-policy.js';
 import type {
   WorkspaceExecuteCommandRequest,
   WorkspaceExecuteCommandResult,
@@ -105,10 +108,15 @@ const TRUSTED_GIT_ENVIRONMENT = {
   GIT_CONFIG_KEY_3: 'filter.lfs.required',
   GIT_CONFIG_VALUE_3: 'true',
 } as const;
-const {
-  GIT_CONFIG_COUNT: TRUSTED_GIT_CONFIG_COUNT,
-  ...TRUSTED_GIT_CONFIG_ENTRIES
-} = TRUSTED_GIT_ENVIRONMENT;
+/** Sibling lanes share object storage, so a lane never starts automatic gc or maintenance. */
+const LINKED_WORKTREE_GIT_ENVIRONMENT = {
+  ...TRUSTED_GIT_ENVIRONMENT,
+  GIT_CONFIG_COUNT: '6',
+  GIT_CONFIG_KEY_4: 'gc.auto',
+  GIT_CONFIG_VALUE_4: '0',
+  GIT_CONFIG_KEY_5: 'maintenance.auto',
+  GIT_CONFIG_VALUE_5: 'false',
+} as const;
 
 const NATIVE_SANDBOX_SCRATCH_PREFIX = 'librechat-code-srt-';
 // SRT grants these shared compatibility paths by default. A worker-specific
@@ -124,7 +132,10 @@ const HOST_TEMPORARY_ROOT = tmpdir();
 interface NativeSandboxManager {
   isSupportedPlatform(): boolean;
   checkDependenciesAsync(): Promise<{ warnings: string[]; errors: string[] }>;
-  initialize(config: SandboxRuntimeConfig): Promise<void>;
+  initialize(
+    config: SandboxRuntimeConfig,
+    sandboxAskCallback?: SandboxAskCallback,
+  ): Promise<void>;
   wrapWithSandboxArgv(
     command: string,
     binShell?: string,
@@ -133,8 +144,12 @@ interface NativeSandboxManager {
     cwd?: string,
     options?: { commandId?: string; commandText?: string },
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>;
-  annotateStderrWithSandboxFailures(commandId: string, stderr: string): string;
+    annotateStderrWithSandboxFailures(
+        commandId: string,
+        stderr: string,
+    ): string;
   cleanupAfterCommand(): void;
+  updateConfig?(config: SandboxRuntimeConfig): void;
   reset(): Promise<void>;
 }
 
@@ -152,7 +167,18 @@ type SpawnCommand = (
 ) => ChildProcessWithoutNullStreams;
 
 export interface NativeSrtWorkspaceCommandSandboxOptions {
+  workspaceIdentity?: WorkspaceRootIdentity;
   workspaceRoot: string;
+  /** Present when `workspaceRoot` is a verified linked worktree lane of a checkout. */
+  linkedWorktree?: {
+    /** The checkout that owns the worktree; trusted as a Git safe directory. */
+    checkoutRoot: string;
+    /** `<checkout>/.git`: readable, but writable only at `writableGitPaths`. */
+    commonGitDir: string;
+    /** Shared objects and refs plus the lane's own metadata beneath `commonGitDir`. */
+    writableGitPaths: string[];
+  };
+  commandPolicy?: NativeSrtCommandPolicy;
   /** Trusted worker files that must never become workspace-readable or writable. */
   protectedPaths?: string[];
   allowedDomains?: string[];
@@ -163,6 +189,8 @@ export interface NativeSrtWorkspaceCommandSandboxOptions {
   platform?: NodeJS.Platform;
   /** Trusted shell path used by SRT on POSIX hosts. */
   shellPath?: string;
+  /** Trusted jq path used by generated programmatic scripts. */
+  jqPath?: string;
   /** Host-owned credentials exposed only as SRT sentinels inside the sandbox. */
   maskedEnvironment?: {
     variables: Array<{
@@ -170,8 +198,15 @@ export interface NativeSrtWorkspaceCommandSandboxOptions {
       injectHosts: string[];
       extract?: string;
     }>;
-    resolve(signal?: AbortSignal): Promise<Record<string, string>>;
-    wrapCommand?(command: string, platform: NodeJS.Platform): string;
+    resolve(
+      signal?: AbortSignal,
+      cwd?: string,
+    ): Promise<Record<string, string>>;
+    wrapCommand?(
+      command: string,
+      platform: NodeJS.Platform,
+      environment: Readonly<Record<string, string>>,
+    ): string;
   };
 }
 
@@ -200,6 +235,130 @@ async function canonicalPath(path: string): Promise<string> {
   }
 }
 
+/**
+ * Paths inside a repository's own Git directory that Git treats as executable
+ * configuration: hooks run on the next Git invocation, and `config` /
+ * an existing `config.worktree` can define filter, diff, or fsmonitor commands
+ * that later run unsandboxed. An existing `commondir` is denied too, since it
+ * redirects the whole common Git directory to attacker-controlled config.
+ *
+ * A sandboxed command may write anywhere in the workspace root, so these are
+ * denied explicitly for the registered root's `.git`. SRT's Linux mandatory
+ * denies derive equivalents from the worker process's current directory, which
+ * is not the registered root, so they never cover it; macOS instead applies
+ * global `.git/hooks` and `.git/config` Seatbelt patterns. Denying the root's
+ * own metadata directly keeps the guarantee identical on both platforms and
+ * independent of the worker's cwd. Lane workspaces keep the whole common Git
+ * directory read-only already, so this augments only the non-lane root.
+ *
+ * The set is recomputed before every ordinary root command, so a repository,
+ * submodule, or linked worktree created after initialization is covered from
+ * the next command on. Only submodule and linked-worktree Git directories
+ * that exist at that moment are enumerated: masking a non-existent
+ * `.git/modules` would block a later `git submodule add` from creating it
+ * during the same command. `.git/info`
+ * is intentionally omitted — its attributes reference filter/diff drivers by
+ * name, but the commands those names resolve to live in the denied config, so
+ * `info` alone cannot introduce a new executable.
+ */
+async function collectGitMetadataDenies(root: string): Promise<string[]> {
+  const gitDir = join(root, '.git');
+  if (!(await statIfPresent(gitDir))?.isDirectory()) return [];
+  const denies = [join(gitDir, 'hooks'), join(gitDir, 'config')];
+  await pushExistingDenies(denies, gitDir);
+  for (const submoduleGitDir of await collectSubmoduleGitDirs(
+    join(gitDir, 'modules'),
+  )) {
+    denies.push(join(submoduleGitDir, 'hooks'), join(submoduleGitDir, 'config'));
+    await pushExistingDenies(denies, submoduleGitDir);
+  }
+  const worktreesDir = join(gitDir, 'worktrees');
+  for (const entry of await readdirIfPresent(worktreesDir)) {
+    if (entry.isDirectory()) {
+      await pushExistingDenies(denies, join(worktreesDir, entry.name));
+    }
+  }
+  return denies;
+}
+
+/**
+ * `commondir` and `config.worktree` are read strictly by Git when present —
+ * `commondir` at every startup, `config.worktree` whenever `worktreeConfig`
+ * is enabled — and SRT masks a non-existent deny target with an empty
+ * `/dev/null` bind that Git cannot open, failing every Git command. Denying
+ * them only where they already exist keeps the mask a read-only bind of the
+ * real file. `config` and `hooks` stay unconditional: they always exist in a
+ * real repository. In a repository that already enables `worktreeConfig`, a
+ * missing `config.worktree` therefore stays creatable, like a new
+ * `commondir`; the package README lists both with the other residuals of a
+ * writable workspace.
+ */
+async function pushExistingDenies(paths: string[], gitDir: string): Promise<void> {
+  for (const name of ['config.worktree', 'commondir']) {
+    const candidate = join(gitDir, name);
+    if (await statIfPresent(candidate)) paths.push(candidate);
+  }
+}
+
+/**
+ * Enumerate every submodule Git directory beneath `.git/modules`, following the
+ * `<gitdir>/modules/<name>` nesting Git uses for recursive submodules. A
+ * directory holding a `HEAD` file is a Git directory; any other directory is an
+ * intermediate segment of a submodule path that itself contains slashes.
+ */
+async function collectSubmoduleGitDirs(modulesDir: string): Promise<string[]> {
+  const found: string[] = [];
+  const stack = [modulesDir];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    const entries = await readdirIfPresent(dir);
+    if (entries.some(entry => entry.isFile() && entry.name === 'HEAD')) {
+      found.push(dir);
+      if (
+        entries.some(entry => entry.isDirectory() && entry.name === 'modules')
+      ) {
+        stack.push(join(dir, 'modules'));
+      }
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) stack.push(join(dir, entry.name));
+    }
+  }
+  return found;
+}
+
+/**
+ * Absence is an expected answer while inspecting Git metadata. Any other
+ * failure (for example `EACCES`) propagates, so metadata that cannot be
+ * inspected fails the command closed instead of silently dropping a deny.
+ */
+function isMissing(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+  );
+}
+
+async function statIfPresent(path: string): Promise<Stats | undefined> {
+  try {
+    return await stat(path);
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
+}
+
+async function readdirIfPresent(path: string): Promise<Dirent[]> {
+  try {
+    return await readdir(path, { withFileTypes: true });
+  } catch (error) {
+    if (isMissing(error)) return [];
+    throw error;
+  }
+}
+
 function boundedUtf8(buffer: Buffer, budget: number): string {
   let end = Math.min(buffer.byteLength, budget);
   while (end > 0) {
@@ -215,13 +374,16 @@ function deniedEnvironmentNames(
   platform: NodeJS.Platform,
 ): string[] {
   return Object.keys(environment)
-    .filter((name) => {
+        .filter(name => {
       const normalized = platform === 'win32' ? name.toUpperCase() : name;
       return (
         normalized.startsWith('LIBRECHAT_CODE_') ||
         (!SAFE_CHILD_ENV_NAMES.has(normalized) &&
           !PROXY_CHILD_ENV_NAMES.has(normalized) &&
-          !(platform === 'win32' && WINDOWS_CHILD_ENV_NAMES.has(normalized)) &&
+                    !(
+                        platform === 'win32' &&
+                        WINDOWS_CHILD_ENV_NAMES.has(normalized)
+                    ) &&
           !normalized.startsWith('LC_'))
       );
     })
@@ -235,6 +397,36 @@ function normalizedEnvironmentName(
   return platform === 'win32' ? name.toUpperCase() : name;
 }
 
+/** Distinguishes an unsupported host filesystem from an implementation fault. */
+export class CopyOnWriteCloneUnavailableError extends WorkspaceToolError {
+  constructor() {
+    super(
+      'Selected-workspace PTC requires copy-on-write filesystem cloning',
+      'COMMAND_UNAVAILABLE',
+    );
+    this.name = 'CopyOnWriteCloneUnavailableError';
+  }
+}
+
+function isCopyOnWriteUnsupported(
+  error: unknown,
+  platform: NodeJS.Platform,
+): boolean {
+  if (platform === 'win32') return true;
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error.code === 'ENOTSUP' || error.code === 'EOPNOTSUPP')
+  ) {
+    return true;
+  }
+  return (
+    error instanceof Error &&
+    error.message.toLowerCase().includes('operation not supported')
+  );
+}
+
 export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox {
   readonly mutationFailuresAreAtomic = true as const;
   private readonly manager: NativeSandboxManager;
@@ -243,8 +435,24 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
   private readonly platform: NodeJS.Platform;
   private initialized?: Promise<void>;
   private canonicalRoot?: string;
+  /** A lane's shared Git directory; replay probes of the lane must read it too. */
+  private canonicalCommonGitDir?: string;
+  private runtimeConfig?: SandboxRuntimeConfig;
+    private denyReadPaths: string[] = [];
+    private denyWritePaths: string[] = [];
+    /** Worker-owned write denies that precede each command's live Git metadata denies. */
+    private baseDenyWritePaths: string[] = [];
+    private get gitEnvironment():
+        | typeof TRUSTED_GIT_ENVIRONMENT
+        | typeof LINKED_WORKTREE_GIT_ENVIRONMENT {
+        return this.options.linkedWorktree
+            ? LINKED_WORKTREE_GIT_ENVIRONMENT
+            : TRUSTED_GIT_ENVIRONMENT;
+    }
   private scratchDirectory?: string;
   private scratchHandle?: FileHandle;
+  /** A private sibling of scratch, readable but never writable by lane commands. */
+  private gitGuardDirectory?: string;
   private execution?: Promise<WorkspaceExecuteCommandResult>;
   private closing?: Promise<void>;
   private resetFailed = false;
@@ -279,10 +487,11 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     managerOwners.set(this.manager, this);
-    this.initialized = this.initializeOnce().catch(async (error) => {
+        this.initialized = this.initializeOnce().catch(async error => {
       await this.manager.reset().catch(() => {
         this.resetFailed = true;
       });
+      await this.removeLinkedWorktreeGitGuard().catch(() => undefined);
       await this.removeScratchDirectory().catch(() => undefined);
       if (!this.resetFailed) managerOwners.delete(this.manager);
       this.initialized = undefined;
@@ -299,13 +508,18 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     const root = await realpath(this.options.workspaceRoot);
+    if (this.options.workspaceIdentity && !await matchesWorkspaceRoot(root, this.options.workspaceIdentity)) {
+      throw new WorkspaceToolError('Selected project changed before sandbox admission', 'REGISTRATION_INVALID');
+    }
     if (!(await stat(root)).isDirectory()) {
       throw new WorkspaceToolError(
         'Native sandbox workspace is unavailable',
         'COMMAND_UNAVAILABLE',
       );
     }
-    const home = await canonicalPath(this.options.homeDirectory ?? homedir());
+        const home = await canonicalPath(
+            this.options.homeDirectory ?? homedir(),
+        );
     if (isWithin(root, home)) {
       throw new WorkspaceToolError(
         'Native sandbox workspace cannot contain the worker home directory',
@@ -315,7 +529,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     const protectedPaths = await Promise.all(
       (this.options.protectedPaths ?? []).map(canonicalPath),
     );
-    if (protectedPaths.some((path) => isWithin(root, path))) {
+        if (protectedPaths.some(path => isWithin(root, path))) {
       throw new WorkspaceToolError(
         'Native sandbox workspace cannot contain worker control files',
         'REGISTRATION_INVALID',
@@ -329,13 +543,16 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     const inheritedWritablePaths = [
       ...sharedScratchPaths,
       ...(await Promise.all(
-        [join(home, '.npm', '_logs'), join(home, '.claude', 'debug')].map(
-          canonicalPath,
-        ),
+                [
+                    join(home, '.npm', '_logs'),
+                    join(home, '.claude', 'debug'),
+                ].map(canonicalPath),
       )),
     ];
-    const deniedInheritedWritablePaths = [...new Set(inheritedWritablePaths)];
-    if (deniedInheritedWritablePaths.some((path) => isWithin(path, root))) {
+        const deniedInheritedWritablePaths = [
+            ...new Set(inheritedWritablePaths),
+        ];
+        if (deniedInheritedWritablePaths.some(path => isWithin(path, root))) {
       throw new WorkspaceToolError(
         'Native sandbox workspace cannot be inside an inherited writable path',
         'REGISTRATION_INVALID',
@@ -350,7 +567,10 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     }
     if (this.platform !== 'win32') {
       try {
-        await access(this.options.shellPath ?? '/bin/bash', fsConstants.X_OK);
+                await access(
+                    this.options.shellPath ?? '/bin/bash',
+                    fsConstants.X_OK,
+                );
       } catch {
         throw new WorkspaceToolError(
           `Native sandbox shell is unavailable: ${this.options.shellPath ?? '/bin/bash'}`,
@@ -358,6 +578,55 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         );
       }
     }
+    const lane = this.options.linkedWorktree;
+    if (lane && this.platform === 'win32') {
+      throw new WorkspaceToolError('Linked worktree Git guard requires a POSIX host', 'COMMAND_UNAVAILABLE');
+    }
+    const commonGitDir = lane ? await canonicalPath(lane.commonGitDir) : undefined;
+    const checkoutRoot = lane ? await canonicalPath(lane.checkoutRoot) : undefined;
+    const writableGitPaths = lane
+      ? await Promise.all(lane.writableGitPaths.map(canonicalPath))
+      : [];
+    if (
+      lane &&
+      (commonGitDir == null ||
+        checkoutRoot == null ||
+        !isWithin(checkoutRoot, commonGitDir) ||
+        !isWithin(checkoutRoot, root) ||
+        isWithin(commonGitDir, home) ||
+        protectedPaths.some(path => isWithin(commonGitDir, path)) ||
+        writableGitPaths.some(
+          (path, index) =>
+            path !== resolve(lane.writableGitPaths[index]!) ||
+            path === commonGitDir ||
+            !isWithin(commonGitDir, path),
+        ))
+    ) {
+      throw new WorkspaceToolError(
+        'Linked worktree Git storage is outside its checkout',
+        'REGISTRATION_INVALID',
+      );
+    }
+    const laneGitPaths = commonGitDir ? [commonGitDir] : [];
+    /**
+     * On Linux, SRT hides a read-denied directory (such as the worker home) under a
+     * tmpfs and then re-binds writes before reads, so the read-only bind of the whole
+     * common Git directory would mask its writable descendants. SRT processes read
+     * denies shallow-first, re-binding each one's writes on top, so listing every
+     * existing writable Git directory as a deeper deny restores its write bind after
+     * the ancestor read bind. The common directory stays a live, read-only host
+     * directory: nothing can be created at its top level.
+     */
+    const laneWriteRebinds =
+      this.platform === 'linux'
+        ? (
+            await Promise.all(
+              writableGitPaths.map(async path =>
+                (await stat(path).catch(() => undefined))?.isDirectory() ? path : undefined,
+              ),
+            )
+          ).filter((path): path is string => path != null)
+        : [];
     const canonicalScratchDirectory =
       await this.createScratchDirectory(sharedScratchPaths);
     if (
@@ -369,35 +638,66 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         'REGISTRATION_INVALID',
       );
     }
-    const config: SandboxRuntimeConfig = {
-      network: {
+    if (lane && !canonicalScratchDirectory) {
+      throw new WorkspaceToolError('Linked worktree Git guard requires private scratch storage', 'COMMAND_UNAVAILABLE');
+    }
+    const gitGuardDirectory = lane
+      ? await this.createLinkedWorktreeGitGuard(canonicalScratchDirectory!)
+      : undefined;
+    // A lane already keeps the shared common Git directory read-only; only
+    // the non-lane root exposes a writable `.git` whose executable metadata
+    // SRT's cwd-derived mandatory denies do not reach.
+    const rootGitMetadataDenies = lane
+      ? []
+      : await collectGitMetadataDenies(root);
+    const commandPolicy = normalizeNativeSrtCommandPolicy(
+      this.options.commandPolicy,
+    );
+    const unrestrictedNetwork =
+      commandPolicy.network.outbound === 'unrestricted';
+    const network: SandboxRuntimeConfig['network'] = {
         allowedDomains: [...(this.options.allowedDomains ?? [])],
         deniedDomains: [],
-        strictAllowlist: true,
-        allowAllUnixSockets: false,
-        allowLocalBinding: false,
+        strictAllowlist: !unrestrictedNetwork,
+        allowAllUnixSockets: commandPolicy.network.allowAllUnixSockets,
+        allowLocalBinding: commandPolicy.network.allowLocalBinding,
         ...(this.options.maskedEnvironment ? { tlsTerminate: {} } : {}),
-      },
+    };
+    const config: SandboxRuntimeConfig = {
+      network,
       filesystem: {
         denyRead: [
           home,
-          ...sharedScratchPaths.filter((path) =>
+                    ...sharedScratchPaths.filter(path =>
             deniedInheritedWritablePaths.includes(path),
           ),
+          ...laneWriteRebinds,
         ],
         allowRead: [
           root,
-          ...(canonicalScratchDirectory ? [canonicalScratchDirectory] : []),
+          ...laneGitPaths,
+          ...(gitGuardDirectory ? [gitGuardDirectory] : []),
+                    ...(canonicalScratchDirectory
+                        ? [canonicalScratchDirectory]
+                        : []),
         ],
         allowWrite: [
           root,
-          ...(canonicalScratchDirectory ? [canonicalScratchDirectory] : []),
+          ...writableGitPaths,
+                    ...(canonicalScratchDirectory
+                        ? [canonicalScratchDirectory]
+                        : []),
         ],
-        denyWrite: [...protectedPaths, ...deniedInheritedWritablePaths],
+        denyWrite: [
+          ...protectedPaths,
+          ...deniedInheritedWritablePaths,
+          ...rootGitMetadataDenies,
+          ...(gitGuardDirectory ? [gitGuardDirectory] : []),
+        ],
         allowGitConfig: false,
       },
       credentials: {
-        files: protectedPaths.map((path) => ({
+                files: protectedPaths.map(path => ({
           path,
           mode: 'deny' as const,
         })),
@@ -410,15 +710,18 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             },
             this.platform,
           )
-            .filter((name) => {
+                        .filter(name => {
               const normalized = normalizedEnvironmentName(
                 name,
                 this.platform,
               );
               return (
-                !Object.hasOwn(TRUSTED_GIT_ENVIRONMENT, normalized) &&
+                                !Object.hasOwn(
+                                    TRUSTED_GIT_ENVIRONMENT,
+                                    normalized,
+                                ) &&
                 !this.options.maskedEnvironment?.variables.some(
-                  (variable) =>
+                                    variable =>
                     normalizedEnvironmentName(
                       variable.name,
                       this.platform,
@@ -426,21 +729,46 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
                 )
               );
             })
-            .map((name) => ({ name, mode: 'deny' as const })),
-          ...(this.options.maskedEnvironment?.variables.map((variable) => ({
+                        .map(name => ({ name, mode: 'deny' as const })),
+                    ...(this.options.maskedEnvironment?.variables.map(
+                        variable => ({
             ...variable,
             mode: 'mask' as const,
-            ...(variable.extract ? { onExtractNoMatch: 'error' as const } : {}),
-          })) ?? []),
+                            ...(variable.extract
+                                ? { onExtractNoMatch: 'error' as const }
+                                : {}),
+                        }),
+                    ) ?? []),
         ],
       },
       allowAppleEvents: false,
       enableWeakerNestedSandbox: false,
       enableWeakerNetworkIsolation: false,
-      git: { safeDirectories: [root] },
+      git: { safeDirectories: checkoutRoot ? [root, checkoutRoot] : [root] },
     };
-    await this.manager.initialize(config);
+    await this.manager.initialize(
+      config,
+      unrestrictedNetwork ? async () => true : undefined,
+    );
     this.canonicalRoot = root;
+    this.canonicalCommonGitDir = commonGitDir;
+    this.runtimeConfig = config;
+        this.denyReadPaths = [
+            home,
+            ...sharedScratchPaths.filter(path =>
+                deniedInheritedWritablePaths.includes(path),
+            ),
+        ];
+        this.baseDenyWritePaths = [
+            ...protectedPaths,
+            ...deniedInheritedWritablePaths,
+        ];
+        this.denyWritePaths = [
+            ...protectedPaths,
+            ...deniedInheritedWritablePaths,
+            ...rootGitMetadataDenies,
+            ...(gitGuardDirectory ? [gitGuardDirectory] : []),
+        ];
   }
 
   async execute(
@@ -462,10 +790,337 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     }
   }
 
+  /**
+   * Allocate an owner-only execution directory that is already inside this
+   * sandbox's allowlist. The caller must remove the returned directory after
+   * the execution settles. It is intentionally unavailable on native Windows
+   * until the restricted-account TEMP directory can be opened and verified by
+   * the trusted parent process.
+   */
+  async createExecutionDirectory(): Promise<string> {
+    await this.initialize();
+    if (!this.scratchDirectory || this.platform === 'win32') {
+      throw new WorkspaceToolError(
+        'Native programmatic execution storage is unavailable',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
+    return await mkdtemp(join(this.scratchDirectory, 'execution-'));
+  }
+
+  /**
+   * Clone the current workspace into private scratch for a side-effect-
+   * equivalent replay probe. Platform clone flags are intentionally strict:
+   * silently falling back to a byte copy would make every tool-bearing run
+   * consume time and disk proportional to the repository size.
+   */
+  async createProgrammaticProbeWorkspace(
+    executionDirectory: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    try {
+      return await withWorkspaceRoot(this.options.workspaceRoot, this.options.workspaceIdentity,
+        () => this.createBoundProgrammaticProbeWorkspace(executionDirectory, signal));
+    } catch (error) {
+      if (error instanceof WorkspaceRootAccessError) throw new WorkspaceToolError('Selected project changed before probe staging', 'REGISTRATION_INVALID');
+      throw error;
+    }
+  }
+
+  private async createBoundProgrammaticProbeWorkspace(executionDirectory: string, signal?: AbortSignal): Promise<string> {
+    await this.initialize();
+    if (this.options.workspaceIdentity && !await matchesWorkspaceRoot(this.options.workspaceRoot, this.options.workspaceIdentity)) {
+      throw new WorkspaceToolError('Selected project changed before probe staging', 'REGISTRATION_INVALID');
+    }
+    const scratchDirectory = this.scratchDirectory;
+    const root = this.canonicalRoot;
+    let parent: string;
+    try {
+      parent = await realpath(executionDirectory);
+      if (
+        !scratchDirectory ||
+        !root ||
+        !isWithin(scratchDirectory, parent) ||
+        !(await stat(parent)).isDirectory()
+      ) {
+        throw new Error('invalid execution directory');
+      }
+    } catch {
+      throw new WorkspaceToolError(
+        'Programmatic execution directory is unavailable',
+        'INVALID_PATH',
+      );
+    }
+    if (signal?.aborted) {
+      throw new WorkspaceToolError(
+        'Programmatic execution aborted',
+        'EXECUTION_ABORTED',
+      );
+    }
+    const destination = join(parent, 'workspace');
+    try {
+      if (this.platform === 'win32') {
+        throw new Error('copy-on-write cloning is unavailable on Windows');
+      }
+      const args =
+        this.platform === 'darwin'
+          ? ['-cR', root, destination]
+          : ['--archive', '--reflink=always', root, destination];
+      const identity = this.options.workspaceIdentity;
+      const copyArgs = identity ? [...args.slice(0, -2), '.', destination] : args;
+      await new Promise<void>((resolveCopy, rejectCopy) => {
+        const child = spawnWithinWorkspace(this.spawnCommand, '/bin/cp', copyArgs, {
+          ...(identity ? { cwd: root } : {}),
+          env: {
+            PATH: this.environment.PATH,
+            LANG: this.environment.LANG,
+            LC_ALL: this.environment.LC_ALL,
+          },
+          signal,
+        });
+        let stderr = Buffer.alloc(0);
+        child.stderr.on('data', (chunk: Buffer) => {
+          if (stderr.byteLength < 4_096) {
+            stderr = Buffer.concat([stderr, chunk]).subarray(0, 4_096);
+          }
+        });
+        child.once('error', rejectCopy);
+        child.once('close', code => {
+          if (code === 0) resolveCopy();
+          else {
+            rejectCopy(
+              new Error(
+                `copy-on-write clone failed (${code ?? 'signal'}): ${boundedUtf8(stderr, 4_096)}`,
+              ),
+            );
+          }
+        });
+      });
+      return await realpath(destination);
+    } catch (error) {
+      await rm(destination, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+      if (signal?.aborted) {
+        throw new WorkspaceToolError(
+          'Programmatic execution aborted',
+          'EXECUTION_ABORTED',
+        );
+      }
+      if (isCopyOnWriteUnsupported(error, this.platform)) {
+        throw new CopyOnWriteCloneUnavailableError();
+      }
+      throw new WorkspaceToolError(
+        'Copy-on-write workspace clone failed unexpectedly',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
+  }
+
+  /** Run a generated program from a verified private execution directory. */
+  async executeProgrammatic(
+    request: WorkspaceExecuteCommandRequest,
+    dataDirectory: string,
+    signal?: AbortSignal,
+        options?: {
+          probe?: boolean;
+          workspaceRoot?: string;
+          shellPath?: string;
+          jqPath?: string;
+        },
+  ): Promise<WorkspaceExecuteCommandResult> {
+    if (this.execution || this.closing) {
+      throw new WorkspaceToolError(
+        'Native sandbox already has an active command or is closing',
+        'COMMAND_UNAVAILABLE',
+      );
+    }
+    await this.initialize();
+    const scratchDirectory = this.scratchDirectory;
+    let canonicalDataDirectory: string;
+    let canonicalWorkspaceRoot: string | undefined;
+    try {
+      canonicalDataDirectory = await realpath(dataDirectory);
+      canonicalWorkspaceRoot = options?.workspaceRoot
+        ? await realpath(options.workspaceRoot)
+        : undefined;
+      if (
+        !scratchDirectory ||
+        !isWithin(scratchDirectory, canonicalDataDirectory) ||
+        !(await stat(canonicalDataDirectory)).isDirectory() ||
+        (canonicalWorkspaceRoot != null &&
+          (!isWithin(scratchDirectory, canonicalWorkspaceRoot) ||
+            !(await stat(canonicalWorkspaceRoot)).isDirectory()))
+      ) {
+        throw new Error('invalid execution directory');
+      }
+    } catch {
+      throw new WorkspaceToolError(
+        'Programmatic execution directory is unavailable',
+        'INVALID_PATH',
+      );
+    }
+        const execute = () => this.executeExclusive(
+            request,
+            signal,
+            {
+      LIBRECHAT_CODE_DATA_DIR: canonicalDataDirectory,
+                LIBRECHAT_CODE_CONTROL_PATH: join(
+                    canonicalDataDirectory,
+                    '_ptc_pending_result.json',
+                ),
+                LIBRECHAT_CODE_BASH_PATH:
+                  options?.shellPath ?? this.options.shellPath ?? '/bin/bash',
+                ...((options?.jqPath ?? this.options.jqPath)
+                    ? {
+                          LIBRECHAT_CODE_JQ_PATH:
+                              options?.jqPath ?? this.options.jqPath,
+                      }
+                    : {}),
+                PTC_HISTORY_PATH: join(
+                    canonicalDataDirectory,
+                    '_ptc_history.json',
+                ),
+      TMPDIR: canonicalDataDirectory,
+            },
+            options?.probe
+                ? {
+                      filesystem: {
+                          allowRead: [
+                              canonicalWorkspaceRoot ?? this.canonicalRoot!,
+                              canonicalDataDirectory,
+                              ...(this.canonicalCommonGitDir
+                                  ? [this.canonicalCommonGitDir]
+                                  : []),
+                              ...(this.gitGuardDirectory
+                                  ? [this.gitGuardDirectory]
+                                  : []),
+                          ],
+                          allowWrite: [
+                              ...(canonicalWorkspaceRoot != null
+                                  ? [canonicalWorkspaceRoot]
+                                  : []),
+                              canonicalDataDirectory,
+                          ],
+                          denyRead: this.denyReadPaths,
+                          denyWrite: [
+                              this.canonicalRoot!,
+                              ...this.denyWritePaths,
+                          ],
+                      },
+                      network: {
+                          // A probe is speculative, even on a trusted VM.
+                          // Copy-on-write protects files, not remote mutations.
+                          allowedDomains: [],
+                          deniedDomains: [],
+                          strictAllowlist: true,
+                          allowUnixSockets: [],
+                          allowAllUnixSockets: false,
+                          allowLocalBinding: false,
+                      },
+                  }
+                : undefined,
+            canonicalDataDirectory,
+            canonicalWorkspaceRoot,
+        );
+    const execution = options?.probe ? this.withProbeNetwork(execute) : execute();
+    this.execution = execution;
+    try {
+      return await execution;
+    } finally {
+      this.execution = undefined;
+    }
+  }
+
+  private async withProbeNetwork<T>(execute: () => Promise<T>): Promise<T> {
+    const config = this.runtimeConfig;
+    if (!config || !this.manager.updateConfig) {
+      throw new WorkspaceToolError('Native probe network isolation is unavailable', 'COMMAND_UNAVAILABLE');
+    }
+    // SRT's proxies and Unix/local socket rules read session configuration,
+    // not wrapWithSandboxArgv's per-command override.
+    this.manager.updateConfig({ ...config, network: {
+      allowedDomains: [], deniedDomains: [], strictAllowlist: true,
+      allowUnixSockets: [], allowAllUnixSockets: false, allowLocalBinding: false,
+    } });
+    try {
+      return await execute();
+    } finally {
+      try {
+        // Revoke the probe's proxy endpoints and credentials before restoring
+        // network access. A lingering probe must never inherit the commit's
+        // permissive proxy session through a live updateConfig.
+        await this.manager.reset();
+        await this.manager.initialize(config, config.network.strictAllowlist ? undefined : async () => true);
+      } catch {
+        this.resetFailed = true;
+        throw new WorkspaceToolError('Native probe network cleanup failed', 'COMMAND_UNAVAILABLE');
+      }
+    }
+  }
+
   private async executeExclusive(
     request: WorkspaceExecuteCommandRequest,
     signal?: AbortSignal,
+    trustedEnvironment?: NodeJS.ProcessEnv,
+        customConfig?: Partial<SandboxRuntimeConfig>,
+        sandboxScratchDirectory?: string,
+        workspaceRoot?: string,
   ): Promise<WorkspaceExecuteCommandResult> {
+    try {
+      return await withWorkspaceRoot(this.options.workspaceRoot, workspaceRoot ? undefined : this.options.workspaceIdentity,
+        () => this.executeBound(request, signal, trustedEnvironment, customConfig, sandboxScratchDirectory, workspaceRoot));
+    } catch (error) {
+      if (error instanceof WorkspaceRootAccessError) throw new WorkspaceToolError(error.message, 'REGISTRATION_INVALID');
+      throw error;
+    }
+  }
+
+  /**
+   * The session policy snapshots the root's Git metadata at initialization, but
+   * the worker outlives that snapshot: a repository, submodule, or linked
+   * worktree created on the host afterwards must be protected without a
+   * restart, the way SRT recomputes its own mandatory denies on every wrap.
+   * Only `denyWrite` differs from the session filesystem policy. Lanes keep
+   * the whole common Git directory read-only already. Native Windows keeps the
+   * initialization snapshot, because `srt-win` rejects the per-command
+   * `allowRead`/`allowWrite` a full filesystem override carries.
+   */
+  private async rootCommandConfig(): Promise<
+    Partial<SandboxRuntimeConfig> | undefined
+  > {
+    const config = this.runtimeConfig;
+    const root = this.canonicalRoot;
+    if (
+      !config ||
+      !root ||
+      this.options.linkedWorktree ||
+      this.platform === 'win32'
+    ) {
+      return undefined;
+    }
+    return {
+      filesystem: {
+        ...config.filesystem,
+        denyWrite: [
+          ...this.baseDenyWritePaths,
+          ...(await collectGitMetadataDenies(root)),
+        ],
+      },
+    };
+  }
+
+  private async executeBound(
+    request: WorkspaceExecuteCommandRequest,
+    signal?: AbortSignal,
+    trustedEnvironment?: NodeJS.ProcessEnv,
+    customConfig?: Partial<SandboxRuntimeConfig>,
+    sandboxScratchDirectory?: string,
+    workspaceRoot?: string,
+  ): Promise<WorkspaceExecuteCommandResult> {
+    if (this.options.workspaceIdentity && !await matchesWorkspaceRoot(this.options.workspaceRoot, this.options.workspaceIdentity)) {
+      throw new WorkspaceToolError('Selected project changed after sandbox admission', 'REGISTRATION_INVALID');
+    }
     if (
       !isWorkspaceToolRequest(request) ||
       request.operation !== 'execute_command'
@@ -482,11 +1137,11 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     await this.initialize();
-    const root = this.canonicalRoot!;
+    const root = workspaceRoot ?? this.canonicalRoot!;
     let cwd: string;
     try {
-      cwd = await realpath(resolve(root, request.cwd ?? '.'));
-      if (!isWithin(root, cwd) || !(await stat(cwd)).isDirectory())
+      cwd = await rootedRealpath(resolve(root, request.cwd ?? '.'));
+      if (!isWithin(root, cwd) || !(await rootedStat(cwd)).isDirectory())
         throw new Error('invalid cwd');
     } catch {
       throw new WorkspaceToolError(
@@ -495,23 +1150,25 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     const commandId = `librechat-code-${randomUUID()}`;
-    const sandboxedCommand = this.options.maskedEnvironment?.wrapCommand
-      ? this.options.maskedEnvironment.wrapCommand(
-          request.command,
-          this.platform,
-        )
-      : request.command;
     let wrapped: Awaited<
       ReturnType<NativeSandboxManager['wrapWithSandboxArgv']>
     >;
     try {
+      const commandConfig = customConfig ?? (await this.rootCommandConfig());
       const credentialEnvironment =
-        await this.options.maskedEnvironment?.resolve(signal);
+        await this.options.maskedEnvironment?.resolve(signal, cwd);
+      const sandboxedCommand = this.options.maskedEnvironment?.wrapCommand
+        ? this.options.maskedEnvironment.wrapCommand(
+            request.command,
+            this.platform,
+            credentialEnvironment ?? {},
+          )
+        : request.command;
       wrapped = await this.withTemporaryHostEnvironment(
         {
-          ...TRUSTED_GIT_ENVIRONMENT,
+          ...this.gitEnvironment,
           ...(credentialEnvironment ?? {}),
-          ...this.scratchSelectorEnvironment(),
+          ...this.scratchSelectorEnvironment(sandboxScratchDirectory),
         },
         () =>
           this.manager.wrapWithSandboxArgv(
@@ -519,7 +1176,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             this.platform === 'win32'
               ? undefined
               : (this.options.shellPath ?? '/bin/bash'),
-            undefined,
+            commandConfig,
             signal,
             cwd,
             { commandId, commandText: request.command },
@@ -544,7 +1201,14 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
           'EXECUTION_ABORTED',
         );
       }
-      return await this.runWrapped(request, wrapped, cwd, commandId, signal);
+      return await this.runWrapped(
+        request,
+        wrapped,
+        cwd,
+        commandId,
+        signal,
+        trustedEnvironment,
+      );
     } finally {
       // A successful wrap owns command state even when no child is spawned.
       try {
@@ -561,7 +1225,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
   ): Promise<T> {
     const previousMutation = hostEnvironmentMutationQueue;
     let releaseMutation!: () => void;
-    hostEnvironmentMutationQueue = new Promise<void>((resolve) => {
+        hostEnvironmentMutationQueue = new Promise<void>(resolve => {
       releaseMutation = resolve;
     });
     await previousMutation;
@@ -587,31 +1251,44 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     cwd: string,
     commandId: string,
     signal?: AbortSignal,
+    trustedEnvironment?: NodeJS.ProcessEnv,
   ): Promise<WorkspaceExecuteCommandResult> {
     const outputLimit =
-      request.maxOutputBytes ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_OUTPUT_BYTES;
+            request.maxOutputBytes ??
+            BRIDGE_WORKSPACE_COMMAND_DEFAULT_OUTPUT_BYTES;
     const timeoutMs =
       request.timeoutMs ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS;
     return await new Promise<WorkspaceExecuteCommandResult>(
       (resolvePromise, reject) => {
         let child: ChildProcessWithoutNullStreams;
         try {
-          child = this.spawnCommand(wrapped.argv[0], wrapped.argv.slice(1), {
+                    child = spawnWithinWorkspace(this.spawnCommand,
+                        wrapped.argv[0],
+                        wrapped.argv.slice(1),
+                        {
             cwd,
             env: {
               ...wrapped.env,
               ...this.scratchEnvironment(),
-              ...TRUSTED_GIT_CONFIG_ENTRIES,
+              ...trustedEnvironment,
+              ...this.gitEnvironment,
               GIT_CONFIG_COUNT:
-                wrapped.env.GIT_CONFIG_COUNT ?? TRUSTED_GIT_CONFIG_COUNT,
+                                    wrapped.env.GIT_CONFIG_COUNT ??
+                                    this.gitEnvironment.GIT_CONFIG_COUNT,
               GIT_CONFIG_GLOBAL:
-                this.platform === 'win32' ? 'NUL' : '/dev/null',
+                                    this.platform === 'win32'
+                                        ? 'NUL'
+                                        : '/dev/null',
               GIT_CONFIG_NOSYSTEM: '1',
+              ...(this.gitGuardDirectory ? {
+                PATH: `${this.gitGuardDirectory}:${wrapped.env.PATH || this.environment.PATH || '/usr/bin:/bin'}`,
+              } : {}),
             },
             detached: this.platform !== 'win32',
             shell: false,
             windowsHide: true,
-          });
+                        },
+                    );
           child.stdin.end();
         } catch {
           reject(
@@ -637,10 +1314,15 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
           const accepted = chunk.subarray(0, remaining);
           target.push(accepted);
           outputBytes += accepted.byteLength;
-          if (accepted.byteLength !== chunk.byteLength) truncated = true;
+                    if (accepted.byteLength !== chunk.byteLength)
+                        truncated = true;
         };
-        child.stdout.on('data', (chunk: Buffer) => append(stdout, chunk));
-        child.stderr.on('data', (chunk: Buffer) => append(stderr, chunk));
+                child.stdout.on('data', (chunk: Buffer) =>
+                    append(stdout, chunk),
+                );
+                child.stderr.on('data', (chunk: Buffer) =>
+                    append(stderr, chunk),
+                );
         const abort = (): void => {
           if (settled) return;
           this.killCommandTree(child);
@@ -689,7 +1371,10 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             );
             return;
           }
-          const stdoutValue = boundedUtf8(Buffer.concat(stdout), outputLimit);
+                    const stdoutValue = boundedUtf8(
+                        Buffer.concat(stdout),
+                        outputLimit,
+                    );
           const stderrBudget = Math.max(
             0,
             outputLimit - Buffer.byteLength(stdoutValue),
@@ -697,7 +1382,8 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
           const rawStderr = Buffer.concat(stderr).toString('utf8');
           let annotatedStderr = rawStderr;
           try {
-            annotatedStderr = this.manager.annotateStderrWithSandboxFailures(
+                        annotatedStderr =
+                            this.manager.annotateStderrWithSandboxFailures(
               commandId,
               rawStderr,
             );
@@ -713,12 +1399,15 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             operation: 'execute_command',
             workspaceId: request.workspaceId,
             exitCode:
-              timedOut || childSignal ? null : this.protocolExitCode(code),
+                            timedOut || childSignal
+                                ? null
+                                : this.protocolExitCode(code),
             ...(childSignal ? { signal: childSignal } : {}),
             stdout: stdoutValue,
             stderr: stderrValue,
             truncated:
-              truncated || Buffer.byteLength(annotatedStderr) > stderrBudget,
+                            truncated ||
+                            Buffer.byteLength(annotatedStderr) > stderrBudget,
             timedOut,
           });
         });
@@ -758,7 +1447,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     const canonicalTemporaryRoot = await canonicalPath(HOST_TEMPORARY_ROOT);
-    const sharedScratchRoot = sharedScratchPaths.find((path) =>
+        const sharedScratchRoot = sharedScratchPaths.find(path =>
       isWithin(path, canonicalTemporaryRoot),
     );
     const scratchDirectory = await mkdtemp(
@@ -781,7 +1470,9 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
           true,
         );
         if (((await scratchHandle.stat()).mode & 0o777) !== 0o700) {
-          throw new Error('Native sandbox scratch directory is not private');
+                    throw new Error(
+                        'Native sandbox scratch directory is not private',
+                    );
         }
         this.scratchHandle = scratchHandle;
       } catch (error) {
@@ -812,12 +1503,32 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       : { TMPDIR: scratchDirectory };
   }
 
-  private scratchSelectorEnvironment(): NodeJS.ProcessEnv {
-    const scratchDirectory = this.scratchDirectory;
+  private scratchSelectorEnvironment(
+        selectedDirectory = this.scratchDirectory,
+  ): NodeJS.ProcessEnv {
+    const scratchDirectory = selectedDirectory;
     if (!scratchDirectory) return {};
     return Object.fromEntries(
-      SRT_SCRATCH_SELECTOR_NAMES.map((name) => [name, scratchDirectory]),
+            SRT_SCRATCH_SELECTOR_NAMES.map(name => [name, scratchDirectory]),
     );
+  }
+
+  private async createLinkedWorktreeGitGuard(scratchDirectory: string): Promise<string> {
+    if (this.gitGuardDirectory) {
+      throw new Error('Linked worktree Git guard cleanup is still pending');
+    }
+    // Unlike scratch, this sibling directory is not in filesystem.allowWrite.
+    const directory = await mkdtemp(join(dirname(scratchDirectory), 'librechat-code-git-'));
+    this.gitGuardDirectory = directory;
+    await assertPrivateStorageAncestors(directory);
+    await writeLinkedWorktreeGitGuard(directory);
+    return directory;
+  }
+
+  private async removeLinkedWorktreeGitGuard(): Promise<void> {
+    if (!this.gitGuardDirectory) return;
+    await rm(this.gitGuardDirectory, { recursive: true, force: true });
+    this.gitGuardDirectory = undefined;
   }
 
   private async removeScratchDirectory(): Promise<void> {
@@ -863,6 +1574,10 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
     }
     this.initialized = undefined;
     this.canonicalRoot = undefined;
-    await this.removeScratchDirectory();
+    try {
+      await this.removeLinkedWorktreeGitGuard();
+    } finally {
+      await this.removeScratchDirectory();
+    }
   }
 }

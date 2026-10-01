@@ -14,8 +14,9 @@ import { logger as rootLogger } from './logger';
 import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
+import { recordCleanupResources } from './cleanup-metrics';
 import { internalServiceHeaders } from './internal-service-auth';
-import { EGRESS_GRANT_HEADER } from './egress';
+import { EGRESS_GRANT_HEADER, EGRESS_ERROR_CODE_HEADER } from './egress';
 import { injectTraceHeaders } from './telemetry';
 import {
   applyReadOnlyInputPermissions,
@@ -36,12 +37,13 @@ import {
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
   ValidationError,
+  checkPathShape,
   hasRunnableSource,
   isDirkeep,
-  isValidPathShape,
   validateFilePath,
   isValidFilePath,
 } from './validation';
+import { fetchCachedHttpInput } from './http-input-cache';
 import { cachedInputResponse, inputCacheKey, openCachedInput } from './session-inputs';
 
 export {
@@ -59,6 +61,23 @@ export {
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
 const AUTO_LOAD_DIRKEEP_RETRIES = 2;
+const PTC_HISTORY_FILENAME = '_ptc_history.json';
+const TRUNCATION_PROBE_MAX_ENTRIES = 1000;
+const TRUNCATION_PROBE_MAX_LEVELS = 10;
+const TRUNCATION_PROBE_MAX_HASH_BYTES = 50_000_000;
+
+interface TruncationProbeState {
+  remainingEntries: number;
+  remainingHashBytes: number;
+}
+
+/** Replaying the same sealed grant cannot repair an authorization denial. */
+class InputAuthorizationError extends Error {
+  constructor(status: number) {
+    super(`HTTP error: ${status}`);
+    this.name = 'InputAuthorizationError';
+  }
+}
 
 /**
  * Bridges a `fetch` response body to a Node-stream Readable. The types at the
@@ -164,52 +183,12 @@ export function ensureNodeModulesSymlink(
 }
 
 /**
- * Extracts the on-disk filename from a Content-Disposition response header,
- * falling back to the request-supplied `file.name` (or `file.id` if no name
- * was provided). Pure; exported for unit testing.
- *
- * Matches RFC 5987 / 8187 `filename*=UTF-8''<percent-encoded>` first because
- * the file server emits that form for UTF-8-safe transport of arbitrary
- * names — including paths with `/` separators that the legacy `filename=`
- * form would mangle. Falls back to the legacy quoted (`filename="..."`) or
- * unquoted (`filename=...`) forms, each stopping at the closing quote or
- * the first whitespace/semicolon so trailing params like
- * `attachment; filename="foo.txt"; size=123` correctly yield `foo.txt`.
+ * Resolves the on-disk destination for a by-reference input. The request owns
+ * the sandbox path; object response metadata must not redirect the write.
+ * Pure; exported for unit testing.
  */
-export function resolveOriginalName(response: Response, file: TFile): string {
-  const fallback = file.name || (file.id ?? '');
-  const header = response.headers.get('content-disposition');
-  if (!header) return fallback;
-
-  const preferRequestedName = (candidate: string): string => {
-    /* Older file servers advertised path.basename(objectName) when an
-     * S3-compatible backend omitted original-filename user metadata. That
-     * basename is `<file.id><extension>`, so it is a storage identifier rather
-     * than an authoritative destination. Preserve the caller's requested name
-     * during rolling upgrades instead of exposing the opaque id in /mnt/data. */
-    const opaqueStem = path.basename(candidate, path.extname(candidate));
-    const isFlatObjectBasename = candidate === path.basename(candidate);
-    return file.name && file.id && isFlatObjectBasename && opaqueStem === file.id
-      ? file.name
-      : candidate;
-  };
-
-  const star = header.match(/filename\*=(?:UTF-8'[^']*')?([^;]+)/i);
-  if (star) {
-    const raw = star[1].trim();
-    try {
-      return preferRequestedName(decodeURIComponent(raw));
-    } catch {
-      /* Malformed percent-encoding (e.g. `%ZZ`) — fall through to the legacy
-       * forms. The same header may emit both `filename*=` and a legacy
-       * `filename=` per RFC 5987 §4.3, so a corrupt extended form should
-       * not poison a valid fallback. */
-    }
-  }
-
-  const match = header.match(/filename="([^"]+)"/i)
-    ?? header.match(/filename=([^\s;]+)/i);
-  return match ? preferRequestedName(match[1]) : fallback;
+export function resolveInputDestination(file: TFile): string {
+  return file.name || (file.id ?? '');
 }
 
 /**
@@ -677,8 +656,22 @@ interface ExecuteResult {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
+  /** Persisted input paths that no longer exist after this execution. */
+  deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 }
+
+export type ArtifactTruncationReason = 'max_files' | 'depth' | 'size' | 'path' | 'unreadable';
+
+export interface ArtifactTruncation {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  skipped: string[];
+  skipped_count: number;
+}
+
+const MAX_REPORTED_TRUNCATED_PATHS = 20;
 
 const jobQueue: Array<() => void> = [];
 
@@ -724,7 +717,15 @@ export class Job {
   private pendingSurfaced = new Map<string, { name: string; signature: string }>();
   private sessionFiles: FileRef[] = [];
   private inheritedRefs: FileRef[] = [];
+  private presentInputFiles = new Set<string>();
+  private deletedFiles: string[] = [];
+  private artifactTruncation: ArtifactTruncation | undefined;
+  private truncationProbeState: TruncationProbeState = {
+    remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
+    remainingHashBytes: TRUNCATION_PROBE_MAX_HASH_BYTES,
+  };
   private inputFileHashes = new Map<string, InputFileInfo>();
+  private inputManifest = new Map<TFile, unknown>();
   private inputDestinations = new Map<string, TFile>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
@@ -930,6 +931,7 @@ export class Job {
 
   async prime(): Promise<void> {
     this.inputDestinations.clear();
+    this.inputManifest.clear();
     const requestedDestinations = new Map<string, TFile>();
     for (const file of this.files) {
       validateFilePath(file.name, '/tmp/codeapi-request-validation');
@@ -948,12 +950,9 @@ export class Job {
         );
       }
       requestedDestinations.set(file.name, file);
-      /* Inline destinations are final, so keep them reserved while reference
-       * downloads resolve their authoritative Content-Disposition names.
-       * A ref's requested name is only a fallback, not a real destination yet:
-       * reserving every ref here makes concurrent swaps/order-dependent
-       * renames falsely conflict before the owning response has resolved. */
-      if (!file.id) this.inputDestinations.set(file.name, file);
+      /* The request owns every sandbox destination. Reserve it before parallel
+       * priming begins so object metadata cannot redirect a later write. */
+      this.inputDestinations.set(file.name, file);
     }
 
     if (this.session) {
@@ -982,6 +981,8 @@ export class Job {
       await this.autoLoadDirkeep();
     }
 
+    await this.prepareInputManifest();
+
     /* Promise.all rejects as soon as one operation fails, while its siblings
      * keep running. The route's finally then calls cleanup(), which clears the
      * session path/identity. A delayed sibling used to resume afterward and
@@ -993,11 +994,18 @@ export class Job {
       submissionDir: this.submissionDir,
       identity: this.jobIdentity,
     };
+    const startedAt = performance.now();
+    let started = 0;
+    let completed = 0;
+    let cancelled = 0;
     let firstFailure: { error: unknown } | undefined;
     const runFileOperation = async (operation: () => Promise<void>): Promise<void> => {
+      started++;
       try {
         await operation();
+        completed++;
       } catch (error) {
+        if (firstFailure) cancelled++;
         if (!firstFailure) {
           firstFailure = { error };
           controller.abort(error);
@@ -1031,6 +1039,15 @@ export class Job {
       Array.from({ length: workerCount }, () => runPrimeWorker()),
     );
     if (firstFailure) {
+      this.log.error({
+        inputCount: fileOps.length,
+        completed,
+        failed: 1,
+        cancelled,
+        notStarted: fileOps.length - started,
+        durationMs: Math.round(performance.now() - startedAt),
+        err: firstFailure.error,
+      }, 'Input preparation batch failed');
       if (this.session) {
         /* A sibling may already have atomically replaced its destination. The
          * workspace now matches neither the previous checkpoint nor the full
@@ -1054,10 +1071,8 @@ export class Job {
   ): Promise<void> {
     throwIfAborted(context.signal);
     if (this.session && file.id && (await this.reusePrimedInput(file, context))) {
-      /* Reuse has no response header to pass through downloadAndWriteFile, so
-       * its requested name becomes authoritative only after the on-disk copy
-       * has been verified. Reserve it before another concurrent ref can claim
-       * and overwrite that path. */
+      /* Inherited markers are registered after prime's initial reservation
+       * pass, so reserve the verified requested path here as well. */
       this.reserveInputDestination(file, file.name);
       return;
     }
@@ -1172,6 +1187,11 @@ export class Job {
     }
   }
 
+  private isLegacyGatewayDenial(response: Response): boolean {
+    return !!config.egress_gateway_url && response.status === 403 &&
+      !response.headers.has(EGRESS_ERROR_CODE_HEADER);
+  }
+
   /**
    * Fetches normalized objects for one inherited session and returns the
    * `.dirkeep` markers belonging to exactly that session. Guards against:
@@ -1195,7 +1215,7 @@ export class Job {
             signal: controller.signal,
           },
         );
-        if (res.status === 503 && attempt < AUTO_LOAD_DIRKEEP_RETRIES) {
+        if ((res.status === 503 || this.isLegacyGatewayDenial(res)) && attempt < AUTO_LOAD_DIRKEEP_RETRIES) {
           await res.body?.cancel().catch(() => {});
           const retryAfterSeconds = Number(res.headers.get('retry-after'));
           await sleep(
@@ -1302,13 +1322,19 @@ export class Job {
 
         if (!response.ok) {
           await response.body?.cancel().catch(() => {});
+          /* Older gateways also used 403 for transient ledger contention.
+           * Only classify 403 as permanent when the gateway distinguishes it. */
+          if (response.status === 401 ||
+            (response.status === 403 && !this.isLegacyGatewayDenial(response))) {
+            throw new InputAuthorizationError(response.status);
+          }
           throw new Error(`HTTP error: ${response.status}`);
         }
 
-        const originalName = resolveOriginalName(response, file);
-        validateFilePath(originalName, operation.submissionDir);
-        this.reserveInputDestination(file, originalName);
-        const finalPath = path.join(operation.submissionDir, originalName);
+        const destination = resolveInputDestination(file);
+        validateFilePath(destination, operation.submissionDir);
+        this.reserveInputDestination(file, destination);
+        const finalPath = path.join(operation.submissionDir, destination);
         const finalParent = path.dirname(finalPath);
         /* Persistent-session workspaces can hold a prior turn's symlink, so build
          * ancestors no-follow; a fresh per-job workspace can use plain mkdir -p. */
@@ -1336,7 +1362,7 @@ export class Job {
           operation.signal,
         );
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
-        this.inputFileHashes.set(originalName, {
+        this.inputFileHashes.set(destination, {
           originalId: file.id,
           originalSessionId: file.storage_session_id!,
           hash,
@@ -1349,15 +1375,8 @@ export class Job {
           await applyReadOnlyInputPermissions(finalPath);
         }
 
-        /* Keep the in-memory TFile in sync with the on-disk name so that
-         * inputByName lookups in handleSessionFiles match walkDir's
-         * path.relative() output. Otherwise a Content-Disposition override
-         * would leave file.name pointing at the client-submitted name while
-         * the file lives under originalName on disk. */
-        if (originalName !== file.name) file.name = originalName;
-
-        this.log.info({ file: originalName, hash: hash.substring(0, 8) }, 'Downloaded file');
-        return originalName;
+        this.log.info({ file: destination, hash: hash.substring(0, 8) }, 'Downloaded file');
+        return destination;
       } catch (error: unknown) {
         if (response?.body && !response.bodyUsed) {
           await response.body.cancel().catch(() => {});
@@ -1366,26 +1385,66 @@ export class Job {
           try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
           throw abortReason(operation.signal);
         }
-        /* ValidationError is deterministic — a bad Content-Disposition
-         * filename will fail identically on every retry. Abort fast
-         * (cleanup + rethrow) instead of burning ~7.5s on exponential
-         * backoff and surfacing the error as a generic download failure. */
-        if (error instanceof ValidationError) {
+        /* Invalid filenames and authorization denials cannot recover by
+         * replaying the same request. Abort the batch before exponential
+         * backoff amplifies the failure across its remaining files. */
+        if (error instanceof ValidationError || error instanceof InputAuthorizationError) {
           try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
           throw error;
         }
         lastError = error instanceof Error ? error : new Error(String(error));
         if (attempt < maxRetries) {
-          const delay = retryDelay * Math.pow(2, attempt - 1);
+          const backoff = retryDelay * Math.pow(2, attempt - 1);
+          const retryAfterSeconds = response?.status === 503
+            ? Number(response.headers.get('retry-after')) : NaN;
+          /* Use the same bounded retry hint as marker discovery, without
+           * shortening exponential backoff or bypassing batch cancellation. */
+          const delay = Number.isFinite(retryAfterSeconds)
+            ? Math.max(backoff, Math.min(1000, Math.max(0, retryAfterSeconds * 1000)))
+            : backoff;
           this.log.warn({ fileId: file.id, attempt, maxRetries, delay, err: lastError }, 'Download failed, retrying');
           await sleep(delay, operation.signal);
         }
       }
     }
 
-    this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
+    if (!context?.signal) {
+      this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
+    }
     try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
     throw lastError ?? new Error(`Failed to download input ${file.id}`);
+  }
+
+  private async prepareInputManifest(): Promise<void> {
+    if (!config.http_input_cache_enabled || !config.egress_gateway_url) return;
+    const files = this.files.filter(file => file.id && file.storage_session_id);
+    if (!files.length) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AUTO_LOAD_DIRKEEP_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${this.fileEgressBaseUrl()}/input-manifest`, {
+        method: 'POST', headers: this.fileEgressHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ files: files.map(file => ({
+          sessionHandle: file.storage_session_id, objectHandle: file.id,
+        })) }), signal: controller.signal,
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        return; // Older gateways/relays and transient failures use per-file preflight.
+      }
+      const manifest = await response.json() as { files?: unknown[] };
+      if (!Array.isArray(manifest.files) || manifest.files.length !== files.length) return;
+      manifest.files.forEach((metadata, index) => {
+        if (metadata && typeof metadata === 'object' && !('retry' in metadata)) {
+          this.inputManifest.set(files[index], metadata);
+        }
+      });
+    } catch {
+      // This is an optimization. Individual reads still authorize and report failures.
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
   }
 
   /**
@@ -1418,6 +1477,24 @@ export class Job {
       throw new Error(
         `Input ${file.id} was not delivered to the sandbox and no file server is reachable`,
       );
+    }
+    if (config.http_input_cache_enabled && config.egress_gateway_url) {
+      const response = await fetchCachedHttpInput({
+        metadata: () => {
+          const metadata = this.inputManifest.get(file);
+          // A version-race retry must obtain a new authorized storage version.
+          this.inputManifest.delete(file);
+          return metadata === undefined
+            ? fetch(`${this.buildDownloadUrl(file)}/metadata`, { headers: this.fileEgressHeaders(), signal })
+            : Promise.resolve(Response.json(metadata));
+        },
+        download: (version, sharedSignal) => fetch(this.buildDownloadUrl(file), {
+          headers: this.fileEgressHeaders({ 'X-CodeAPI-Input-Version': version }), signal: sharedSignal,
+        }),
+        signal, maxBytes: config.input_cache_max_bytes, maxFileBytes: config.max_file_size,
+        maxInflight: config.http_input_cache_max_inflight, maxObjects: config.http_input_cache_max_objects,
+      });
+      if (response) return response;
     }
     return fetch(this.buildDownloadUrl(file), {
       headers: this.fileEgressHeaders(),
@@ -1627,6 +1704,10 @@ export class Job {
       version: this.runtime.version.raw,
       session_id: this.outputSessionId,
       files: this.sessionFiles,
+      ...(this.deletedFiles.length > 0
+        ? { deleted_files: this.deletedFiles }
+        : {}),
+      ...(this.artifactTruncation ? { artifact_truncation: this.artifactTruncation } : {}),
     };
   }
 
@@ -1634,6 +1715,13 @@ export class Job {
     this.generatedFiles = [];
     this.sessionFiles = [];
     this.inheritedRefs = [];
+    this.presentInputFiles.clear();
+    this.deletedFiles = [];
+    this.artifactTruncation = undefined;
+    this.truncationProbeState = {
+      remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
+      remainingHashBytes: TRUNCATION_PROBE_MAX_HASH_BYTES,
+    };
 
     const inputByName = new Map<string, TFile>();
     for (const f of this.files) inputByName.set(f.name, f);
@@ -1642,6 +1730,26 @@ export class Job {
       await this.walkDir(this.submissionDir, 0, inputByName);
     } catch (error) {
       this.log.error({ err: error }, 'Error scanning submission directory');
+      this.recordArtifactTruncation('unreadable', '.');
+    }
+
+    if (this.artifactTruncation == null) {
+      const returnedNames = new Set([
+        ...this.sessionFiles.map(file => file.name),
+        ...this.inheritedRefs.map(file => file.name),
+      ]);
+      for (const file of this.files) {
+        if (
+          file.id != null &&
+          file.storage_session_id != null &&
+          this.inputFileHashes.get(file.name)?.readOnly !== true &&
+          !this.presentInputFiles.has(file.name) &&
+          !returnedNames.has(file.name)
+        ) {
+          this.deletedFiles.push(file.name);
+          this.session?.forgetPrimed(file.name);
+        }
+      }
     }
 
     /* Generated files get priority in sessionFiles; fill remaining slots up
@@ -1652,6 +1760,23 @@ export class Job {
     const remaining = Math.max(0, config.max_output_files - this.sessionFiles.length);
     if (remaining > 0 && this.inheritedRefs.length > 0) {
       this.sessionFiles.push(...this.inheritedRefs.slice(0, remaining));
+    }
+    for (const ref of this.inheritedRefs.slice(remaining)) {
+      this.recordArtifactTruncation('max_files', ref.name);
+    }
+  }
+
+  private recordArtifactTruncation(reason: ArtifactTruncationReason, relativePath: string): void {
+    this.artifactTruncation ??= {
+      code: 'artifact_truncated',
+      reasons: {},
+      skipped: [],
+      skipped_count: 0,
+    };
+    this.artifactTruncation.reasons[reason] = (this.artifactTruncation.reasons[reason] ?? 0) + 1;
+    this.artifactTruncation.skipped_count++;
+    if (this.artifactTruncation.skipped.length < MAX_REPORTED_TRUNCATED_PATHS) {
+      this.artifactTruncation.skipped.push(relativePath);
     }
   }
 
@@ -1676,6 +1801,7 @@ export class Job {
         isRegularFile = st.isFile();
       } catch (err) {
         this.log.debug({ path: relativePath, err }, 'walkDir: failed to lstat entry');
+        this.recordArtifactTruncation('unreadable', relativePath);
         return 'skip';
       }
     }
@@ -1696,7 +1822,14 @@ export class Job {
     inputByName: Map<string, TFile>,
   ): Promise<{ collected: boolean; truncated: boolean }> {
     const keepPath = path.join(relativePath, DIRKEEP);
-    if (!isValidPathShape(keepPath)) return { collected: false, truncated: false };
+    const pathShapeError = checkPathShape(keepPath);
+    if (pathShapeError) {
+      this.recordArtifactTruncation(
+        pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+        keepPath,
+      );
+      return { collected: false, truncated: true };
+    }
     const keepFullPath = path.join(fullPath, DIRKEEP);
     const inheritedKeep = inputByName.get(keepPath);
 
@@ -1724,6 +1857,7 @@ export class Job {
       return this.createDirkeepMarker(keepPath, keepFullPath);
     }
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     const id = nanoid();
@@ -1773,6 +1907,7 @@ export class Job {
     if (!keepModified || keepInfo?.readOnly === true) return this.echoInheritedKeep(keepPath, inheritedKeep);
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     const refreshedId = nanoid();
@@ -1814,6 +1949,7 @@ export class Job {
     inheritedKeep: TFile,
   ): { collected: boolean; truncated: boolean } {
     if (this.inheritedRefs.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     this.inheritedRefs.push({
@@ -1840,6 +1976,7 @@ export class Job {
     keepFullPath: string,
   ): Promise<{ collected: boolean; truncated: boolean }> {
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     try {
@@ -1898,6 +2035,7 @@ export class Job {
 
     if (existingFile.id && existingFile.storage_session_id) {
       if (this.inheritedRefs.length >= config.max_output_files) {
+        this.recordArtifactTruncation('max_files', relativePath);
         return { collected: false, truncated: true };
       }
       this.inheritedRefs.push({
@@ -1957,9 +2095,29 @@ export class Job {
       size = st.size;
     } catch (err) {
       this.log.debug({ path: relativePath, err }, 'walkDir: unable to stat file');
+      this.recordArtifactTruncation('unreadable', relativePath);
       return { collected: false, truncated: false, stopLoop: false };
     }
+
+    const inputFileInfo = this.inputFileHashes.get(relativePath);
+    const existingFile = inputByName.get(relativePath);
     if (size > this.runtime.max_file_size) {
+      /* Only an inline entrypoint needs hashing to decide whether this is
+       * intentional request-input suppression. Every other oversized file
+       * is rejected immediately, preserving the scan's bounded I/O cost. */
+      if (!inputFileInfo || existingFile?.id != null || relativePath !== this.entryPointName) {
+        this.recordArtifactTruncation('size', relativePath);
+        return { collected: false, truncated: false, stopLoop: false };
+      }
+      try {
+        const currentHash = await this.computeFileHash(fullPath, true);
+        if (currentHash === inputFileInfo.hash) {
+          return { collected: true, truncated: false, stopLoop: false };
+        }
+      } catch (err) {
+        this.log.debug({ path: relativePath, err }, 'walkDir: failed to hash oversized entrypoint');
+      }
+      this.recordArtifactTruncation('size', relativePath);
       return { collected: false, truncated: false, stopLoop: false };
     }
 
@@ -1969,8 +2127,6 @@ export class Job {
      * stat-only signature would wrongly suppress. Compute once per session/input
      * file and reuse for the suppression check, wasModified, and the surfaced
      * mark; non-session jobs still only hash their inputs. */
-    const inputFileInfo = this.inputFileHashes.get(relativePath);
-    const existingFile = inputByName.get(relativePath);
     let contentHash: string | undefined;
     if (inputFileInfo != null || this.session != null) {
       try {
@@ -2012,6 +2168,15 @@ export class Job {
       if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
     }
 
+    /* The unchanged inline entrypoint is executable request input, not an
+     * output artifact. Suppress it before applying output-size reporting;
+     * downloaded inputs still flow through the size limit below, preserving
+     * the existing response-cap behavior for inherited refs. */
+    if (!wasModified && inputFileInfo && existingFile?.id == null
+      && relativePath === this.entryPointName) {
+      return { collected: true, truncated: false, stopLoop: false };
+    }
+
     const echoed = this.tryEchoUnchangedInput({
       wasModified,
       inputFileInfo,
@@ -2021,6 +2186,7 @@ export class Job {
     if (echoed) return { ...echoed, stopLoop: false };
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', relativePath);
       return { collected: false, truncated: true, stopLoop: true };
     }
 
@@ -2059,8 +2225,168 @@ export class Job {
     const childStatus = await this.walkDir(fullPath, parentDepth + 1, inputByName);
     if (childStatus === 'collected') return { collected: true, truncated: false };
     if (childStatus === 'skipped') return { collected: false, truncated: true };
-    if (this.isOutputCapFull()) return { collected: false, truncated: true };
     return this.handleEmptyDirectory(relativePath, fullPath, inputByName);
+  }
+
+  /** Finds the first artifact that a scan cap would hide without reading file
+   * contents. Files below a depth boundary cannot be valid primed inputs, and
+   * symlinks/unsupported files/hidden runtime directories remain intentional
+   * exclusions. An empty directory represents a reportable `.dirkeep`. */
+  private async findTruncatedArtifact(
+    dir: string,
+    inputByName: Map<string, TFile>,
+    state = this.truncationProbeState,
+    probeDepth = 0,
+    rootPath = path.relative(this.submissionDir, dir) || '.',
+    isOutputCapProbe = false,
+  ): Promise<string | undefined> {
+    /* The state is shared by every probe in this job. Once exhausted, return
+     * conservatively before opening yet another capped sibling directory. */
+    if (state.remainingEntries <= 0) return rootPath;
+    let directory: fs.Dir;
+    try {
+      directory = await fsp.opendir(dir);
+    } catch (err) {
+      const relativeDir = path.relative(this.submissionDir, dir) || '.';
+      this.log.debug({ dir, err }, 'walkDir: unable to inspect depth-capped directory');
+      this.recordArtifactTruncation('unreadable', relativeDir);
+      return undefined;
+    }
+
+    let sawVisibleEntry = false;
+    let sawVisibleNonHiddenEntry = false;
+    try {
+      for await (const entry of directory) {
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = path.relative(this.submissionDir, fullPath);
+        const kind = await this.classifyDirent(entry, fullPath, relativePath);
+        if (kind === 'file' && entry.name === PTC_HISTORY_FILENAME) {
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
+          continue;
+        }
+        sawVisibleEntry = true;
+        state.remainingEntries--;
+        if (state.remainingEntries < 0) return rootPath;
+        if (kind === 'skip') {
+          /* Ordinary walking counts symlinks/special entries as non-empty even
+           * though it does not surface them, so the probe must not invent a
+           * parent .dirkeep for that shape. */
+          sawVisibleNonHiddenEntry = true;
+          continue;
+        }
+        if (kind === 'file') {
+          sawVisibleNonHiddenEntry = true;
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
+          if (entry.name !== DIRKEEP && !isSupportedOutputFilename(entry.name)) continue;
+          const existingFile = inputByName.get(relativePath);
+          const inputFileInfo = this.inputFileHashes.get(relativePath);
+          let capProbeStat: fs.Stats | undefined;
+          if (isOutputCapProbe) {
+            const pathShapeError = checkPathShape(relativePath);
+            if (pathShapeError) {
+              this.recordArtifactTruncation(
+                pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+                relativePath,
+              );
+              continue;
+            }
+            try {
+              capProbeStat = await fsp.lstat(fullPath);
+              if (!capProbeStat.isFile()) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during cap-probe stat');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+            if (capProbeStat.size > this.runtime.max_file_size) {
+              /* Match handleRegularFile's one exception: an unchanged inline
+               * entrypoint is request input rather than an oversized output. */
+              if (!inputFileInfo || existingFile?.id != null || relativePath !== this.entryPointName) {
+                this.recordArtifactTruncation('size', relativePath);
+                continue;
+              }
+              if (capProbeStat.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat.size;
+              try {
+                if (await this.computeFileHash(fullPath, true) === inputFileInfo.hash) continue;
+              } catch (err) {
+                this.log.debug({ path: relativePath, err }, 'walkDir: failed during oversized entrypoint cap probe');
+              }
+              this.recordArtifactTruncation('size', relativePath);
+              continue;
+            }
+          }
+          if (
+            isOutputCapProbe
+            && relativePath === this.entryPointName
+            && existingFile?.id == null
+            && inputFileInfo
+          ) {
+            try {
+              if (capProbeStat!.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat!.size;
+              if (await this.computeFileHash(fullPath, true) === inputFileInfo.hash) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during entrypoint cap probe');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+          }
+          /* Once generated outputs fill the response cap, a persistent
+           * workspace may still contain unchanged artifacts from earlier
+           * turns. Ordinary walking suppresses those via their content hash,
+           * so the bounded cap probe must do the same or it reports a false
+           * max_files warning. Current-request inputs remain reportable: they
+           * would otherwise have been echoed into this response. */
+          if (isOutputCapProbe && this.session && !existingFile) {
+            if (this.session.isPrimedReadOnly(relativePath)) continue;
+            try {
+              if (capProbeStat!.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat!.size;
+              const hash = await this.computeFileHash(fullPath, true);
+              if (this.session.isSurfaced(relativePath, hash)) continue;
+              if (
+                this.session.isPrimedInput(relativePath)
+                && this.session.primedHash(relativePath) === hash
+              ) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during cap-probe hashing');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+          }
+          return relativePath;
+        }
+        if (isHiddenDirectory(entry.name) && !inputsLiveUnder(inputByName, relativePath)) continue;
+        sawVisibleNonHiddenEntry = true;
+        /* The probe exists only to avoid false warnings for small, obviously
+         * unsupported-only subtrees. Once either budget is exhausted, report
+         * the capped root conservatively instead of defeating the scan bound. */
+        if (probeDepth >= TRUNCATION_PROBE_MAX_LEVELS) return rootPath;
+        const nested = await this.findTruncatedArtifact(
+          fullPath,
+          inputByName,
+          state,
+          probeDepth + 1,
+          rootPath,
+          isOutputCapProbe,
+        );
+        if (nested) return nested;
+      }
+    } catch (err) {
+      const relativeDir = path.relative(this.submissionDir, dir) || '.';
+      this.log.debug({ dir, err }, 'walkDir: failed during bounded directory inspection');
+      this.recordArtifactTruncation('unreadable', relativeDir);
+      return undefined;
+    }
+
+    return sawVisibleEntry && sawVisibleNonHiddenEntry
+      ? undefined
+      : path.join(path.relative(this.submissionDir, dir), DIRKEEP);
   }
 
   /**
@@ -2074,14 +2400,30 @@ export class Job {
     depth: number,
     inputByName: Map<string, TFile>,
   ): Promise<'collected' | 'empty' | 'skipped'> {
-    if (depth >= config.max_nesting_depth) return 'skipped';
-    if (this.isOutputCapFull()) return 'skipped';
-
+    const relativeDir = path.relative(this.submissionDir, dir) || '.';
+    if (depth >= config.max_nesting_depth) {
+      const skippedPath = await this.findTruncatedArtifact(dir, inputByName);
+      if (skippedPath) this.recordArtifactTruncation('depth', skippedPath);
+      return 'skipped';
+    }
+    if (this.isOutputCapFull()) {
+      const skippedPath = await this.findTruncatedArtifact(
+        dir,
+        inputByName,
+        this.truncationProbeState,
+        0,
+        relativeDir,
+        true,
+      );
+      if (skippedPath) this.recordArtifactTruncation('max_files', skippedPath);
+      return 'skipped';
+    }
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
     } catch (err) {
       this.log.debug({ dir, err }, 'walkDir: unable to read directory');
+      this.recordArtifactTruncation('unreadable', relativeDir);
       return 'skipped';
     }
 
@@ -2100,7 +2442,6 @@ export class Job {
      * separate npm packages so we can't import directly; the filename literal
      * is asserted-equal in `service/scripts/test-ptc-sentinel.ts` to catch
      * accidental drift in CI. */
-    const PTC_HISTORY_FILENAME = '_ptc_history.json';
     const isPtcReserved = (name: string): boolean => name === PTC_HISTORY_FILENAME;
 
     const nonDirkeepCount = entries.reduce(
@@ -2120,15 +2461,20 @@ export class Job {
     let skippedHiddenDirs = 0;
 
     for (const entry of entries) {
-      if (this.isOutputCapFull()) { truncated = true; break; }
-      if (isPtcReserved(entry.name)) continue;
-
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);
-      if (!isValidPathShape(relativePath)) continue;
-
       const kind = await this.classifyDirent(entry, fullPath, relativePath);
       if (kind === 'skip') continue;
+
+      if (kind === 'file' && inputByName.has(relativePath)) {
+        this.presentInputFiles.add(relativePath);
+      }
+
+      /* A by-reference input may legitimately use the reserved replay-history
+       * basename on the ordinary execution endpoint. It remains hidden from
+       * output collection, but must be observed before the runtime fixture is
+       * skipped so an untouched input is not reported as deleted. */
+      if (kind === 'file' && isPtcReserved(entry.name)) continue;
 
       if (kind === 'dir') {
         /* Skip hidden directories (basename starts with `.`) unless the user
@@ -2143,9 +2489,42 @@ export class Job {
           skippedHiddenDirs++;
           continue;
         }
+        const pathShapeError = checkPathShape(relativePath);
+        if (pathShapeError) {
+          const skippedPath = await this.findTruncatedArtifact(
+            fullPath,
+            inputByName,
+            this.truncationProbeState,
+            0,
+            relativePath,
+          );
+          if (skippedPath) {
+            this.recordArtifactTruncation(
+              pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+              skippedPath,
+            );
+            truncated = true;
+          }
+          continue;
+        }
         const res = await this.walkSubdirectory(relativePath, fullPath, depth, inputByName);
         if (res.collected) hasCollectedChild = true;
         if (res.truncated) truncated = true;
+        if (this.isOutputCapFull() && this.artifactTruncation?.reasons.max_files) break;
+        continue;
+      }
+
+      /* Check intentional filename filtering before path limits. Unsupported
+       * files never belong in files[], regardless of how long their path is. */
+      if (entry.name !== DIRKEEP && !isSupportedOutputFilename(entry.name)) continue;
+
+      const pathShapeError = checkPathShape(relativePath);
+      if (pathShapeError) {
+        this.recordArtifactTruncation(
+          pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+          relativePath,
+        );
+        truncated = true;
         continue;
       }
 
@@ -2338,49 +2717,61 @@ export class Job {
       this.log.info('Cleaning up');
     }
 
-    /* Session mode: the workspace and pinned UID belong to the long-lived
-     * session, not this job. Keep both so the next call sees prior files;
-     * teardown happens on the /terminate hook (or explicit session reset). */
-    if (this.session) {
-      this.workspaceLease = undefined;
-      this.submissionDir = '';
-      this.jobIdentity = undefined;
-      return;
-    }
-
-    let workspaceRemoved = true;
-    const workspaceLease = this.workspaceLease;
-    const jobIdentity = this.jobIdentity;
-
-    if (workspaceLease) {
-      try {
-        workspaceRemoved = await cleanupSandboxWorkspace(workspaceLease);
-      } catch (error) {
-        workspaceRemoved = false;
-        this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
-      } finally {
+    let outcome: 'removed' | 'preserved' | 'retained' | 'error' = 'error';
+    try {
+      /* Session mode: the workspace and pinned UID belong to the long-lived
+       * session, not this job. Keep both so the next call sees prior files;
+       * teardown happens on the /terminate hook (or explicit session reset). */
+      if (this.session) {
         this.workspaceLease = undefined;
         this.submissionDir = '';
+        this.jobIdentity = undefined;
+        outcome = 'preserved';
+        return;
       }
-    }
 
-    if (jobIdentity) {
-      if (!workspaceLease || workspaceRemoved) {
-        releaseJobIdentity(jobIdentity);
-      } else {
-        retainWorkspaceCleanupUntilRemoved(workspaceLease, () => {
-          releaseJobIdentity(jobIdentity);
-          this.log.info(
-            { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
-            'Released retained sandbox job UID slot after workspace cleanup',
-          );
-        });
-        this.log.error(
-          { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
-          'Retaining sandbox job UID slot after failed workspace cleanup',
-        );
+      let workspaceRemoved = true;
+      const workspaceLease = this.workspaceLease;
+      const jobIdentity = this.jobIdentity;
+
+      if (workspaceLease) {
+        try {
+          workspaceRemoved = await cleanupSandboxWorkspace(workspaceLease);
+        } catch (error) {
+          workspaceRemoved = false;
+          this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
+        } finally {
+          this.workspaceLease = undefined;
+          this.submissionDir = '';
+        }
       }
-      this.jobIdentity = undefined;
+
+      if (jobIdentity) {
+        if (!workspaceLease || workspaceRemoved) {
+          releaseJobIdentity(jobIdentity);
+        } else {
+          retainWorkspaceCleanupUntilRemoved(workspaceLease, () => {
+            releaseJobIdentity(jobIdentity);
+            this.log.info(
+              { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+              'Released retained sandbox job UID slot after workspace cleanup',
+            );
+          });
+          this.log.error(
+            { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+            'Retaining sandbox job UID slot after failed workspace cleanup',
+          );
+        }
+        this.jobIdentity = undefined;
+      }
+      outcome = workspaceRemoved ? 'removed' : 'retained';
+    } finally {
+      recordCleanupResources({
+        job: this.uuid,
+        mode: this.session ? 'session' : 'disposable',
+        outcome,
+        suppressSuccessLogs: this.isSynthetic,
+      });
     }
   }
 }

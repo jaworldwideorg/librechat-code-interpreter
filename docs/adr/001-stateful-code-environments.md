@@ -52,12 +52,21 @@ worker replacement; the UI and operator documentation must not imply otherwise.
 - The VM requires no inbound internet listener.
 - Code API, not the worker, authenticates LibreChat users and normalizes work.
 - A stolen short-lived credential is insufficient without the worker private
-  key; a stolen private key is insufficient after credential expiry or
-  revocation.
+  key. In the original pairing-only model, a stolen private key is insufficient
+  after credential expiry or revocation. With optional durable machine
+  enrollment and signed credential recovery, the private key itself remains
+  a revocable long-lived credential: access-credential expiry alone does not
+  protect against theft of that key. Revocation invalidates both.
 - Pairing codes and credentials are stored by digest where lookup permits.
 - One configured worker has at most one active fenced assignment.
-- Sandbox isolation and default-deny egress remain mandatory; pairing secures
-  the transport identity but does not make the host a sandbox.
+- Sandbox isolation and default-deny egress remain the mandatory default;
+  pairing secures the transport identity but does not make the host a sandbox.
+  An operator may explicitly delegate network and local-socket restrictions to
+  an approved outer VM boundary through a named, digested worker policy. That
+  delegation retains direct workspace filesystem rules, cancellation, and
+  resource limits. The operator is responsible for preventing permitted host
+  services (for example, a privileged container socket) from bypassing those
+  rules and exposing worker identity or credential material.
 - A compromised worker can lie about advertised capabilities. Capability
   labels and policy digests are audit signals until enforcement is coupled to
   an attested sandbox or trusted host policy.
@@ -65,7 +74,8 @@ worker replacement; the UI and operator documentation must not imply otherwise.
 ## Consequences
 
 - `@librechat/code` owns the provider-neutral protocol, identity handling, and
-  worker CLI; Code API owns enrollment, scheduling, and execution policy.
+  worker CLI, including machine-local execution-policy presets; Code API owns
+  enrollment, scheduling, and execution policy.
 - LibreChat owns environment persistence, ownership, RBAC, and user experience.
 - The Agents SDK keeps only its adapter until a second concrete consumer proves
   which coding-tool abstractions are genuinely provider neutral.

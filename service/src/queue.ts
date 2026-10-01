@@ -1,6 +1,7 @@
 // src/queue.ts
 import IORedis from 'ioredis';
 import { Queue, QueueEvents } from 'bullmq';
+import type { Job } from 'bullmq';
 import { setMaxListeners } from 'events';
 import type { CommonRedisOptions } from 'ioredis';
 import type * as tls from 'tls';
@@ -17,19 +18,13 @@ import type {
   SandboxBackendName,
 } from './execution-profile';
 import logger from './logger';
-import { redisKeepAliveOptions } from './redis-options';
+import { redisKeepAliveOptions, redisReconnectDelay } from './redis-options';
 import { bullmqQueueJobs, registerBullmqQueueMetricsCollector } from './metrics';
-
-const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY = 2000;
+import { JobCancellationRegistry } from './job-cancellation';
 
 const retryStrategy: CommonRedisOptions['retryStrategy'] = (times) => {
-  if (times > MAX_RECONNECT_ATTEMPTS) {
-    logger.error(`Failed to connect to Redis after ${times} attempts`);
-    return null;
-  }
   logger.warn(`Retrying Redis connection attempt ${times}`);
-  return RECONNECT_DELAY;
+  return redisReconnectDelay(times);
 };
 
 const reconnectOnError: CommonRedisOptions['reconnectOnError'] = (err) => {
@@ -60,6 +55,7 @@ const connection = new IORedis({
     ? { dnsLookup: (address: string, callback: (err: Error | null, addr: string) => void): void => callback(null, address) }
     : {})
 });
+const jobCancellationRegistry = new JobCancellationRegistry(connection);
 
 // Global queues - no INSTANCE_ID prefix
 // This enables horizontal scaling where any worker can process any job
@@ -108,6 +104,19 @@ export function getExecutionQueueBinding(
     backend,
   );
   return { ...getQueueResources(name), language };
+}
+
+/**
+ * Resolve a job only from this deployment's already-open queue set. Every
+ * homogeneous API replica opens both execution queues at startup, so this
+ * supports cross-replica cancellation without allocating attacker-shaped
+ * QueueEvents connections for arbitrary names recovered from Redis.
+ */
+export async function getExistingExecutionJob(
+  queueName: string,
+  jobId: string,
+): Promise<Job<t.JobData, t.JobResult, Jobs.execute> | undefined> {
+  return queueResources.get(queueName)?.queue.getJob(jobId);
 }
 
 const { queue: pyQueue, events: pyQueueEvents } = getQueueResources(queueNames.python);
@@ -163,8 +172,16 @@ export async function closeQueueConnections(): Promise<void> {
     [...queueResources.values()].flatMap(({ queue, events }) => [
       queue.close(),
       events.close(),
-    ]),
+    ]).concat(jobCancellationRegistry.close()),
   );
 }
 
-export { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, queueNames, connection };
+export {
+  pyQueue,
+  otherQueue,
+  pyQueueEvents,
+  otherQueueEvents,
+  queueNames,
+  connection,
+  jobCancellationRegistry,
+};

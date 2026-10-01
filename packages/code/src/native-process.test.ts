@@ -1,12 +1,29 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { ChildProcess, ForkOptions } from 'node:child_process';
 import {
   NativeProcessWorkspaceCommandSandbox,
   nativeExecutorEnvironment,
+  trustedProgrammaticExecutable,
 } from './native-process.js';
 import { WorkspaceToolError } from './workspace.js';
+import { BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS } from './protocol.js';
+
+test('preflight rejects relative and workspace-controlled executables including symlinks', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'native-ptc-path-'));
+  const outside = await mkdtemp(join(tmpdir(), 'native-ptc-link-'));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); });
+  const executable = join(root, 'bash');
+  await writeFile(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  await symlink(executable, join(outside, 'bash'));
+  await assert.rejects(trustedProgrammaticExecutable('./bash', root), /absolute/);
+  await assert.rejects(trustedProgrammaticExecutable(executable, root), /outside the workspace/);
+  await assert.rejects(trustedProgrammaticExecutable(join(outside, 'bash'), root), /outside the workspace/);
+});
 
 const request = {
   protocolVersion: 1 as const,
@@ -43,13 +60,19 @@ function fixture(
       queueMicrotask(() => {
         if (message.type === 'prepare' && prepare)
           return prepare(child, message);
-        if (message.type === 'execute' && execute)
+        if (
+          (message.type === 'execute' || message.type === 'programmatic') &&
+          execute
+        )
           return execute(child, message);
         if (message.type === 'cancel') return;
         child.emit('message', {
           id: message.id,
           ok: true,
-          ...(message.type === 'execute' ? { result } : {}),
+                    ...(message.type === 'execute' ||
+                    message.type === 'programmatic'
+            ? { result }
+            : {}),
         });
       });
       return true;
@@ -75,6 +98,24 @@ function fixture(
       return child;
     },
   };
+}
+
+class ObservedWatchdogSandbox extends NativeProcessWorkspaceCommandSandbox {
+  readonly watchdogTimeouts: number[] = [];
+  readonly watchdogCallbacks: Array<() => void> = [];
+
+  protected override scheduleRpcTimeout(
+    callback: () => void,
+    timeoutMs: number,
+  ): ReturnType<typeof setTimeout> {
+    this.watchdogTimeouts.push(timeoutMs);
+    this.watchdogCallbacks.push(callback);
+    return super.scheduleRpcTimeout(callback, timeoutMs);
+  }
+
+  fireLatestWatchdog(): void {
+    this.watchdogCallbacks.at(-1)?.();
+  }
 }
 
 test('executor bootstrap excludes bridge credentials and Node injection variables', async () => {
@@ -105,17 +146,66 @@ test('executor bootstrap excludes bridge credentials and Node injection variable
   assert.deepEqual(fake.options?.execArgv, []);
   assert.deepEqual(fake.options?.env, { PATH: '/bin' });
   assert.equal(JSON.stringify(fake.messages).includes('secret'), false);
+  assert.equal('gitSharedObjectDirectory' in fake.messages[0].options, false);
+  await sandbox.close();
+});
+
+test('executor forwards the linked worktree policy to the sandbox process', async () => {
+  const fake = fixture();
+  const linkedWorktree = {
+    checkoutRoot: '/checkout',
+    commonGitDir: '/checkout/.git',
+    writableGitPaths: ['/checkout/.git/objects', '/checkout/.git/refs'],
+  };
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    { workspaceRoot: '/checkout/.worktrees/task-a', linkedWorktree },
+    fake.fork,
+  );
+  await sandbox.prepare();
+  assert.deepEqual(fake.messages[0].options.linkedWorktree, linkedWorktree);
+  await sandbox.close();
+});
+
+test('executor forwards the resolved command policy without worker credentials', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: '/workspace',
+      commandPolicy: {
+        version: 1,
+        preset: 'trusted-vm',
+        network: {
+          outbound: 'unrestricted',
+          allowLocalBinding: true,
+          allowAllUnixSockets: true,
+        },
+      },
+    },
+    fake.fork,
+  );
+  await sandbox.prepare();
+  assert.deepEqual(fake.messages[0].options.commandPolicy, {
+    version: 1,
+    preset: 'trusted-vm',
+    network: {
+      outbound: 'unrestricted',
+      allowLocalBinding: true,
+      allowAllUnixSockets: true,
+    },
+  });
   await sandbox.close();
 });
 
 test('executor hands credentials over IPC only for the current command', async () => {
   const fake = fixture();
+  let credentialCwd: string | undefined;
   const sandbox = new NativeProcessWorkspaceCommandSandbox(
     {
       workspaceRoot: '/workspace',
       maskedEnvironment: {
         variables: [{ name: 'TOKEN', injectHosts: ['github.com'] }],
-        async resolve() {
+        async resolve(_signal, cwd) {
+          credentialCwd = cwd;
           return { TOKEN: 'per-command-secret' };
         },
         wrapCommand(command) {
@@ -137,12 +227,304 @@ test('executor hands credentials over IPC only for the current command', async (
   assert.deepEqual(fake.messages[1].credentials, {
     TOKEN: 'per-command-secret',
   });
+  assert.equal(credentialCwd, '/workspace');
   assert.equal(fake.messages[1].wrappedCommand, 'wrapped printf ok');
   await sandbox.close();
 });
 
+test('programmatic executor resolves and scopes credentials to its command', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+      environment: { PATH: '/sandbox-only' },
+      maskedEnvironment: {
+        variables: [{ name: 'TOKEN', injectHosts: ['github.com'] }],
+        async resolve() {
+          return { TOKEN: 'per-programmatic-secret' };
+        },
+        wrapCommand(command) {
+          return `wrapped ${command}`;
+        },
+      },
+    },
+    fake.fork,
+  );
+  const programmaticRequest = {
+    headers: {},
+    body: {
+      language: 'bash' as const,
+      version: '5.2.0',
+      session_id: 'session',
+      files: [{ name: 'main.sh', content: 'git status' }],
+    },
+  };
+  await sandbox.executeProgrammatic('primary', programmaticRequest);
+  assert.equal(
+    JSON.stringify(fake.options).includes('per-programmatic-secret'),
+    false,
+  );
+  const message = fake.messages.find(
+        candidate => candidate.type === 'programmatic',
+    )!;
+  assert.equal(typeof message.programmaticShellPath, 'string');
+  assert.equal(message.programmaticShellPath.startsWith('/'), true);
+  assert.equal(typeof message.programmaticJqPath, 'string');
+  assert.equal(message.programmaticJqPath.startsWith('/'), true);
+  assert.equal(
+    '/sandbox-only'.split(':').includes(dirname(message.programmaticJqPath)),
+    false,
+  );
+  assert.deepEqual(message.credentials, { TOKEN: 'per-programmatic-secret' });
+  assert.equal(
+    message.wrappedCommand,
+        'wrapped exec "$LIBRECHAT_CODE_BASH_PATH" "$LIBRECHAT_CODE_DATA_DIR/main.sh"',
+  );
+  await sandbox.close();
+});
+
+test('omitted PTC timeout gives the commit watchdog the protocol execution default', async () => {
+  const fake = fixture((child, message) => {
+    if (message.type !== 'programmatic') return;
+    child.emit('message', { id: message.id, phase: 'commit' });
+    child.emit('message', { id: message.id, ok: true, result: {} });
+  });
+  const sandbox = new ObservedWatchdogSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  await sandbox.executeProgrammatic('primary', {
+    headers: {},
+    body: {
+      language: 'bash',
+      version: '5.2.0',
+      session_id: 'session',
+      replay_tool_count: 0,
+      max_output_files: 0,
+      files: [{ name: 'main.sh', content: 'sleep 45' }],
+    },
+  });
+  assert.ok(
+    sandbox.watchdogTimeouts.at(-1)! >
+      BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS,
+  );
+  await sandbox.close();
+});
+
+test('PTC watchdog budgets staging separately and resets when commit begins', async () => {
+  const fake = fixture((child, message) => {
+    if (message.type !== 'programmatic') return;
+    child.emit('message', { id: message.id, phase: 'commit' });
+    child.emit('message', { id: message.id, ok: true, result: {} });
+  });
+  const sandbox = new ObservedWatchdogSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  await sandbox.executeProgrammatic('primary', {
+    headers: {},
+    body: {
+      language: 'bash',
+      version: '5.2.0',
+      session_id: 'session',
+      run_timeout: 1_000,
+      replay_tool_count: 0,
+      max_output_files: 0,
+      files: [{ name: 'main.sh', content: 'echo ready' }],
+    },
+  });
+  assert.deepEqual(sandbox.watchdogTimeouts.slice(-2), [65_000, 6_000]);
+  assert.ok(
+    fake.messages.some(message => message.type === 'commit-ack'),
+    'the child must not enter the mutating phase before the parent arms it',
+  );
+  await sandbox.close();
+});
+
+test('PTC-only preflight failures do not disable ordinary native commands', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: '/workspace',
+      shellPath: '/definitely/missing/bash',
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  assert.deepEqual(await sandbox.execute(request), result);
+  await assert.rejects(
+    sandbox.executeProgrammatic('primary', {
+      headers: {},
+      body: {
+        language: 'bash',
+        version: '5.2.0',
+        session_id: 'session',
+        files: [{ name: 'main.sh', content: 'echo ready' }],
+      },
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      error.code === 'COMMAND_UNAVAILABLE' &&
+      !error.mutationMayHaveCommitted,
+  );
+  assert.deepEqual(await sandbox.execute(request), result);
+  await sandbox.close();
+});
+
+test('programmatic executor preserves a child-reported pre-dispatch failure', async () => {
+  const fake = fixture((child, message) => {
+    if (message.type !== 'programmatic') {
+      child.emit('message', { id: message.id, ok: true, result });
+      return;
+    }
+    child.emit('message', {
+      id: message.id,
+      ok: false,
+      code: 'COMMAND_UNAVAILABLE',
+      errorMessage: 'Programmatic input download failed',
+      mutation: false,
+      requiresQuarantine: false,
+    });
+  });
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  await assert.rejects(
+    sandbox.executeProgrammatic('primary', {
+      headers: {},
+      body: {
+        language: 'bash',
+        version: '5.2.0',
+        session_id: 'session',
+        files: [{ name: 'main.sh', content: 'echo ready' }],
+      },
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      !error.mutationMayHaveCommitted &&
+      !error.requiresQuarantine,
+  );
+  assert.deepEqual(await sandbox.execute(request), result);
+  await sandbox.close();
+});
+
+test('executor loss during programmatic staging is not an uncertain workspace mutation', async () => {
+  const fake = fixture((child, message) => {
+    if (message.type === 'programmatic') child.emit('exit', 1);
+  });
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  await assert.rejects(
+    sandbox.executeProgrammatic('primary', {
+      headers: {},
+      body: {
+        language: 'bash',
+        version: '5.2.0',
+        session_id: 'session',
+        files: [{ name: 'main.sh', content: 'echo ready' }],
+      },
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      !error.mutationMayHaveCommitted &&
+      !error.requiresQuarantine,
+  );
+  await sandbox.close();
+});
+
+test('programmatic staging watchdog expires without claiming a workspace mutation', async () => {
+  let staged!: () => void;
+  const staging = new Promise<void>(resolve => {
+    staged = resolve;
+  });
+  const fake = fixture((_child, message) => {
+    if (message.type === 'programmatic') staged();
+  });
+  const sandbox = new ObservedWatchdogSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+  const execution = sandbox.executeProgrammatic('primary', {
+    headers: {},
+    body: {
+      language: 'bash',
+      version: '5.2.0',
+      session_id: 'session',
+      files: [{ name: 'main.sh', content: 'echo ready' }],
+    },
+  });
+  await staging;
+  sandbox.fireLatestWatchdog();
+
+  await assert.rejects(
+    execution,
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      !error.mutationMayHaveCommitted &&
+      !error.requiresQuarantine,
+  );
+  assert.equal(fake.killCalls, 1);
+  await sandbox.close();
+});
+
+test('executor loss after programmatic commit starts remains an uncertain mutation', async () => {
+  const fake = fixture((child, message) => {
+    if (message.type !== 'programmatic') return;
+    child.emit('message', { id: message.id, phase: 'commit' });
+    child.emit('exit', 1);
+  });
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    {
+      workspaceRoot: tmpdir(),
+      programmaticFileUpstream: 'http://127.0.0.1:3190',
+    },
+    fake.fork,
+  );
+
+  await assert.rejects(
+    sandbox.executeProgrammatic('primary', {
+      headers: {},
+      body: {
+        language: 'bash',
+        version: '5.2.0',
+        session_id: 'session',
+        files: [{ name: 'main.sh', content: 'echo ready' }],
+      },
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      error.mutationMayHaveCommitted &&
+      error.requiresQuarantine,
+  );
+  await sandbox.close();
+});
+
 test('executor loss after dispatch is an uncertain mutation and is never replayed', async () => {
-  const fake = fixture((child) => child.emit('exit', 1));
+    const fake = fixture(child => child.emit('exit', 1));
   const sandbox = new NativeProcessWorkspaceCommandSandbox(
     { workspaceRoot: '/workspace' },
     fake.fork,
@@ -150,16 +532,17 @@ test('executor loss after dispatch is an uncertain mutation and is never replaye
   await assert.rejects(
     sandbox.execute(request),
     (error: unknown) =>
-      error instanceof WorkspaceToolError && error.mutationMayHaveCommitted,
+            error instanceof WorkspaceToolError &&
+            error.mutationMayHaveCommitted,
   );
   await assert.rejects(sandbox.execute(request), /unavailable/);
-  assert.equal(fake.messages.filter((m) => m.type === 'execute').length, 1);
+    assert.equal(fake.messages.filter(m => m.type === 'execute').length, 1);
   await sandbox.close();
 });
 
 test('executor cancellation targets the active request and preserves mutation certainty', async () => {
   let dispatched!: () => void;
-  const dispatch = new Promise<void>((resolve) => {
+    const dispatch = new Promise<void>(resolve => {
     dispatched = resolve;
   });
   const fake = fixture(() => dispatched());
@@ -172,7 +555,7 @@ test('executor cancellation targets the active request and preserves mutation ce
   await dispatch;
   await assert.rejects(sandbox.execute(request), /unavailable/);
   controller.abort();
-  const command = fake.messages.find((m) => m.type === 'execute')!;
+    const command = fake.messages.find(m => m.type === 'execute')!;
   assert.deepEqual(fake.messages.at(-1), { type: 'cancel', id: command.id });
   fake.child.emit('message', {
     id: command.id,
@@ -194,7 +577,7 @@ test('executor cancellation targets the active request and preserves mutation ce
 
 test('executor ignores a cleanup exemption on non-cancellation failures', async () => {
   let dispatched!: () => void;
-  const dispatch = new Promise<void>((resolve) => {
+    const dispatch = new Promise<void>(resolve => {
     dispatched = resolve;
   });
   const fake = fixture(() => dispatched());
@@ -204,7 +587,7 @@ test('executor ignores a cleanup exemption on non-cancellation failures', async 
   );
   const execution = sandbox.execute(request);
   await dispatch;
-  const command = fake.messages.find((message) => message.type === 'execute')!;
+    const command = fake.messages.find(message => message.type === 'execute')!;
   fake.child.emit('message', {
     id: command.id,
     ok: false,
@@ -239,7 +622,8 @@ test('executor rejects mismatched results as uncertain and fences subsequent com
   await assert.rejects(
     sandbox.execute(request),
     (error: unknown) =>
-      error instanceof WorkspaceToolError && error.mutationMayHaveCommitted,
+            error instanceof WorkspaceToolError &&
+            error.mutationMayHaveCommitted,
   );
   await assert.rejects(sandbox.execute(request), /unavailable/);
   await sandbox.close();
@@ -247,7 +631,7 @@ test('executor rejects mismatched results as uncertain and fences subsequent com
 
 test('executor close drains an active command before closing IPC', async () => {
   let dispatched!: () => void;
-  const dispatch = new Promise<void>((resolve) => {
+    const dispatch = new Promise<void>(resolve => {
     dispatched = resolve;
   });
   const fake = fixture(() => dispatched());
@@ -258,16 +642,86 @@ test('executor close drains an active command before closing IPC', async () => {
   const execution = sandbox.execute(request);
   await dispatch;
   const closing = sandbox.close();
-  await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(
-    fake.messages.some((m) => m.type === 'close'),
+        fake.messages.some(m => m.type === 'close'),
     false,
   );
-  const command = fake.messages.find((m) => m.type === 'execute')!;
+    const command = fake.messages.find(m => m.type === 'execute')!;
   fake.child.emit('message', { id: command.id, ok: true, result });
   assert.deepEqual(await execution, result);
   await closing;
-  assert.equal(fake.messages.filter((m) => m.type === 'close').length, 1);
+    assert.equal(fake.messages.filter(m => m.type === 'close').length, 1);
+  await assert.rejects(sandbox.execute(request), /unavailable/);
+});
+
+test('executor close resolves when the child exits during the close handshake', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    { workspaceRoot: '/workspace' },
+    fake.fork,
+  );
+  await sandbox.prepare();
+  Object.assign(fake.child, {
+    send(message: Record<string, any>, callback: (error: null) => void) {
+      fake.messages.push(message);
+      callback(null);
+      queueMicrotask(() => {
+        Object.assign(fake.child, { connected: false });
+        fake.child.emit('exit', 1, null);
+        fake.child.emit('disconnect');
+      });
+      return true;
+    },
+  });
+  await sandbox.close();
+    assert.equal(fake.messages.filter(m => m.type === 'close').length, 1);
+  await assert.rejects(sandbox.execute(request), /unavailable/);
+});
+
+test('executor close still reports a cleanup failure the child replies with', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    { workspaceRoot: '/workspace' },
+    fake.fork,
+  );
+  await sandbox.prepare();
+  Object.assign(fake.child, {
+    send(message: Record<string, any>, callback: (error: null) => void) {
+      fake.messages.push(message);
+      callback(null);
+      queueMicrotask(() =>
+        fake.child.emit('message', {
+          id: message.id,
+          ok: false,
+          code: 'COMMAND_UNAVAILABLE',
+          errorMessage: 'scratch cleanup failed',
+          mutation: false,
+          requiresQuarantine: false,
+        }),
+      );
+      return true;
+    },
+  });
+  await assert.rejects(sandbox.close(), /scratch cleanup failed/);
+  assert.equal(fake.killCalls, 1);
+  await assert.rejects(sandbox.execute(request), /unavailable/);
+});
+
+test('executor close skips the handshake once the child is already lost', async () => {
+  const fake = fixture();
+  const sandbox = new NativeProcessWorkspaceCommandSandbox(
+    { workspaceRoot: '/workspace' },
+    fake.fork,
+  );
+  await sandbox.prepare();
+  Object.assign(fake.child, { connected: false });
+  fake.child.emit('exit', 1, null);
+  await sandbox.close();
+  assert.equal(
+        fake.messages.some(m => m.type === 'close'),
+    false,
+  );
   await assert.rejects(sandbox.execute(request), /unavailable/);
 });
 
@@ -277,17 +731,20 @@ test('executor startup loss is not reported as an applied mutation', async () =>
     { workspaceRoot: '/workspace' },
     (path, args, options) => {
       const child = fake.fork(path, args, options);
-      queueMicrotask(() => child.emit('error', new Error('startup failed')));
+            queueMicrotask(() =>
+                child.emit('error', new Error('startup failed')),
+            );
       return child;
     },
   );
   await assert.rejects(
     sandbox.execute(request),
     (error: unknown) =>
-      error instanceof WorkspaceToolError && !error.mutationMayHaveCommitted,
+            error instanceof WorkspaceToolError &&
+            !error.mutationMayHaveCommitted,
   );
   assert.equal(
-    fake.messages.some((m) => m.type === 'execute'),
+        fake.messages.some(m => m.type === 'execute'),
     false,
   );
   await sandbox.close();
@@ -309,7 +766,7 @@ test('executor shutdown receipt fences reuse before the OS exit event', async ()
   );
   await assert.rejects(sandbox.execute(request));
   await assert.rejects(sandbox.execute(request), /unavailable/);
-  assert.equal(fake.messages.filter((m) => m.type === 'execute').length, 1);
+    assert.equal(fake.messages.filter(m => m.type === 'execute').length, 1);
   await sandbox.close();
 });
 
@@ -331,7 +788,8 @@ test('executor preserves bounded startup diagnostics and conventional host setti
       ok: false,
       mutation: false,
       code: 'COMMAND_UNAVAILABLE',
-      errorMessage: 'Native sandbox dependencies are unavailable: bubblewrap',
+            errorMessage:
+                'Native sandbox dependencies are unavailable: bubblewrap',
     }),
   );
   const sandbox = new NativeProcessWorkspaceCommandSandbox(
@@ -365,7 +823,10 @@ test('executor matches POSIX names exactly and folds names only on Windows', () 
     https_proxy: 'http://proxy:8080',
   });
   assert.deepEqual(
-    nativeExecutorEnvironment({ Path: 'C:\\bin', Temp: 'C:\\temp' }, 'win32'),
+        nativeExecutorEnvironment(
+            { Path: 'C:\\bin', Temp: 'C:\\temp' },
+            'win32',
+        ),
     { Path: 'C:\\bin', Temp: 'C:\\temp' },
   );
 });
@@ -386,7 +847,8 @@ test('executor classifies every pre-dispatch setup failure as mutation-atomic', 
             return {};
           },
           wrapCommand(command) {
-            if (failure === 'wrapper') throw new Error('wrapper failed');
+                        if (failure === 'wrapper')
+                            throw new Error('wrapper failed');
             return command;
           },
         },
@@ -403,10 +865,12 @@ test('executor classifies every pre-dispatch setup failure as mutation-atomic', 
         error instanceof WorkspaceToolError &&
         !error.mutationMayHaveCommitted &&
         error.code ===
-          (failure === 'abort' ? 'EXECUTION_ABORTED' : 'COMMAND_UNAVAILABLE'),
+                    (failure === 'abort'
+                        ? 'EXECUTION_ABORTED'
+                        : 'COMMAND_UNAVAILABLE'),
     );
     assert.equal(
-      fake.messages.some((m) => m.type === 'execute'),
+            fake.messages.some(m => m.type === 'execute'),
       false,
     );
     await sandbox.close();

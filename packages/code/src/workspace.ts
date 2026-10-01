@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, open, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { link, lstat, open, realpath, rename, stat, unlink, spawn, withWorkspaceRoot, WorkspaceRootAccessError } from './root-access.js';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { FileHandle } from 'node:fs/promises';
+import { matchesWorkspaceRoot } from './root-identity.js';
+import type { WorkspaceRootIdentity } from './root-identity.js';
 
 import {
   BRIDGE_PROTOCOL_VERSION,
@@ -19,10 +20,19 @@ import {
   isValidBridgeWorkspaceToolCapabilities,
   isWorkspaceToolRequest,
   isWorkspaceToolResult,
+  WORKSPACE_EDIT_FILE_FEATURES,
+  workspaceEditRequestReportsMatches,
 } from './protocol.js';
+import {
+  applyTextEdits,
+  WorkspaceEditMatchError,
+  WorkspaceEditOutputLimitError,
+} from './edits.js';
+import type { AppliedEdits } from './edits.js';
 
 import type {
   BridgeWorkspaceDescriptor,
+  WorkspaceEditMatch,
   BridgeWorkspaceToolCapabilities,
   WorkspaceReadFileRequest,
   WorkspaceReadFileResult,
@@ -45,6 +55,7 @@ import type {
 } from './protocol.js';
 
 export { isWorkspaceToolRequest, isWorkspaceToolResult };
+import { readRepositoryInstructions } from './instructions.js';
 export type {
   WorkspaceReadFileRequest,
   WorkspaceReadFileResult,
@@ -66,6 +77,7 @@ export type {
 };
 
 export interface LocalWorkspaceConfig {
+  identity?: WorkspaceRootIdentity;
   id: string;
   name?: string;
   root: string;
@@ -75,6 +87,7 @@ export interface LocalWorkspaceConfig {
 
 export interface LocalWorkspaceToolsOptions {
   workspaces: LocalWorkspaceConfig[];
+  repositoryInstructions?: boolean;
 }
 
 export interface WorkspaceToolExecutor {
@@ -112,6 +125,8 @@ export interface SandboxWorkspaceToolsOptions {
   commandSandbox: WorkspaceCommandSandbox;
   /** Workspace IDs whose sandbox is configured and may run commands. */
   commandWorkspaces: string[];
+  /** Optional execution-scoped languages supplied by the same command sandbox. */
+  programmaticLanguages?: BridgeWorkspaceToolCapabilities['programmaticLanguages'];
 }
 
 const MAX_SEARCH_CANDIDATE_BYTES = 1024 * 1024;
@@ -332,6 +347,7 @@ async function readConfinedFile(
 }
 
 interface WorkspaceRoot {
+  identity?: WorkspaceRootIdentity;
   root: string;
   writable: boolean;
 }
@@ -715,7 +731,10 @@ async function editWorkspaceFile(
         'EDIT_CONFLICT',
       );
     }
-    const { updated, replacements } = applyWorkspaceEdits(original, request);
+    const { updated, replacements, matches } = applyWorkspaceEdits(
+      original,
+      request,
+    );
     await atomicWriteConfinedFile(
       root,
       request.path,
@@ -734,6 +753,7 @@ async function editWorkspaceFile(
       path: request.path,
       replacements,
       bytesWritten: updated.byteLength,
+      ...(matches ? { matches } : {}),
     };
   } catch (error) {
     if (error instanceof WorkspaceToolError) throw error;
@@ -746,7 +766,7 @@ async function editWorkspaceFile(
 function applyWorkspaceEdits(
   original: Buffer,
   request: WorkspaceEditFileRequest | WorkspacePreviewEditRequest,
-): { updated: Buffer; replacements: number } {
+): { updated: Buffer; replacements: number; matches?: WorkspaceEditMatch[] } {
   const hasBom =
     original[0] === 0xef && original[1] === 0xbb && original[2] === 0xbf;
   const body = hasBom ? original.subarray(3) : original;
@@ -760,20 +780,19 @@ function applyWorkspaceEdits(
   const edits = request.edits ?? [
     { oldText: request.oldText ?? '', newText: request.newText ?? '' },
   ];
-  let updatedText = text;
-  for (const edit of edits) {
-    const first = updatedText.indexOf(edit.oldText);
-    if (first < 0 || updatedText.indexOf(edit.oldText, first + 1) >= 0) {
-      throw new WorkspaceToolError(
-        'Workspace edit must match exactly once',
-        'EDIT_CONFLICT',
-      );
+  let applied: AppliedEdits;
+  try {
+    applied = applyTextEdits(text, edits, request.matching ?? 'exact');
+  } catch (error) {
+    if (error instanceof WorkspaceEditMatchError) {
+      throw new WorkspaceToolError(error.message, 'EDIT_CONFLICT');
     }
-    updatedText =
-      updatedText.slice(0, first) +
-      edit.newText +
-      updatedText.slice(first + edit.oldText.length);
+    if (error instanceof WorkspaceEditOutputLimitError) {
+      throw new WorkspaceToolError(error.message, 'WRITE_LIMIT_EXCEEDED');
+    }
+    throw error;
   }
+  const updatedText = applied.text;
   const updatedBody = Buffer.from(updatedText, 'utf8');
   const updated = hasBom
     ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), updatedBody])
@@ -784,7 +803,13 @@ function applyWorkspaceEdits(
       'WRITE_LIMIT_EXCEEDED',
     );
   }
-  return { updated, replacements: edits.length };
+  return {
+    updated,
+    replacements: edits.length,
+    ...(workspaceEditRequestReportsMatches(request)
+      ? { matches: applied.matches }
+      : {}),
+  };
 }
 
 async function previewWorkspaceEdit(
@@ -799,7 +824,10 @@ async function previewWorkspaceEdit(
       'EXECUTION_ABORTED',
     );
   }
-  const { updated, replacements } = applyWorkspaceEdits(original, request);
+  const { updated, replacements, matches } = applyWorkspaceEdits(
+    original,
+    request,
+  );
   if (signal?.aborted) {
     throw new WorkspaceToolError(
       'Workspace tool execution aborted',
@@ -818,6 +846,7 @@ async function previewWorkspaceEdit(
     baseSha256: createHash('sha256').update(original).digest('hex'),
     replacements,
     bytesWritten: updated.byteLength,
+    ...(matches ? { matches } : {}),
   };
 }
 
@@ -1427,6 +1456,16 @@ async function withinListDeadline<T>(
 export class LocalWorkspaceTools implements WorkspaceToolExecutor {
   readonly capabilities: BridgeWorkspaceToolCapabilities;
   readonly mutationFailuresAreAtomic = true as const;
+  private repositoryInstructions = false;
+
+  async instructionDescriptors() {
+    if (!this.repositoryInstructions) return undefined;
+    const entries = await Promise.all([...this.roots].map(async ([id, { root, identity }]) => {
+      const snapshot = await withWorkspaceRoot(root, identity, () => readRepositoryInstructions(root));
+      return [id, snapshot ? [snapshot.descriptor] : []] as const;
+    }));
+    return new Map(entries);
+  }
 
   private constructor(
     private readonly roots: ReadonlyMap<string, WorkspaceRoot>,
@@ -1480,7 +1519,7 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       ...(anyWritable ? { writeFileModes: ['replace', 'create'] } : {}),
       ...(anyWritable ? { editFileModes: ['single', 'batch'] } : {}),
       ...(anyWritable
-        ? { editFileFeatures: ['expected_base_sha256'] }
+        ? { editFileFeatures: [...WORKSPACE_EDIT_FILE_FEATURES] }
         : {}),
       listFileFeatures: ['after_path'],
     };
@@ -1494,6 +1533,8 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       let canonicalRoot: string;
       try {
         canonicalRoot = await realpath(workspace.root);
+        if (workspace.identity && !await matchesWorkspaceRoot(canonicalRoot, workspace.identity)) throw new Error();
+        await withWorkspaceRoot(canonicalRoot, workspace.identity, async () => undefined);
         if (!(await stat(canonicalRoot)).isDirectory()) throw new Error();
       } catch {
         throw new WorkspaceToolError(
@@ -1502,11 +1543,12 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
         );
       }
       roots.set(workspace.id, {
+        identity: workspace.identity,
         root: canonicalRoot,
         writable: workspace.writable === true,
       });
     }
-    return new LocalWorkspaceTools(
+    const tools = new LocalWorkspaceTools(
       roots,
       operations,
       workspaces,
@@ -1515,9 +1557,25 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       capabilities.editFileFeatures,
       capabilities.listFileFeatures,
     );
+    tools.repositoryInstructions = options.repositoryInstructions === true;
+    return tools;
   }
 
   async execute(
+    request: WorkspaceToolRequest,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceToolResult> {
+    const workspace = this.roots.get(request?.workspaceId);
+    if (!workspace?.identity) return this.executeBound(request, signal);
+    try {
+      return await withWorkspaceRoot(workspace.root, workspace.identity, () => this.executeBound(request, signal));
+    } catch (error) {
+      if (error instanceof WorkspaceRootAccessError) throw new WorkspaceToolError(error.message, 'REGISTRATION_INVALID');
+      throw error;
+    }
+  }
+
+  private async executeBound(
     request: WorkspaceToolRequest,
     signal?: AbortSignal,
   ): Promise<WorkspaceToolResult> {
@@ -1577,6 +1635,15 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       );
     }
 
+    if (request.instructionSha256 !== undefined) {
+      const snapshot = this.repositoryInstructions ? await readRepositoryInstructions(root) : undefined;
+      if (!snapshot || snapshot.descriptor.path !== request.path || snapshot.descriptor.sha256 !== request.instructionSha256) {
+        throw new WorkspaceToolError('Repository instructions changed or are unavailable', 'INVALID_PATH');
+      }
+      return { protocolVersion: BRIDGE_PROTOCOL_VERSION, operation: 'read_file', workspaceId: request.workspaceId,
+        path: request.path, content: snapshot.content, startLine: 1, endLine: snapshot.content.split('\n').length,
+        truncated: snapshot.descriptor.truncated };
+    }
     const startLine = request.startLine ?? 1;
     const maxLines = request.maxLines ?? 200;
     if (
@@ -1657,6 +1724,9 @@ export class SandboxWorkspaceTools implements WorkspaceToolExecutor {
       ...(base.listFileFeatures != null
         ? { listFileFeatures: base.listFileFeatures }
         : {}),
+      ...(options.programmaticLanguages?.length
+        ? { programmaticLanguages: [...options.programmaticLanguages] }
+        : {}),
       workspaces: base.workspaces.map((workspace) => ({
         ...workspace,
         operations: [
@@ -1687,6 +1757,9 @@ export class SandboxWorkspaceTools implements WorkspaceToolExecutor {
     }
     if (request.operation !== 'execute_command') {
       return this.options.workspaceTools.execute(request, signal);
+    }
+    if (request.environmentAction) {
+      throw new WorkspaceToolError('Environment action was not resolved by this worker', 'INVALID_REQUEST');
     }
     if (!this.commandWorkspaces.has(request.workspaceId)) {
       throw new WorkspaceToolError(

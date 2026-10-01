@@ -18,6 +18,11 @@ import {
   BridgeWorkerSelectionError,
   resolveBridgeWorkerSelection,
 } from '../bridge/selection';
+import { principalWorkspaceInstanceId } from '../bridge/workspace-instance';
+
+const MAX_WORKSPACE_QUEUE_WAIT_MS = 5 * 60_000;
+const DEFAULT_WORKSPACE_QUEUE_WAIT_MS = 30_000;
+const WORKSPACE_QUEUE_WAIT_HEADER = 'X-LibreChat-Workspace-Queue-Wait-Ms';
 
 interface WorkspaceToolsRouterOptions {
   store: Pick<RedisBridgeStore, 'dispatchWorkspaceTool'>;
@@ -36,6 +41,7 @@ function asyncRoute(handler: (req: AuthenticatedRequest, res: Response) => Promi
 }
 
 export function bridgeStoreStatus(error: BridgeStoreError): number {
+  if (error.code === 'WORKSPACE_QUEUE_TIMEOUT') return 503;
   if (error.code === 'WORKER_QUEUE_FULL') return 429;
   if (error.code === 'WORKER_UNAUTHORIZED') return 403;
   if (error.code === 'ASSIGNMENT_INVALID') return 400;
@@ -48,14 +54,16 @@ export function bridgeStoreStatus(error: BridgeStoreError): number {
 }
 
 export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions): Router {
-  const queueBudgetMs = options.queueTimeoutMs ?? 30_000;
-  if (!Number.isSafeInteger(queueBudgetMs) || queueBudgetMs < 1 || queueBudgetMs > 30_000) {
-    throw new RangeError('Workspace queue timeout must be between 1 and 30000 milliseconds');
-  }
   if (options.timeoutMs !== undefined && (
     !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1
   )) {
     throw new RangeError('Workspace execution timeout must be a positive safe integer');
+  }
+  // A configured queue timeout is a ceiling. Legacy callers get 30 seconds even
+  // when their execution timeout is longer; only the per-request header opts in.
+  const queueCeilingMs = options.queueTimeoutMs ?? MAX_WORKSPACE_QUEUE_WAIT_MS;
+  if (!Number.isSafeInteger(queueCeilingMs) || queueCeilingMs < 1 || queueCeilingMs > MAX_WORKSPACE_QUEUE_WAIT_MS) {
+    throw new RangeError('Workspace queue timeout must be between 1 and 300000 milliseconds');
   }
   const router = Router();
 
@@ -80,13 +88,38 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
         });
         return;
       }
+      const advertisedQueueWait = req.header(WORKSPACE_QUEUE_WAIT_HEADER);
+      if (advertisedQueueWait !== undefined && !/^[1-9]\d*$/.test(advertisedQueueWait)) {
+        outcome.errorCode = 'INVALID_WORKSPACE_QUEUE_WAIT';
+        res.status(400).json({ error: 'Invalid workspace queue wait', code: 'INVALID_WORKSPACE_QUEUE_WAIT' });
+        return;
+      }
+      const requestedQueueWaitMs = advertisedQueueWait === undefined
+        ? DEFAULT_WORKSPACE_QUEUE_WAIT_MS
+        : Number(advertisedQueueWait);
+      if (!Number.isSafeInteger(requestedQueueWaitMs) || requestedQueueWaitMs > MAX_WORKSPACE_QUEUE_WAIT_MS) {
+        outcome.errorCode = 'INVALID_WORKSPACE_QUEUE_WAIT';
+        res.status(400).json({ error: 'Invalid workspace queue wait', code: 'INVALID_WORKSPACE_QUEUE_WAIT' });
+        return;
+      }
+      const queueBudgetMs = Math.min(requestedQueueWaitMs, queueCeilingMs);
       outcome.operation = req.body.operation;
-      const request: WorkspaceToolRequest = req.body.operation === 'execute_command'
-        ? { ...req.body, timeoutMs: Math.min(
-          req.body.timeoutMs ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+      const principalRequest: WorkspaceToolRequest = req.body.workspaceInstanceId == null
+        ? req.body
+        : {
+          ...req.body,
+          workspaceInstanceId: principalWorkspaceInstanceId({
+            instanceId: req.body.workspaceInstanceId,
+            tenantId: principal.tenantId,
+            principalId: principal.userId,
+          }),
+        };
+      const request: WorkspaceToolRequest = principalRequest.operation === 'execute_command'
+        ? { ...principalRequest, timeoutMs: Math.min(
+          principalRequest.timeoutMs ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
           options.timeoutMs ?? Number.MAX_SAFE_INTEGER,
         ) }
-        : req.body;
+        : principalRequest;
       const executionBudgetMs = request.operation === 'execute_command'
         ? request.timeoutMs! + 5_000
         : Math.min(options.timeoutMs ?? 30_000, 30_000);
@@ -172,6 +205,7 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
       } catch (error) {
         if (error instanceof BridgeStoreError) {
           outcome.errorCode = error.code;
+          if (error.code === 'WORKSPACE_QUEUE_TIMEOUT') res.setHeader('Retry-After', '1');
           res.status(bridgeStoreStatus(error)).json({
             error: error.message,
             code: error.code,

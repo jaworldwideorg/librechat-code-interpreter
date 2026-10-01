@@ -1,10 +1,19 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import {
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, test } from 'bun:test';
 import { extractPendingFromStdout, type LCTool } from './preamble';
-import { generateBashReplayPostamble, generateBashReplayPreamble } from './preamble-bash';
+import {
+    generateBashReplayPostamble,
+    generateBashReplayPreamble,
+} from './preamble-bash';
 
 interface BashRunResult {
   stdout: string;
@@ -60,9 +69,13 @@ function assemble(userCode: string, toolSet: LCTool[] = tools): string {
   ].join('\n');
 }
 
-function runBash(script: string, options: number | BashRunOptions = {}): BashRunResult {
-  const timeoutMs = typeof options === 'number' ? options : options.timeoutMs ?? 3000;
-  const history = typeof options === 'number' ? {} : options.history ?? {};
+function runBash(
+    script: string,
+    options: number | BashRunOptions = {},
+): BashRunResult {
+    const timeoutMs =
+        typeof options === 'number' ? options : (options.timeoutMs ?? 3000);
+    const history = typeof options === 'number' ? {} : (options.history ?? {});
   const dir = mkdtempSync(join(tmpdir(), 'ptc-bash-unit-'));
   const file = join(dir, 'main.sh');
   const historyPath = join(dir, 'history.json');
@@ -99,46 +112,144 @@ function pendingNames(stdout: string): string[] {
   return (parsed.pending ?? []).map(call => call.tool_name).sort();
 }
 
+describe('generateBashReplayPreamble - private runtime directory', () => {
+  test('creates every replay tempfile beneath TMPDIR', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ptc-bash-private-tmp-'));
+    const dataDir = join(dir, 'data');
+    const runtimeDir = join(dir, 'runtime');
+    const file = join(dir, 'main.sh');
+    const historyPath = join(dataDir, 'history.json');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(historyPath, '{}');
+    writeFileSync(
+      file,
+      assemble(`
+printf '%s\\n' "$_PTC_PENDING_FILE" "$_PTC_ERROR_FILE" "$_PTC_COUNTER_FILE"
+`),
+      { mode: 0o755 },
+    );
+
+    try {
+      const stdout = execFileSync('bash', [file], {
+        env: {
+          ...process.env,
+          PTC_HISTORY_PATH: historyPath,
+          TMPDIR: runtimeDir,
+        },
+        encoding: 'utf8',
+      });
+      const paths = stdout.trim().split('\n');
+      expect(paths).toHaveLength(3);
+            expect(
+                paths.every(value => value.startsWith(`${runtimeDir}/`)),
+            ).toBe(true);
+            expect(
+                generateBashReplayPreamble({ executionId, tools }),
+            ).not.toContain('mktemp -t');
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('persists pending calls through the private native control path', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'ptc-bash-control-'));
+        const file = join(dir, 'main.sh');
+        const historyPath = join(dir, 'history.json');
+        const controlPath = join(dir, 'control.json');
+        writeFileSync(file, assemble(`get_weather '{"city":"Paris"}'`), {
+            mode: 0o755,
+        });
+        writeFileSync(historyPath, '{}');
+        try {
+            execFileSync('bash', [file], {
+                env: {
+                    ...process.env,
+                    PTC_HISTORY_PATH: historyPath,
+                    LIBRECHAT_CODE_CONTROL_PATH: controlPath,
+                    TMPDIR: dir,
+                },
+                encoding: 'utf8',
+            });
+            expect(JSON.parse(readFileSync(controlPath, 'utf8'))).toMatchObject(
+                {
+                    pending: [
+                        {
+                            call_id: 'call_001',
+                            tool_name: 'get_weather',
+                            input: { city: 'Paris' },
+                        },
+                    ],
+                },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('uses the trusted jq path instead of resolving jq through PATH', () => {
+    const preamble = generateBashReplayPreamble({ executionId, tools });
+    expect(preamble).toContain(
+      '_PTC_JQ_PATH="${LIBRECHAT_CODE_JQ_PATH:-jq}"',
+    );
+    expect(preamble).not.toMatch(/(^|[|;(]\s*)jq\s/m);
+  });
+});
+
 describe('generateBashReplayPreamble - command substitution pending emission', () => {
   test('emits ClickHouse-style object input with SQL quotes from double-quoted JSON', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(
+                `
 SVC="45886e06-932b-4cff-bb49-3f7281d80717"
 result=$(run_select_query_mcp_ClickHouse "{\\"serviceId\\":\\"$SVC\\",\\"query\\":\\"SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c FROM system.columns WHERE database='default' AND table='uk_prices_3' AND tempAvg != -9999\\"}")
 echo "AFTER: $result"
-`, [clickHouseTool]));
+`,
+                [clickHouseTool],
+            ),
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.exitCode).toBe(0);
     expect(parsed.pending).toHaveLength(1);
-    expect(parsed.pending?.[0]?.tool_name).toBe('run_select_query_mcp_ClickHouse');
+        expect(parsed.pending?.[0]?.tool_name).toBe(
+            'run_select_query_mcp_ClickHouse',
+        );
     expect(parsed.pending?.[0]?.input).toEqual({
       serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
-      query:
-        "SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c FROM system.columns WHERE database='default' AND table='uk_prices_3' AND tempAvg != -9999",
+            query: "SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c FROM system.columns WHERE database='default' AND table='uk_prices_3' AND tempAvg != -9999",
     });
     expect(parsed.stdout).not.toContain('AFTER');
   });
 
   test('emits ClickHouse-style object input with shell-escaped SQL quotes', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(
+                `
 result=$(run_select_query_mcp_ClickHouse '{"serviceId":"45886e06-932b-4cff-bb49-3f7281d80717","query":"SELECT name, type FROM system.columns WHERE database='"'"'default'"'"' AND table='"'"'uk_prices_3'"'"' ORDER BY position"}')
 echo "AFTER: $result"
-`, [clickHouseTool]));
+`,
+                [clickHouseTool],
+            ),
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.exitCode).toBe(0);
     expect(parsed.pending).toHaveLength(1);
-    expect(parsed.pending?.[0]?.tool_name).toBe('run_select_query_mcp_ClickHouse');
+        expect(parsed.pending?.[0]?.tool_name).toBe(
+            'run_select_query_mcp_ClickHouse',
+        );
     expect(parsed.pending?.[0]?.input).toEqual({
       serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
-      query:
-        "SELECT name, type FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position",
+            query: "SELECT name, type FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position",
     });
     expect(parsed.stdout).not.toContain('AFTER');
   });
 
   test('batches parallel ClickHouse-style command substitutions into one pending block', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(
+                `
 SVC="45886e06-932b-4cff-bb49-3f7281d80717"
 
 {
@@ -158,7 +269,11 @@ SVC="45886e06-932b-4cff-bb49-3f7281d80717"
 
 wait
 echo "AFTER"
-`, [clickHouseTool]), 3000);
+`,
+                [clickHouseTool],
+            ),
+            3000,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.exitCode).toBe(0);
@@ -168,7 +283,11 @@ echo "AFTER"
       'run_select_query_mcp_ClickHouse',
       'run_select_query_mcp_ClickHouse',
     ]);
-    expect(parsed.pending?.map(call => (call.input as { query: string }).query).sort()).toEqual([
+        expect(
+            parsed.pending
+                ?.map(call => (call.input as { query: string }).query)
+                .sort(),
+        ).toEqual([
       "SELECT name, engine, total_rows, formatReadableSize(total_bytes) AS size, sorting_key, partition_key FROM system.tables WHERE database='default' AND name IN ('uk_prices_3','weather_noaa_mt')",
       "SELECT name, type, comment FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position",
       "SELECT name, type, comment FROM system.columns WHERE database='default' AND table='weather_noaa_mt' ORDER BY position",
@@ -177,12 +296,14 @@ echo "AFTER"
   });
 
   test('emits a command-substitution tool call before later user code while another job is running', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 sleep 0.2 &
 result=$(get_weather '{"city":"Madrid"}')
 echo "AFTER: $result"
 wait
-`));
+`),
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -194,12 +315,15 @@ wait
   });
 
   test('batches background and command-substitution tool calls before command-substitution side effects', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Oslo"}' &
 result=$(calculate '{"expression":"2+3"}')
 echo "SIDE_EFFECT: $result"
 wait
-`), 1500);
+`),
+            1500,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -210,10 +334,13 @@ wait
   });
 
   test('waits for background compound commands that invoke tools later', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 (sleep 0.2; get_weather '{"city":"Paris"}') &
 echo "AFTER LAUNCH"
-`), 1500);
+`),
+            1500,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -225,10 +352,13 @@ echo "AFTER LAUNCH"
   });
 
   test('does not wait for unrelated background commands with tool names as arguments', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 bash -c 'sleep 2' get_weather &
 echo "DONE"
-`), 700);
+`),
+            700,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -238,14 +368,17 @@ echo "DONE"
   });
 
   test('does not treat arithmetic expansion as command substitution while batching background tools', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Oslo"}' &
 sleep 0.1
 x=$((1+1))
 calculate '{"expression":"2+3"}' &
 wait
 echo "DONE $x"
-`), 1500);
+`),
+            1500,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -256,12 +389,15 @@ echo "DONE $x"
   });
 
   test('handles backtick command substitution without waiting for unrelated background jobs', () => {
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 sleep 5 &
 result=\`get_weather '{"city":"Porto"}'\`
 echo "AFTER: $result"
 wait
-`), 1500);
+`),
+            1500,
+        );
 
     const parsed = extractPendingFromStdout(run.stdout, executionId);
     expect(run.signal).not.toBe('SIGTERM');
@@ -281,7 +417,10 @@ wait
 echo "DONE"
 `;
     const firstRun = runBash(assemble(userCode));
-    const firstParsed = extractPendingFromStdout(firstRun.stdout, executionId);
+        const firstParsed = extractPendingFromStdout(
+            firstRun.stdout,
+            executionId,
+        );
     expect(firstRun.exitCode).toBe(0);
     expect(firstParsed.pending).toHaveLength(2);
 
@@ -302,7 +441,10 @@ echo "DONE"
       }),
     );
     const replayRun = runBash(assemble(userCode), { history });
-    const replayParsed = extractPendingFromStdout(replayRun.stdout, executionId);
+        const replayParsed = extractPendingFromStdout(
+            replayRun.stdout,
+            executionId,
+        );
     expect(replayRun.exitCode).toBe(0);
     expect(replayParsed.pending).toBeNull();
     expect(replayParsed.stdout).toContain('"slot":"first"');
@@ -326,12 +468,15 @@ echo "DONE"
       },
     };
 
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Paris"}'
 printf '\\n'
 get_weather '{"city":"Paris"}'
 printf '\\nDONE\\n'
-`), { history });
+`),
+            { history },
+        );
     const parsed = extractPendingFromStdout(run.stdout, executionId);
 
     expect(run.exitCode).toBe(0);
@@ -352,12 +497,15 @@ printf '\\nDONE\\n'
       },
     };
 
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Paris"}'
 printf '\\n'
 calculate '{"expression":"2+3"}'
 printf '\\nDONE\\n'
-`), { history });
+`),
+            { history },
+        );
     const parsed = extractPendingFromStdout(run.stdout, executionId);
 
     expect(run.signal).not.toBe('SIGTERM');
@@ -385,12 +533,15 @@ printf '\\nDONE\\n'
       },
     };
 
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Paris"}'
 printf '\\n'
 calculate '{"expression":"2+3"}'
 printf '\\nDONE\\n'
-`), { history });
+`),
+            { history },
+        );
     const parsed = extractPendingFromStdout(run.stdout, executionId);
 
     expect(run.exitCode).toBe(0);
@@ -418,12 +569,15 @@ printf '\\nDONE\\n'
       },
     };
 
-    const run = runBash(assemble(`
+        const run = runBash(
+            assemble(`
 get_weather '{"city":"Paris"}'
 printf '\\n'
 calculate '{"expression":"2+3"}'
 printf '\\nDONE\\n'
-`), { history });
+`),
+            { history },
+        );
     const parsed = extractPendingFromStdout(run.stdout, executionId);
 
     expect(run.exitCode).toBe(0);

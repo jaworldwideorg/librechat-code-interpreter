@@ -421,6 +421,10 @@ fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
         "SANDBOX_COMPILE_TIMEOUT",
         "SANDBOX_DATA_DIRECTORY",
         "SANDBOX_DISABLE_NETWORKING",
+        "SANDBOX_HTTP_INPUT_CACHE_ENABLED",
+        "SANDBOX_HTTP_INPUT_CACHE_MAX_INFLIGHT",
+        "SANDBOX_HTTP_INPUT_CACHE_MAX_OBJECTS",
+        "SANDBOX_INPUT_CACHE_MAX_BYTES",
         "SANDBOX_EXECUTE_BODY_LIMIT",
         "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY",
         "SANDBOX_FORWARD_TARGET",
@@ -429,6 +433,7 @@ fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
         "SANDBOX_LOG_LEVEL",
         "SANDBOX_MAX_CONCURRENT_JOBS",
         "SANDBOX_MAX_FILE_SIZE",
+        "SANDBOX_MAX_INPUT_FILES",
         "SANDBOX_MAX_NESTING_DEPTH",
         "SANDBOX_MAX_OPEN_FILES",
         "SANDBOX_MAX_OUTPUT_FILES",
@@ -843,6 +848,13 @@ mod tests {
             "PATH",
         ] {
             assert!(is_allowed_guest_env_key(key, true), "{key} should enter the sandbox guest");
+        }
+    }
+
+    #[test]
+    fn guest_env_allowlist_forwards_input_file_limit_in_both_egress_modes() {
+        for egress_gateway_enabled in [false, true] {
+            assert!(is_allowed_guest_env_key("SANDBOX_MAX_INPUT_FILES", egress_gateway_enabled));
         }
     }
 

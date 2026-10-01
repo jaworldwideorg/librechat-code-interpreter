@@ -15,6 +15,10 @@
       "types": "./dist/protocol.d.ts",
       "import": "./dist/protocol.js"
     },
+    "./identity": {
+      "types": "./dist/identity.d.ts",
+      "import": "./dist/identity.js"
+    },
     "./worker": {
       "types": "./dist/worker.d.ts",
       "import": "./dist/worker.js"
@@ -34,6 +38,10 @@
     "./native-sandbox": {
       "types": "./dist/native-sandbox.d.ts",
       "import": "./dist/native-sandbox.js"
+    },
+    "./native-policy": {
+      "types": "./dist/native-policy.d.ts",
+      "import": "./dist/native-policy.js"
     },
     "./github": {
       "types": "./dist/github.d.ts",
@@ -61,6 +69,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.75",
-    "koffi": "3.2.1"
+    "koffi": "3.2.1",
+    "yaml": "2.9.1"
   }
 }

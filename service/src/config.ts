@@ -95,10 +95,17 @@ export function jobDeadlineAtMs(
   enqueuedAtMs: number | undefined,
   timeoutMs: number,
   nowMs: number = Date.now(),
+  producerDeadlineAtMs?: number,
 ): number {
-  return Number.isFinite(enqueuedAtMs) && (enqueuedAtMs as number) > 0
+  const localDeadline = Number.isFinite(enqueuedAtMs) && (enqueuedAtMs as number) > 0
     ? (enqueuedAtMs as number) + timeoutMs
     : nowMs + timeoutMs;
+  if (producerDeadlineAtMs === undefined) return localDeadline;
+  // A worker with a larger JOB_TIMEOUT must not outlive the admission fence
+  // retained by its API producer. Malformed explicit deadlines fail closed.
+  return Number.isFinite(producerDeadlineAtMs)
+    ? Math.min(localDeadline, producerDeadlineAtMs)
+    : 0;
 }
 
 /** The worker stops user work at JOB_TIMEOUT, then may still need to terminate
@@ -318,6 +325,12 @@ export const env = {
   EGRESS_GATEWAY_REQUEST_TIMEOUT_MS: Number(process.env.EGRESS_GATEWAY_REQUEST_TIMEOUT_MS) || 30_000,
   EGRESS_GATEWAY_REVOKE_TIMEOUT_MS: Number(process.env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS) || 5_000,
   EGRESS_LEDGER_REQUIRED: process.env.CODEAPI_EGRESS_LEDGER_REQUIRED === 'true' || process.env.CODEAPI_HARDENED_SANDBOX_MODE === 'true',
+  FILE_METADATA_CONCURRENCY: Math.min(64, Math.max(1, Math.floor(Number(process.env.CODEAPI_FILE_METADATA_CONCURRENCY) || 1))),
+  FILE_OBJECT_INDEX_ENABLED: process.env.CODEAPI_FILE_OBJECT_INDEX_ENABLED === 'true',
+  INPUT_MANIFEST_MAX_FILES: Math.min(512, Math.max(1, Math.floor(Number(process.env.CODEAPI_INPUT_MANIFEST_MAX_FILES) || 512))),
+  INPUT_MANIFEST_CONCURRENCY: Math.min(64, Math.max(1, Math.floor(Number(process.env.CODEAPI_INPUT_MANIFEST_CONCURRENCY) || 8))),
+  INPUT_MANIFEST_TIMEOUT_MS: Math.max(1, Math.floor(Number(process.env.CODEAPI_INPUT_MANIFEST_TIMEOUT_MS) || 10000)),
+  EGRESS_LEDGER_COMPACT: process.env.CODEAPI_EGRESS_LEDGER_COMPACT === 'true',
   EGRESS_LEDGER_TTL_GRACE_SECONDS: Number(process.env.CODEAPI_EGRESS_LEDGER_TTL_GRACE_SECONDS) || 300,
   EGRESS_GRANT_SECRET: process.env.CODEAPI_EGRESS_GRANT_SECRET ?? '',
   EGRESS_GRANT_TTL_SECONDS: resolveEgressGrantTtlSeconds(process.env.EGRESS_GRANT_TTL_SECONDS, defaultJobTimeoutMs),
@@ -340,6 +353,12 @@ export const env = {
   // Files List Rate Limits
   FETCH_LIMIT_WINDOW: Number(process.env.FETCH_LIMIT_WINDOW) || 60 * 1000, // 1 minute
   FETCH_MAX_REQUESTS: Number(process.env.FETCH_MAX_REQUESTS) || 120, // 120 requests per minute
+  // File Delete Rate Limits. Fall back to the fetch settings so existing
+  // deployments keep their current limits while using an independent bucket.
+  DELETE_LIMIT_WINDOW:
+    Number(process.env.DELETE_LIMIT_WINDOW) || Number(process.env.FETCH_LIMIT_WINDOW) || 60 * 1000,
+  DELETE_MAX_REQUESTS:
+    Number(process.env.DELETE_MAX_REQUESTS) || Number(process.env.FETCH_MAX_REQUESTS) || 120,
   // Redis Key Cache Config
   SESSION_CACHE_TTL: Number(process.env.SESSION_CACHE_TTL) || 86400,
   /** TTL for the durable `session-owner:<session_id>` record that backs
@@ -407,6 +426,22 @@ export const env = {
   BRIDGE_AUTH_MODE: bridgeAuthMode,
   /** Enrollment and lease credential shared only with the configured worker. */
   BRIDGE_TOKEN: process.env.CODEAPI_BRIDGE_TOKEN ?? '',
+  /** Opt-in stable HTTPS origin of this Code API deployment (shared by all replicas). */
+  BRIDGE_RECOVERY_SERVER_ID: process.env.CODEAPI_BRIDGE_RECOVERY_SERVER_ID ?? '',
+  /** Zero preserves machine authorization until explicit revocation. */
+  BRIDGE_ENROLLMENT_TTL_SECONDS: Number(process.env.CODEAPI_BRIDGE_ENROLLMENT_TTL_SECONDS ?? 0),
+  BRIDGE_RECOVERY_CHALLENGE_TTL_SECONDS: Number(
+    process.env.CODEAPI_BRIDGE_RECOVERY_CHALLENGE_TTL_SECONDS ?? 60,
+  ),
+  BRIDGE_RECOVERY_MAX_CHALLENGES_PER_MINUTE: Number(
+    process.env.CODEAPI_BRIDGE_RECOVERY_MAX_CHALLENGES_PER_MINUTE ?? 12,
+  ),
+  BRIDGE_RECOVERY_MAX_ATTEMPTS_PER_MINUTE: Number(
+    process.env.CODEAPI_BRIDGE_RECOVERY_MAX_ATTEMPTS_PER_MINUTE ?? 30,
+  ),
+  BRIDGE_RECOVERY_MAX_UNTRUSTED_PER_MINUTE: Number(
+    process.env.CODEAPI_BRIDGE_RECOVERY_MAX_UNTRUSTED_PER_MINUTE ?? 240,
+  ),
   /**
    * Runtime session affinity for stateful sandbox backends.
    * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.

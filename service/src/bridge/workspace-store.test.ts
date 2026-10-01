@@ -2,8 +2,9 @@ import { afterEach, expect, test } from 'bun:test';
 import RedisMock from 'ioredis-mock';
 
 import type Redis from 'ioredis';
+import type { WorkspaceToolRequest } from '../../../packages/code/src/protocol';
 
-import { BRIDGE_PROTOCOL_VERSION } from '../../../packages/code/src/protocol';
+import { BRIDGE_PROTOCOL_VERSION, isValidBridgeWorkerCapabilities } from '../../../packages/code/src/protocol';
 import { RedisBridgeStore } from './store';
 
 const redis = new RedisMock() as unknown as Redis;
@@ -75,6 +76,123 @@ test('dispatches a workspace tool only to a worker advertising its workspace and
     status: 'fulfilled',
     result: { content: '# LibreChat' },
   });
+});
+
+for (const finalizationFails of [false, true]) test(`single-slot programmatic finalization retains the workspace fence (failure=${finalizationFails})`, async () => {
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['execute_command'],
+        programmaticLanguages: ['bash'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+  const body = {
+    language: 'bash',
+    version: '5.2',
+    session_id: 'session-1',
+    files: [{ name: 'main.sh', content: 'echo ready' }],
+  };
+  const completion = store.dispatch({
+    workerId: 'workspace-worker',
+    body,
+    headers: {},
+    workspaceId: 'primary',
+    deadlineAtMs: Date.now() + 5_000,
+    signal: new AbortController().signal,
+    finalize: async settlement => {
+      if (finalizationFails) throw new Error('artifact restoration failed');
+      return settlement;
+    },
+  });
+
+  const assignment = await store.lease('workspace-worker', incarnationId, 1_000);
+  expect(assignment).toMatchObject({
+    executionKind: 'workspace_programmatic',
+    workspaceId: 'primary',
+    request: { body },
+  });
+  await store.settle('workspace-worker', assignment?.assignmentId ?? '', {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    generation: assignment?.generation ?? 0,
+    leaseToken: assignment?.leaseToken ?? '',
+    incarnationId,
+    status: 'fulfilled',
+    result: {
+      session_id: 'session-1',
+      language: 'bash',
+      version: '5.2',
+      files: [],
+      run: {
+        stdout: 'ready\n',
+        stderr: '',
+        code: 0,
+        signal: null,
+        output: 'ready\n',
+        memory: null,
+        message: null,
+        status: null,
+        cpu_time: null,
+        wall_time: 0.01,
+      },
+    },
+  });
+
+  if (finalizationFails) {
+    await expect(completion).rejects.toThrow('artifact restoration failed');
+    await expect(store.dispatch({ workerId: 'workspace-worker', body, headers: {},
+      workspaceId: 'primary', deadlineAtMs: Date.now() + 1000,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: 'WORKSPACE_QUARANTINED' });
+    return;
+  }
+  await expect(completion).resolves.toMatchObject({
+    status: 'fulfilled',
+    result: { session_id: 'session-1' },
+  });
+});
+
+test('rejects programmatic execution without the workspace capability', async () => {
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['execute_command'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+
+  await expect(
+    store.dispatch({
+      workerId: 'workspace-worker',
+      body: {
+        language: 'bash',
+        version: '5.2',
+        session_id: 'session-2',
+        files: [{ name: 'main.sh', content: 'echo denied' }],
+      },
+      headers: {},
+      workspaceId: 'primary',
+      deadlineAtMs: Date.now() + 1_000,
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toMatchObject({ code: 'WORKER_MISMATCH' });
+  expect(await redis.keys('codeapi:bridge:v1:assignment:*')).toHaveLength(0);
 });
 
 test('drains an acknowledged workspace mutation cancellation before releasing it', async () => {
@@ -524,6 +642,131 @@ test('rejects fenced edits from workers without the negotiated feature', async (
     }),
   ).rejects.toMatchObject({ code: 'WORKER_MISMATCH' });
   expect(await redis.keys('codeapi:bridge:v1:assignment:*')).toHaveLength(0);
+});
+
+const featureGatedEdits: Array<[string, WorkspaceToolRequest]> = [
+  [
+    'tolerant matching',
+    {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'edit_file',
+      workspaceId: 'primary',
+      path: 'notes.txt',
+      matching: 'tolerant',
+      edits: [{ oldText: 'before', newText: 'after' }],
+    },
+  ],
+  [
+    'tolerant previews',
+    {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'preview_edit',
+      workspaceId: 'primary',
+      path: 'notes.txt',
+      matching: 'tolerant',
+      edits: [{ oldText: 'before', newText: 'after' }],
+    },
+  ],
+  [
+    'replaceAll edits',
+    {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'edit_file',
+      workspaceId: 'primary',
+      path: 'notes.txt',
+      edits: [{ oldText: 'before', newText: 'after', replaceAll: true }],
+    },
+  ],
+];
+
+test.each(featureGatedEdits)(
+  'rejects %s from workers without the negotiated feature',
+  async (_label, request) => {
+    await store.register({
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      workerId: 'workspace-worker',
+      incarnationId,
+      capabilities: {
+        statefulWorkspace: true,
+        sandboxProfile: 'nsjail',
+        runtimes: ['bash'],
+        workspaceTools: {
+          protocolVersion: BRIDGE_PROTOCOL_VERSION,
+          operations: ['preview_edit', 'edit_file'],
+          editFileModes: ['single', 'batch'],
+          editFileFeatures: ['expected_base_sha256'],
+          workspaces: [{ id: 'primary' }],
+        },
+      },
+    });
+
+    await expect(
+      store.dispatchWorkspaceTool({
+        workerId: 'workspace-worker',
+        request,
+        deadlineAtMs: Date.now() + 1_000,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toMatchObject({ code: 'WORKER_MISMATCH' });
+    expect(await redis.keys('codeapi:bridge:v1:assignment:*')).toHaveLength(0);
+  },
+);
+
+test('preview-only workers can dispatch negotiated tolerant and replace-all previews', async () => {
+  expect(isValidBridgeWorkerCapabilities({
+    statefulWorkspace: false,
+    sandboxProfile: 'native-srt',
+    runtimes: [],
+    workspaceTools: {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operations: ['preview_edit'],
+      editFileModes: ['single', 'batch'],
+      editFileFeatures: ['tolerant_match', 'replace_all'],
+      workspaces: [{ id: 'primary' }],
+    },
+  })).toBe(true);
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'native-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['preview_edit'],
+        editFileModes: ['single', 'batch'],
+        editFileFeatures: ['tolerant_match', 'replace_all'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+  const request = {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    operation: 'preview_edit' as const,
+    workspaceId: 'primary',
+    path: 'notes.txt',
+    matching: 'tolerant' as const,
+    edits: [{ oldText: 'before', newText: 'after', replaceAll: true }],
+  };
+  const completion = store.dispatchWorkspaceTool({
+    workerId: 'workspace-worker',
+    request,
+    deadlineAtMs: Date.now() + 5_000,
+    signal: new AbortController().signal,
+  });
+  const assignment = await store.lease('workspace-worker', incarnationId, 1_000);
+  expect(assignment).toMatchObject({ executionKind: 'workspace_tool', request });
+  await store.settle('workspace-worker', assignment!.assignmentId, {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    generation: assignment!.generation,
+    leaseToken: assignment!.leaseToken,
+    incarnationId,
+    status: 'rejected',
+    error: 'preview tested',
+  });
+  await expect(completion).resolves.toMatchObject({ status: 'rejected', error: 'preview tested' });
 });
 
 test('rejects batch previews from workers without the negotiated mode', async () => {

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export const BRIDGE_PROTOCOL_VERSION = 1 as const;
 export const BRIDGE_WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export const BRIDGE_SANDBOX_PROFILE_MAX_LENGTH = 128;
@@ -20,8 +22,289 @@ export const BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS = 5 * 60_000;
 export const BRIDGE_WORKSPACE_COMMAND_DEFAULT_OUTPUT_BYTES = 256 * 1024;
 export const BRIDGE_WORKSPACE_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024;
 export const BRIDGE_WORKSPACE_COMMAND_SIGNAL_MAX_LENGTH = 32;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILES = 100;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_INPUT_FILES =
+    BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILES - 2;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_TRANSFER_CONCURRENCY = 4;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_TRANSFER_TIMEOUT_MS = 30_000;
+
+/** Reserve a bounded share for all input/output batches, not per-file grants. */
+export function programmaticTransferReserveMs(jobTimeoutMs: number): number {
+  return Math.max(1, Math.floor(jobTimeoutMs / 3));
+}
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILE_BYTES = 10 * 1024 * 1024;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_HISTORY_BYTES = 40_000_000;
+export const BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_TOTAL_BYTES = 100 * 1024 * 1024;
+/** How long Code API drains a clean rejection after Stop cancels a workspace mutation. */
+export const BRIDGE_CANCELLED_WORKSPACE_SETTLEMENT_GRACE_MS = 5_000;
+
+/**
+ * Artifact names accepted by the hardened egress gateway. Keep this policy in
+ * the bridge protocol package so a remote worker can reject unsupported output
+ * locally instead of discovering the mismatch only after mutating a workspace.
+ */
+const BRIDGE_ARTIFACT_EXTENSIONS = new Set([
+    '.c',
+    '.cs',
+    '.cpp',
+    '.go',
+    '.java',
+    '.js',
+    '.kt',
+    '.kts',
+    '.lua',
+    '.php',
+    '.pl',
+    '.ps1',
+    '.py',
+    '.r',
+    '.rb',
+    '.rs',
+    '.scala',
+    '.sh',
+    '.sql',
+    '.swift',
+    '.ts',
+    '.jsx',
+    '.tsx',
+    '.groovy',
+    '.css',
+    '.htm',
+    '.html',
+    '.less',
+    '.sass',
+    '.scss',
+    '.svg',
+    '.svelte',
+    '.vue',
+    '.adoc',
+    '.asciidoc',
+    '.md',
+    '.rst',
+    '.tex',
+    '.txt',
+    '.wiki',
+    '.csv',
+    '.json',
+    '.bson',
+    '.json5',
+    '.jsonl',
+    '.parquet',
+    '.tsv',
+    '.xml',
+    '.yaml',
+    '.yml',
+    '.ics',
+    '.ical',
+    '.ifb',
+    '.icalendar',
+    '.conf',
+    '.env',
+    '.gitignore',
+    '.ini',
+    '.properties',
+    '.toml',
+    '.doc',
+    '.docx',
+    '.pdf',
+    '.ppt',
+    '.pptx',
+    '.xls',
+    '.xlsx',
+    '.odt',
+    '.ods',
+    '.odp',
+    '.rtf',
+    '.avif',
+    '.bmp',
+    '.gif',
+    '.ico',
+    '.jpeg',
+    '.jpg',
+    '.png',
+    '.tif',
+    '.tiff',
+    '.webp',
+    '.eot',
+    '.ttf',
+    '.woff',
+    '.woff2',
+    '.7z',
+    '.bz2',
+    '.gz',
+    '.gzip',
+    '.rar',
+    '.tar',
+    '.zip',
+    '.tf',
+    '.tfvars',
+    '.tfstate',
+    '.hcl',
+    '.dockerfile',
+    '.Dockerfile',
+    '.dockerignore',
+    '.helmignore',
+    '.helmfile',
+    '.jenkinsfile',
+    '.vagrantfile',
+    '.eslintrc',
+    '.prettierrc',
+    '.editorconfig',
+    '.nomad',
+    '.bat',
+    '.cmd',
+    '.deb',
+    '.log',
+    '.rpm',
+    '.vbs',
+]);
+
+function portableBasename(name: string): string {
+  return name.slice(name.lastIndexOf('/') + 1);
+}
+
+/** Apply the gateway's extension allowlist without importing service code. */
+export function isSupportedBridgeArtifactName(name: string): boolean {
+  const basename = portableBasename(name);
+  if (basename === '.dirkeep') return true;
+  const dot = basename.lastIndexOf('.');
+  const extension = dot > 0 ? basename.slice(dot).toLowerCase() : '';
+  const dottedBasename = `.${basename}`;
+  return (
+    (extension !== '' && BRIDGE_ARTIFACT_EXTENSIONS.has(extension)) ||
+    BRIDGE_ARTIFACT_EXTENSIONS.has(basename) ||
+    BRIDGE_ARTIFACT_EXTENSIONS.has(basename.toLowerCase()) ||
+    (extension === '' &&
+      (BRIDGE_ARTIFACT_EXTENSIONS.has(dottedBasename) ||
+        BRIDGE_ARTIFACT_EXTENSIONS.has(dottedBasename.toLowerCase())))
+  );
+}
+
+const BRIDGE_ARTIFACT_MEDIA_TYPES: Readonly<Record<string, string>> = {
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+  '.bz2': 'application/x-bzip2',
+  '.c': 'text/x-c',
+  '.conf': 'text/plain',
+  '.cpp': 'text/x-c++src',
+  '.css': 'text/css',
+  '.csv': 'text/csv',
+  '.doc': 'application/msword',
+    '.docx':
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.gif': 'image/gif',
+  '.gz': 'application/gzip',
+  '.gzip': 'application/gzip',
+  '.htm': 'text/html',
+  '.html': 'text/html',
+  '.ico': 'image/x-icon',
+  '.ics': 'text/calendar',
+  '.ifb': 'text/calendar',
+  '.ical': 'text/calendar',
+  '.icalendar': 'text/calendar',
+  '.ini': 'text/plain',
+  '.java': 'text/x-java-source',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript',
+  '.json': 'application/json',
+  '.json5': 'application/json5',
+  '.jsonl': 'application/x-ndjson',
+  '.jsx': 'text/jsx',
+  '.log': 'text/plain',
+  '.md': 'text/markdown',
+  '.odt': 'application/vnd.oasis.opendocument.text',
+  '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+  '.odp': 'application/vnd.oasis.opendocument.presentation',
+  '.parquet': 'application/vnd.apache.parquet',
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.ppt': 'application/vnd.ms-powerpoint',
+    '.pptx':
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.py': 'text/x-python',
+  '.rst': 'text/x-rst',
+  '.rtf': 'application/rtf',
+  '.sh': 'application/x-sh',
+  '.sql': 'application/sql',
+  '.svg': 'image/svg+xml',
+  '.tar': 'application/x-tar',
+  '.tex': 'application/x-tex',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+  '.toml': 'application/toml',
+  '.ts': 'text/typescript',
+  '.tsx': 'text/tsx',
+  '.tsv': 'text/tab-separated-values',
+  '.txt': 'text/plain',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.xls': 'application/vnd.ms-excel',
+    '.xlsx':
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xml': 'application/xml',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
+  '.zip': 'application/zip',
+};
+
+/** Infer a safe response media type from an already-validated artifact name. */
+export function bridgeArtifactMediaType(name: string): string {
+  const basename = portableBasename(name).toLowerCase();
+  const dot = basename.lastIndexOf('.');
+  const extension = dot > 0 ? basename.slice(dot) : basename;
+  return BRIDGE_ARTIFACT_MEDIA_TYPES[extension] ?? 'application/octet-stream';
+}
 
 export type BridgeProtocolVersion = typeof BRIDGE_PROTOCOL_VERSION;
+
+/** One path segment naming a linked worktree at `<root>/.worktrees/<name>`. */
+export const BRIDGE_LINKED_WORKTREE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export function isValidLinkedWorktreeName(value: unknown): value is string {
+    return (
+        typeof value === 'string' &&
+        BRIDGE_LINKED_WORKTREE_NAME_PATTERN.test(value) &&
+        !value.endsWith('.lock')
+    );
+}
+
+const LINKED_WORKTREE_KEY_PREFIX = '\0linked-worktree\0';
+
+/** Collision-free identity shared by scheduling and worker quarantine state.
+ * A linked worktree lane nests beneath the key of the checkout that owns it. */
+export function workspaceIsolationKey(
+    workspaceId: string,
+    instanceId?: string,
+    worktree?: string,
+): string {
+    const base = instanceId === undefined
+        ? workspaceId
+        : `\0git-worktree\0${workspaceId}\0${instanceId}`;
+    return worktree === undefined
+        ? base
+        : `${LINKED_WORKTREE_KEY_PREFIX}${base}\0${worktree}`;
+}
+
+/** The checkout key a linked-worktree lane nests beneath, or undefined for a root key.
+ * Scheduling treats a lane and its parent as conflicting; sibling lanes do not. */
+export function workspaceIsolationParent(key: string): string | undefined {
+    if (!key.startsWith(LINKED_WORKTREE_KEY_PREFIX)) return undefined;
+    const separator = key.lastIndexOf('\0');
+    return separator <= LINKED_WORKTREE_KEY_PREFIX.length
+        ? undefined
+        : key.slice(LINKED_WORKTREE_KEY_PREFIX.length, separator);
+}
+
+/** Two isolation keys may not execute concurrently when either nests the other. */
+export function workspaceIsolationKeysConflict(left: string, right: string): boolean {
+    return (
+        left === right ||
+        workspaceIsolationParent(left) === right ||
+        workspaceIsolationParent(right) === left
+    );
+}
 
 export type BridgeWorkspaceToolOperation =
   | 'read_file'
@@ -34,14 +317,49 @@ export type BridgeWorkspaceToolOperation =
 
 export type WorkspaceWriteFileMode = 'replace' | 'create';
 export type WorkspaceEditFileMode = 'single' | 'batch';
-export type WorkspaceEditFileFeature = 'expected_base_sha256';
+export type WorkspaceEditFileFeature =
+  | 'expected_base_sha256'
+  | 'tolerant_match'
+  | 'replace_all';
+/** Every edit feature this protocol version defines, for capability validation. */
+export const WORKSPACE_EDIT_FILE_FEATURES: readonly WorkspaceEditFileFeature[] = [
+  'expected_base_sha256',
+  'tolerant_match',
+  'replace_all',
+];
+/** `tolerant` falls back from exact matching to whitespace-tolerant strategies. */
+export type WorkspaceEditMatching = 'exact' | 'tolerant';
+export type WorkspaceEditMatchStrategy =
+  | 'exact'
+  | 'line-trimmed'
+  | 'whitespace-normalized'
+  | 'indentation-flexible';
+const WORKSPACE_EDIT_MATCH_STRATEGIES = new Set<WorkspaceEditMatchStrategy>([
+  'exact',
+  'line-trimmed',
+  'whitespace-normalized',
+  'indentation-flexible',
+]);
 export type WorkspaceListFileFeature = 'after_path';
+export type WorkspaceProgrammaticLanguage = 'bash';
 
 export interface BridgeWorkspaceDescriptor {
   id: string;
   name?: string;
+  instructions?: RepositoryInstructionDescriptor[];
   /** Optional per-workspace restriction. Omitted by protocol-v1 readers. */
   operations?: BridgeWorkspaceToolOperation[];
+  /** Worker-owned isolation schemes available beneath this selected root. */
+  workspaceInstances?: ['git_worktree'];
+  /** Scheduling scopes available beneath this root. `git_linked_worktree` gives each
+   * verified `.worktrees/<name>` linked worktree its own lane. */
+  workspaceScopes?: ['git_linked_worktree'];
+    environment?: {
+        fingerprint: string;
+        repo?: string;
+        ref?: string;
+        actions: string[];
+    };
 }
 
 export interface BridgeWorkspaceToolCapabilities {
@@ -56,15 +374,41 @@ export interface BridgeWorkspaceToolCapabilities {
   editFileFeatures?: WorkspaceEditFileFeature[];
   /** Omitted by workers that cannot continue a bounded file listing. */
   listFileFeatures?: WorkspaceListFileFeature[];
+  /** Languages that can execute PTC replay inside a selected workspace. */
+  programmaticLanguages?: WorkspaceProgrammaticLanguage[];
 }
 
 export interface WorkspaceReadFileRequest {
   protocolVersion: BridgeProtocolVersion;
   operation: 'read_file';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   path: string;
   startLine?: number;
   maxLines?: number;
+  /** Requests an exact bounded instruction snapshot, not a line-oriented file read. */
+  instructionSha256?: string;
+}
+
+export const REPOSITORY_INSTRUCTION_MAX_BYTES = 32 * 1024;
+export interface RepositoryInstructionDescriptor {
+  path: 'AGENTS.md' | 'CLAUDE.md';
+  /** Bytes in the bounded UTF-8 snapshot, whose digest is sha256. */
+  bytes: number;
+  sha256: string;
+  truncated: boolean;
+}
+
+export function isRepositoryInstructionDescriptor(value: unknown): value is RepositoryInstructionDescriptor {
+  if (value == null || typeof value !== 'object') return false;
+  const descriptor = value as Record<string, unknown>;
+  return Object.keys(descriptor).every(key => ['path', 'bytes', 'sha256', 'truncated'].includes(key)) &&
+    (descriptor.path === 'AGENTS.md' || descriptor.path === 'CLAUDE.md') &&
+    Number.isSafeInteger(descriptor.bytes) && Number(descriptor.bytes) >= 0 && Number(descriptor.bytes) <= REPOSITORY_INSTRUCTION_MAX_BYTES &&
+    typeof descriptor.sha256 === 'string' && /^[a-f0-9]{64}$/.test(descriptor.sha256) &&
+    typeof descriptor.truncated === 'boolean';
 }
 
 export interface WorkspaceReadFileResult {
@@ -83,6 +427,9 @@ export interface WorkspaceSearchTextRequest {
   protocolVersion: BridgeProtocolVersion;
   operation: 'search_text';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   query: string;
   path?: string;
   maxResults?: number;
@@ -107,6 +454,9 @@ export interface WorkspaceListFilesRequest {
   protocolVersion: BridgeProtocolVersion;
   operation: 'list_files';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   path?: string;
   maxResults?: number;
   /** Continue strictly after this canonical path from a previous page. */
@@ -127,6 +477,9 @@ export interface WorkspaceWriteFileRequest {
   protocolVersion: BridgeProtocolVersion;
   operation: 'write_file';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   path: string;
   content: string;
   /** False requires an atomic create and refuses to replace an existing file. */
@@ -146,13 +499,18 @@ interface WorkspaceEditFileRequestBase {
   protocolVersion: BridgeProtocolVersion;
   operation: 'edit_file';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   path: string;
   /** Refuses the mutation unless current file bytes match this preview revision. */
   expectedBaseSha256?: string;
+  /** Requires the `tolerant_match` edit feature. Omitted means `exact`. */
+  matching?: WorkspaceEditMatching;
 }
 
 export interface WorkspaceSingleEditFileRequest
-  extends WorkspaceEditFileRequestBase {
+    extends WorkspaceEditFileRequestBase {
   /** Legacy single-edit form. */
   oldText: string;
   /** Legacy single-edit form. */
@@ -161,7 +519,7 @@ export interface WorkspaceSingleEditFileRequest
 }
 
 export interface WorkspaceBatchEditFileRequest
-  extends WorkspaceEditFileRequestBase {
+    extends WorkspaceEditFileRequestBase {
   /** Ordered exact replacements applied atomically as one file mutation. */
   edits: WorkspaceTextEdit[];
   oldText?: never;
@@ -169,12 +527,21 @@ export interface WorkspaceBatchEditFileRequest
 }
 
 export type WorkspaceEditFileRequest =
-  | WorkspaceSingleEditFileRequest
-  | WorkspaceBatchEditFileRequest;
+    | WorkspaceSingleEditFileRequest
+    | WorkspaceBatchEditFileRequest;
 
 export interface WorkspaceTextEdit {
   oldText: string;
   newText: string;
+  /** Replaces every match instead of requiring exactly one. Requires `replace_all`. */
+  replaceAll?: boolean;
+}
+
+/** How one edit matched. Present only when the request set `matching` or `replaceAll`. */
+export interface WorkspaceEditMatch {
+  strategy: WorkspaceEditMatchStrategy;
+  /** Locations replaced; always 1 unless the edit set `replaceAll`. */
+  occurrences: number;
 }
 
 export interface WorkspaceEditFileResult {
@@ -182,34 +549,41 @@ export interface WorkspaceEditFileResult {
   operation: 'edit_file';
   workspaceId: string;
   path: string;
+  /** Number of edits applied, which is always the number requested. */
   replacements: number;
   bytesWritten: number;
+  matches?: WorkspaceEditMatch[];
 }
 
 interface WorkspacePreviewEditRequestBase {
   protocolVersion: BridgeProtocolVersion;
   operation: 'preview_edit';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   path: string;
+  /** Requires the `tolerant_match` edit feature. Omitted means `exact`. */
+  matching?: WorkspaceEditMatching;
 }
 
 export interface WorkspaceSinglePreviewEditRequest
-  extends WorkspacePreviewEditRequestBase {
+    extends WorkspacePreviewEditRequestBase {
   oldText: string;
   newText: string;
   edits?: never;
 }
 
 export interface WorkspaceBatchPreviewEditRequest
-  extends WorkspacePreviewEditRequestBase {
+    extends WorkspacePreviewEditRequestBase {
   edits: WorkspaceTextEdit[];
   oldText?: never;
   newText?: never;
 }
 
 export type WorkspacePreviewEditRequest =
-  | WorkspaceSinglePreviewEditRequest
-  | WorkspaceBatchPreviewEditRequest;
+    | WorkspaceSinglePreviewEditRequest
+    | WorkspaceBatchPreviewEditRequest;
 
 export interface WorkspacePreviewEditResult {
   protocolVersion: BridgeProtocolVersion;
@@ -221,12 +595,16 @@ export interface WorkspacePreviewEditResult {
   baseSha256: string;
   replacements: number;
   bytesWritten: number;
+  matches?: WorkspaceEditMatch[];
 }
 
 export interface WorkspaceExecuteCommandRequest {
   protocolVersion: BridgeProtocolVersion;
   operation: 'execute_command';
   workspaceId: string;
+  workspaceInstanceId?: string;
+  /** Linked worktree lane at `.worktrees/<name>`; paths and cwd are relative to it. */
+  worktree?: string;
   /** Shell source evaluated only inside the selected sandbox runtime. */
   command: string;
   /** Portable path relative to the workspace root; defaults to '.'. */
@@ -234,6 +612,7 @@ export interface WorkspaceExecuteCommandRequest {
   timeoutMs?: number;
   /** Aggregate UTF-8 stdout and stderr budget. */
   maxOutputBytes?: number;
+    environmentAction?: { name: string; fingerprint: string };
 }
 
 export interface WorkspaceExecuteCommandResult {
@@ -266,9 +645,12 @@ export type WorkspaceToolResult =
   | WorkspaceExecuteCommandResult;
 
 const WORKSPACE_READ_REQUEST_KEYS = new Set([
+  'instructionSha256',
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'path',
   'startLine',
   'maxLines',
@@ -277,6 +659,8 @@ const WORKSPACE_SEARCH_REQUEST_KEYS = new Set([
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'query',
   'path',
   'maxResults',
@@ -285,6 +669,8 @@ const WORKSPACE_LIST_REQUEST_KEYS = new Set([
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'path',
   'maxResults',
   'afterPath',
@@ -293,6 +679,8 @@ const WORKSPACE_WRITE_REQUEST_KEYS = new Set([
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'path',
   'content',
   'overwrite',
@@ -301,26 +689,36 @@ const WORKSPACE_EDIT_REQUEST_KEYS = new Set([
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'path',
   'oldText',
   'newText',
   'edits',
   'expectedBaseSha256',
+  'matching',
 ]);
 const WORKSPACE_PREVIEW_EDIT_REQUEST_KEYS = new Set([
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'path',
   'oldText',
   'newText',
   'edits',
+  'matching',
 ]);
-const WORKSPACE_TEXT_EDIT_KEYS = new Set(['oldText', 'newText']);
+const WORKSPACE_TEXT_EDIT_KEYS = new Set(['oldText', 'newText', 'replaceAll']);
+const WORKSPACE_EDIT_MATCH_KEYS = new Set(['strategy', 'occurrences']);
 const WORKSPACE_COMMAND_REQUEST_KEYS = new Set([
+    'environmentAction',
   'protocolVersion',
   'operation',
   'workspaceId',
+  'workspaceInstanceId',
+  'worktree',
   'command',
   'cwd',
   'timeoutMs',
@@ -367,6 +765,7 @@ const WORKSPACE_EDIT_RESULT_KEYS = new Set([
   'path',
   'replacements',
   'bytesWritten',
+  'matches',
 ]);
 const WORKSPACE_PREVIEW_EDIT_RESULT_KEYS = new Set([
   'protocolVersion',
@@ -378,6 +777,7 @@ const WORKSPACE_PREVIEW_EDIT_RESULT_KEYS = new Set([
   'baseSha256',
   'replacements',
   'bytesWritten',
+  'matches',
 ]);
 const WORKSPACE_COMMAND_RESULT_KEYS = new Set([
   'protocolVersion',
@@ -390,12 +790,7 @@ const WORKSPACE_COMMAND_RESULT_KEYS = new Set([
   'truncated',
   'timedOut',
 ]);
-const WORKSPACE_SEARCH_MATCH_KEYS = new Set([
-  'path',
-  'line',
-  'column',
-  'text',
-]);
+const WORKSPACE_SEARCH_MATCH_KEYS = new Set(['path', 'line', 'column', 'text']);
 
 export interface BridgeWorkerCapabilities {
   /** Opt-in protocol: maximum concurrently leased independent workspace roots. */
@@ -435,6 +830,12 @@ export interface BridgeWorkerRegistrationResponse {
   supportedWorkspaceEditFileFeatures?: WorkspaceEditFileFeature[];
   /** Listing features this Code API can safely route to a capability-aware worker. */
   supportedWorkspaceListFileFeatures?: WorkspaceListFileFeature[];
+  /** PTC languages this Code API can safely route into a selected workspace. */
+  supportedWorkspaceProgrammaticLanguages?: WorkspaceProgrammaticLanguage[];
+  /** Workspace isolation schemes this Code API understands and can route. */
+  supportedWorkspaceInstanceTypes?: ['git_worktree'];
+  /** Scheduling scopes this Code API can admit as independent lanes. */
+  supportedWorkspaceScopes?: ['git_linked_worktree'];
 }
 
 /** Administrator-visible liveness for a configured worker. Credentials,
@@ -445,6 +846,8 @@ export interface BridgeWorkerStatusResponse {
   online: boolean;
   ready: boolean;
   leaseExpiresInMs?: number;
+  /** Server-owned execution ceiling for workspace commands. Omitted by legacy servers. */
+  maxCommandTimeoutMs?: number;
   capabilities?: BridgeWorkerCapabilities;
 }
 
@@ -462,10 +865,70 @@ export interface BridgeWorkerCredentialResponse {
   expiresAt: string;
 }
 
+/** The enrolled machine signs this request before Code API issues a challenge. */
+export interface BridgeRecoveryChallengeRequest {
+  protocolVersion: BridgeProtocolVersion;
+  operation: 'credential.challenge';
+  serverId: string;
+  workerId: string;
+  timestamp: string;
+  nonce: string;
+  signature: string;
+}
+
+/** A short-lived, single-use challenge for an already enrolled machine key. */
+export interface BridgeRecoveryChallengeResponse {
+  protocolVersion: BridgeProtocolVersion;
+  operation: 'credential.recover';
+  serverId: string;
+  workerId: string;
+  enrollmentGeneration: string;
+  challenge: string;
+  expiresAt: string;
+}
+
+export interface BridgeRecoveryRequest extends BridgeRecoveryChallengeResponse {
+  signature: string;
+}
+
 export interface BridgeSandboxRequest<TBody = object> {
   body: TBody;
   headers: Record<string, string>;
 }
+
+export type BridgeProgrammaticPayloadFile =
+  | { name: string; content: string }
+  | {
+      name: string;
+      id: string;
+      storage_session_id: string;
+      input_cache_key?: string;
+    };
+
+export interface BridgeWorkspaceProgrammaticBody {
+  language: 'bash';
+  version: string;
+  workspace_instance_id?: string;
+  /** Linked worktree lane at `.worktrees/<name>` beneath the selected checkout. */
+  workspace_worktree?: string;
+    /** Stable identity shared by every replay iteration of one execution. */
+    execution_id?: string;
+    /** Declared replay tools; zero allows the worker to skip the probe pass. */
+    replay_tool_count?: number;
+  run_timeout?: number;
+  transfer_timeout_ms?: number;
+    /** Manifest-bound upload ceiling negotiated by Code API. */
+    max_output_files?: number;
+    /** Effective per-file upload ceiling negotiated by Code API. */
+    max_output_file_bytes?: number;
+  files: BridgeProgrammaticPayloadFile[];
+  session_id: string;
+  output_session_id?: string;
+  egress_grant?: string;
+}
+
+export type BridgeWorkspaceProgrammaticRequest =
+  BridgeSandboxRequest<BridgeWorkspaceProgrammaticBody>;
 
 export interface BridgeAssignment<TBody = object> {
   workspaceLeaseSlot?: number;
@@ -479,7 +942,9 @@ export interface BridgeAssignment<TBody = object> {
   /** Server-calculated execution budget at lease time; avoids VM clock skew. */
   remainingMs?: number;
   runtimeSessionId?: string;
-  executionKind?: 'sandbox' | 'workspace_tool';
+  executionKind?: 'sandbox' | 'workspace_tool' | 'workspace_programmatic';
+  /** Selected workspace for workspace-scoped programmatic execution. */
+  workspaceId?: string;
   request: BridgeSandboxRequest<TBody> | WorkspaceToolRequest;
 }
 
@@ -556,7 +1021,8 @@ export function isWorkspaceToolErrorCode(
 }
 
 export type BridgeSettlement<TResult = object> =
-  BridgeFulfilledSettlement<TResult> | BridgeRejectedSettlement;
+    | BridgeFulfilledSettlement<TResult>
+    | BridgeRejectedSettlement;
 
 export interface BridgeSettlementResponse {
   protocolVersion: BridgeProtocolVersion;
@@ -587,6 +1053,149 @@ export function isValidBridgeWorkerId(workerId: string): boolean {
   return BRIDGE_WORKER_ID_PATTERN.test(workerId);
 }
 
+export function isBridgeWorkspaceProgrammaticRequest(
+  value: unknown,
+): value is BridgeWorkspaceProgrammaticRequest {
+  if (typeof value !== 'object' || value === null) return false;
+  const request = value as Record<string, unknown>;
+  if (
+    typeof request.headers !== 'object' ||
+    request.headers === null ||
+        !Object.values(request.headers).every(
+            entry => typeof entry === 'string',
+        ) ||
+    typeof request.body !== 'object' ||
+    request.body === null
+  ) {
+    return false;
+  }
+  const body = request.body as Record<string, unknown>;
+  if (
+    body.language !== 'bash' ||
+    typeof body.version !== 'string' ||
+    body.version.length === 0 ||
+    body.version.length > BRIDGE_RUNTIME_MAX_LENGTH ||
+    (body.workspace_instance_id !== undefined &&
+      (typeof body.workspace_instance_id !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(body.workspace_instance_id))) ||
+    (body.workspace_worktree !== undefined &&
+      !isValidLinkedWorktreeName(body.workspace_worktree)) ||
+        (body.execution_id !== undefined &&
+            (typeof body.execution_id !== 'string' ||
+                !/^[A-Za-z0-9_-]{1,128}$/.test(body.execution_id))) ||
+        (body.replay_tool_count !== undefined &&
+            (!Number.isSafeInteger(body.replay_tool_count) ||
+                Number(body.replay_tool_count) < 0 ||
+                Number(body.replay_tool_count) > 256)) ||
+        (body.max_output_files !== undefined &&
+            (!Number.isSafeInteger(body.max_output_files) ||
+                Number(body.max_output_files) < 0 ||
+                Number(body.max_output_files) >
+                    BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILES)) ||
+        (body.max_output_file_bytes !== undefined &&
+            (!Number.isSafeInteger(body.max_output_file_bytes) ||
+                Number(body.max_output_file_bytes) < 1 ||
+                Number(body.max_output_file_bytes) >
+                    BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILE_BYTES)) ||
+    typeof body.session_id !== 'string' ||
+    body.session_id.length === 0 ||
+    body.session_id.length > 32_768 ||
+    /[\0\r\n]/.test(body.session_id) ||
+    (body.output_session_id !== undefined &&
+      (typeof body.output_session_id !== 'string' ||
+        body.output_session_id.length === 0 ||
+        body.output_session_id.length > 32_768 ||
+        /[\0\r\n]/.test(body.output_session_id))) ||
+    (body.egress_grant !== undefined &&
+      (typeof body.egress_grant !== 'string' ||
+        body.egress_grant.length === 0 ||
+        body.egress_grant.length > 256 * 1024)) ||
+    (body.transfer_timeout_ms !== undefined &&
+      (!Number.isSafeInteger(body.transfer_timeout_ms) ||
+        Number(body.transfer_timeout_ms) < 1 ||
+                Number(body.transfer_timeout_ms) >
+                    BRIDGE_WORKSPACE_PROGRAMMATIC_TRANSFER_TIMEOUT_MS)) ||
+    (body.run_timeout !== undefined &&
+      (!Number.isSafeInteger(body.run_timeout) ||
+        Number(body.run_timeout) < 1 ||
+                Number(body.run_timeout) >
+                    BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS)) ||
+    !Array.isArray(body.files) ||
+    body.files.length < 1 ||
+    body.files.length > BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILES
+  ) {
+    return false;
+  }
+  let inlineBytes = 0;
+  const names = new Set<string>();
+  for (const rawFile of body.files) {
+    if (typeof rawFile !== 'object' || rawFile === null) return false;
+    const file = rawFile as Record<string, unknown>;
+    if (
+      !isSafePortableRelativePath(file.name) ||
+      file.name === '.' ||
+            portableBasename(file.name).toLowerCase() ===
+                '_ptc_pending_result.json' ||
+      normalizePortableRelativePath(file.name) !== file.name ||
+      names.has(file.name)
+    ) {
+      return false;
+    }
+    names.add(file.name);
+    if (typeof file.content === 'string') {
+      inlineBytes += Buffer.byteLength(file.content);
+      if (
+                Object.keys(file).some(
+                    key => key !== 'name' && key !== 'content',
+                ) ||
+                Buffer.byteLength(file.content) >
+                    (file.name === '_ptc_history.json'
+                        ? BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_HISTORY_BYTES
+                        : BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILE_BYTES)
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (
+      typeof file.id !== 'string' ||
+      file.id.length === 0 ||
+      file.id.length > 32_768 ||
+      /[\0\r\n]/.test(file.id) ||
+      typeof file.storage_session_id !== 'string' ||
+      file.storage_session_id.length === 0 ||
+      file.storage_session_id.length > 32_768 ||
+      /[\0\r\n]/.test(file.storage_session_id) ||
+      Object.keys(file).some(
+                key =>
+          key !== 'name' &&
+          key !== 'id' &&
+          key !== 'storage_session_id' &&
+          key !== 'input_cache_key',
+      ) ||
+      (file.input_cache_key !== undefined &&
+        (typeof file.input_cache_key !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(file.input_cache_key)))
+    ) {
+      return false;
+    }
+  }
+  for (const name of names) {
+    const segments = name.split('/');
+    let ancestor = '';
+    for (let index = 0; index < segments.length - 1; index += 1) {
+            ancestor = ancestor
+                ? `${ancestor}/${segments[index]}`
+                : segments[index]!;
+      if (names.has(ancestor)) return false;
+    }
+  }
+  return (
+    names.has('main.sh') &&
+    inlineBytes <= BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_TOTAL_BYTES
+  );
+}
+
 export function isSafePortableRelativePath(value: unknown): value is string {
   if (
     typeof value !== 'string' ||
@@ -600,20 +1209,23 @@ export function isSafePortableRelativePath(value: unknown): value is string {
   ) {
     return false;
   }
-  return value.split('/').every((segment) => segment !== '..');
+    return value.split('/').every(segment => segment !== '..');
 }
 
 function normalizePortableRelativePath(value: string): string {
   return (
     value
       .split('/')
-      .filter((segment) => segment.length > 0 && segment !== '.')
+            .filter(segment => segment.length > 0 && segment !== '.')
       .join('/') || '.'
   );
 }
 
 /** Compare path segments in ripgrep's sorted, depth-first traversal order. */
-export function comparePortableRelativePaths(left: string, right: string): number {
+export function comparePortableRelativePaths(
+    left: string,
+    right: string,
+): number {
   const encoder = new TextEncoder();
   const leftSegments = left.split('/');
   const rightSegments = right.split('/');
@@ -643,9 +1255,59 @@ function isWithinRequestedPath(candidate: string, requested?: string): boolean {
   );
 }
 
-function isValidWorkspaceEditRequest(request: Record<string, unknown>): boolean {
+/** Whether a request asked for per-edit match reporting (and so must receive it). */
+export function workspaceEditRequestReportsMatches(
+  request: WorkspaceEditFileRequest | WorkspacePreviewEditRequest,
+): boolean {
+  return (
+    request.matching !== undefined ||
+    (request.edits?.some((edit) => edit.replaceAll !== undefined) ?? false)
+  );
+}
+
+function isValidWorkspaceEditMatches(
+  request: WorkspaceEditFileRequest | WorkspacePreviewEditRequest,
+  matches: unknown,
+): boolean {
+  if (!workspaceEditRequestReportsMatches(request)) return matches === undefined;
+  const edits: WorkspaceTextEdit[] = request.edits ?? [
+    { oldText: request.oldText ?? '', newText: request.newText ?? '' },
+  ];
+  return (
+    Array.isArray(matches) &&
+    matches.length === edits.length &&
+    matches.every((match: unknown, index) => {
+      if (typeof match !== 'object' || match === null) return false;
+      const candidate = match as Record<string, unknown>;
+      return (
+        hasOnlyKeys(candidate, WORKSPACE_EDIT_MATCH_KEYS) &&
+        WORKSPACE_EDIT_MATCH_STRATEGIES.has(
+          candidate.strategy as WorkspaceEditMatchStrategy,
+        ) &&
+        (request.matching === 'tolerant' || candidate.strategy === 'exact') &&
+        Number.isSafeInteger(candidate.occurrences) &&
+        Number(candidate.occurrences) >= 1 &&
+        (edits[index]?.replaceAll === true || candidate.occurrences === 1)
+      );
+    })
+  );
+}
+
+function isValidWorkspaceEditRequest(
+    request: Record<string, unknown>,
+): boolean {
   const hasBatch = request.edits !== undefined;
-  if (hasBatch && (request.oldText !== undefined || request.newText !== undefined)) {
+    if (
+        hasBatch &&
+        (request.oldText !== undefined || request.newText !== undefined)
+    ) {
+    return false;
+  }
+  if (
+    request.matching !== undefined &&
+    request.matching !== 'exact' &&
+    request.matching !== 'tolerant'
+  ) {
     return false;
   }
   const edits = hasBatch
@@ -663,7 +1325,10 @@ function isValidWorkspaceEditRequest(request: Record<string, unknown>): boolean 
     if (
       typeof edit !== 'object' ||
       edit === null ||
-      !hasOnlyKeys(edit as Record<string, unknown>, WORKSPACE_TEXT_EDIT_KEYS)
+            !hasOnlyKeys(
+                edit as Record<string, unknown>,
+                WORKSPACE_TEXT_EDIT_KEYS,
+            )
     ) {
       return false;
     }
@@ -671,9 +1336,13 @@ function isValidWorkspaceEditRequest(request: Record<string, unknown>): boolean 
     if (
       typeof candidate.oldText !== 'string' ||
       candidate.oldText.length === 0 ||
-      Buffer.from(candidate.oldText).toString('utf8') !== candidate.oldText ||
+            Buffer.from(candidate.oldText).toString('utf8') !==
+                candidate.oldText ||
       typeof candidate.newText !== 'string' ||
-      Buffer.from(candidate.newText).toString('utf8') !== candidate.newText
+            Buffer.from(candidate.newText).toString('utf8') !==
+                candidate.newText ||
+      (candidate.replaceAll !== undefined &&
+        typeof candidate.replaceAll !== 'boolean')
     ) {
       return false;
     }
@@ -696,7 +1365,7 @@ function hasOnlyKeys(
   value: Record<string, unknown>,
   allowed: ReadonlySet<string>,
 ): boolean {
-  return Object.keys(value).every((key) => allowed.has(key));
+    return Object.keys(value).every(key => allowed.has(key));
 }
 
 export function isWorkspaceToolRequest(
@@ -707,11 +1376,21 @@ export function isWorkspaceToolRequest(
   if (
     request.protocolVersion !== BRIDGE_PROTOCOL_VERSION ||
     typeof request.workspaceId !== 'string' ||
-    !isValidBridgeWorkerId(request.workspaceId)
+    !isValidBridgeWorkerId(request.workspaceId) ||
+    (request.workspaceInstanceId !== undefined &&
+      (typeof request.workspaceInstanceId !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(request.workspaceInstanceId))) ||
+    (request.worktree !== undefined && !isValidLinkedWorktreeName(request.worktree))
   ) {
     return false;
   }
   if (request.operation === 'read_file') {
+    if (request.instructionSha256 !== undefined) {
+      return hasOnlyKeys(request, WORKSPACE_READ_REQUEST_KEYS) &&
+        typeof request.instructionSha256 === 'string' && /^[a-f0-9]{64}$/.test(request.instructionSha256) &&
+        (request.path === 'AGENTS.md' || request.path === 'CLAUDE.md') &&
+        request.startLine === undefined && request.maxLines === undefined;
+    }
     return (
       hasOnlyKeys(request, WORKSPACE_READ_REQUEST_KEYS) &&
       isSafePortableRelativePath(request.path) &&
@@ -721,7 +1400,8 @@ export function isWorkspaceToolRequest(
       (request.maxLines === undefined ||
         (Number.isSafeInteger(request.maxLines) &&
           Number(request.maxLines) >= 1 &&
-          Number(request.maxLines) <= BRIDGE_WORKSPACE_READ_MAX_LINES))
+                    Number(request.maxLines) <=
+                        BRIDGE_WORKSPACE_READ_MAX_LINES))
     );
   }
   if (request.operation === 'search_text') {
@@ -741,7 +1421,8 @@ export function isWorkspaceToolRequest(
       (request.maxResults === undefined ||
         (Number.isSafeInteger(request.maxResults) &&
           Number(request.maxResults) >= 1 &&
-          Number(request.maxResults) <= BRIDGE_WORKSPACE_SEARCH_MAX_RESULTS))
+                    Number(request.maxResults) <=
+                        BRIDGE_WORKSPACE_SEARCH_MAX_RESULTS))
     );
   }
   if (request.operation === 'list_files') {
@@ -751,12 +1432,14 @@ export function isWorkspaceToolRequest(
         isSafePortableRelativePath(request.path)) &&
       (request.afterPath === undefined ||
         (isSafePortableRelativePath(request.afterPath) &&
-          normalizePortableRelativePath(request.afterPath) === request.afterPath &&
+                    normalizePortableRelativePath(request.afterPath) ===
+                        request.afterPath &&
           isWithinRequestedPath(request.afterPath, request.path))) &&
       (request.maxResults === undefined ||
         (Number.isSafeInteger(request.maxResults) &&
           Number(request.maxResults) >= 1 &&
-          Number(request.maxResults) <= BRIDGE_WORKSPACE_LIST_MAX_RESULTS))
+                    Number(request.maxResults) <=
+                        BRIDGE_WORKSPACE_LIST_MAX_RESULTS))
     );
   }
   if (request.operation === 'write_file') {
@@ -790,6 +1473,22 @@ export function isWorkspaceToolRequest(
   }
   if (request.operation === 'execute_command') {
     return (
+            (request.environmentAction === undefined ||
+                (typeof request.environmentAction === 'object' &&
+                    request.environmentAction !== null &&
+                    Object.keys(request.environmentAction).length === 2 &&
+                    typeof (request.environmentAction as { name?: unknown })
+                        .name === 'string' &&
+                    /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(
+                        (request.environmentAction as { name: string }).name,
+                    ) &&
+                    typeof (
+                        request.environmentAction as { fingerprint?: unknown }
+                    ).fingerprint === 'string' &&
+                    /^[a-f0-9]{64}$/.test(
+                        (request.environmentAction as { fingerprint: string })
+                            .fingerprint,
+                    ))) &&
       hasOnlyKeys(request, WORKSPACE_COMMAND_REQUEST_KEYS) &&
       typeof request.command === 'string' &&
       request.command.trim().length > 0 &&
@@ -797,7 +1496,8 @@ export function isWorkspaceToolRequest(
       !request.command.includes('\0') &&
       new TextEncoder().encode(request.command).byteLength <=
         BRIDGE_WORKSPACE_COMMAND_MAX_BYTES &&
-      (request.cwd === undefined || isSafePortableRelativePath(request.cwd)) &&
+            (request.cwd === undefined ||
+                isSafePortableRelativePath(request.cwd)) &&
       (request.timeoutMs === undefined ||
         (Number.isSafeInteger(request.timeoutMs) &&
           Number(request.timeoutMs) >= 1 &&
@@ -834,15 +1534,28 @@ export function isWorkspaceToolResult(
   }
 
   if (request.operation === 'read_file') {
+    if (request.instructionSha256 !== undefined) {
+      return hasOnlyKeys(result, WORKSPACE_READ_RESULT_KEYS) && result.path === request.path &&
+        typeof result.content === 'string' && new TextEncoder().encode(result.content).byteLength <= REPOSITORY_INSTRUCTION_MAX_BYTES &&
+        createHash('sha256').update(result.content).digest('hex') === request.instructionSha256 &&
+        result.startLine === 1 && result.endLine === result.content.split('\n').length &&
+        result.nextStartLine === undefined;
+    }
     const startLine = request.startLine ?? 1;
     const maxLines = request.maxLines ?? 200;
-    const content = typeof result.content === 'string' ? result.content : null;
+        const content =
+            typeof result.content === 'string' ? result.content : null;
     const reportedLineCount =
-      Number.isSafeInteger(result.endLine) && Number(result.endLine) >= startLine - 1
+            Number.isSafeInteger(result.endLine) &&
+            Number(result.endLine) >= startLine - 1
         ? Number(result.endLine) - startLine + 1
         : -1;
     const actualLineCount =
-      content === null ? -1 : content.length === 0 ? reportedLineCount : content.split('\n').length;
+            content === null
+                ? -1
+                : content.length === 0
+                  ? reportedLineCount
+                  : content.split('\n').length;
     return (
       hasOnlyKeys(result, WORKSPACE_READ_RESULT_KEYS) &&
       result.path === request.path &&
@@ -897,7 +1610,10 @@ export function isWorkspaceToolResult(
         (enforcesPaginationContract &&
           (normalizedPath !== path ||
             (previousPath !== undefined &&
-              comparePortableRelativePaths(normalizedPath, previousPath) <= 0)))
+                            comparePortableRelativePaths(
+                                normalizedPath,
+                                previousPath,
+                            ) <= 0)))
       ) {
         return false;
       }
@@ -907,7 +1623,8 @@ export function isWorkspaceToolResult(
     if (!enforcesPaginationContract) {
       return result.nextAfterPath === undefined;
     }
-    if (result.truncated !== true) return result.nextAfterPath === undefined;
+        if (result.truncated !== true)
+            return result.nextAfterPath === undefined;
     return (
       result.paths.length > 0 &&
       result.nextAfterPath === result.paths[result.paths.length - 1]
@@ -934,13 +1651,15 @@ export function isWorkspaceToolResult(
       result.replacements === replacements &&
       Number.isSafeInteger(result.bytesWritten) &&
       Number(result.bytesWritten) >= 0 &&
-      Number(result.bytesWritten) <= BRIDGE_WORKSPACE_WRITE_MAX_BYTES
+      Number(result.bytesWritten) <= BRIDGE_WORKSPACE_WRITE_MAX_BYTES &&
+      isValidWorkspaceEditMatches(request, result.matches)
     );
   }
 
   if (request.operation === 'preview_edit') {
     const replacements = request.edits?.length ?? 1;
-    const content = typeof result.content === 'string' ? result.content : null;
+        const content =
+            typeof result.content === 'string' ? result.content : null;
     return (
       hasOnlyKeys(result, WORKSPACE_PREVIEW_EDIT_RESULT_KEYS) &&
       result.path === request.path &&
@@ -954,7 +1673,8 @@ export function isWorkspaceToolResult(
       Number(result.bytesWritten) ===
         new TextEncoder().encode(content).byteLength +
           (result.hasUtf8Bom ? 3 : 0) &&
-      Number(result.bytesWritten) <= BRIDGE_WORKSPACE_WRITE_MAX_BYTES
+      Number(result.bytesWritten) <= BRIDGE_WORKSPACE_WRITE_MAX_BYTES &&
+      isValidWorkspaceEditMatches(request, result.matches)
     );
   }
 
@@ -962,7 +1682,8 @@ export function isWorkspaceToolResult(
     const stdout = typeof result.stdout === 'string' ? result.stdout : null;
     const stderr = typeof result.stderr === 'string' ? result.stderr : null;
     const outputLimit =
-      request.maxOutputBytes ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_OUTPUT_BYTES;
+            request.maxOutputBytes ??
+            BRIDGE_WORKSPACE_COMMAND_DEFAULT_OUTPUT_BYTES;
     return (
       hasOnlyKeys(result, WORKSPACE_COMMAND_RESULT_KEYS) &&
       stdout !== null &&
@@ -978,7 +1699,8 @@ export function isWorkspaceToolResult(
           Number(result.exitCode) <= 255)) &&
       (result.signal === undefined ||
         (typeof result.signal === 'string' &&
-          result.signal.length <= BRIDGE_WORKSPACE_COMMAND_SIGNAL_MAX_LENGTH &&
+                    result.signal.length <=
+                        BRIDGE_WORKSPACE_COMMAND_SIGNAL_MAX_LENGTH &&
           /^SIG[A-Z0-9]+$/.test(result.signal))) &&
       typeof result.truncated === 'boolean' &&
       typeof result.timedOut === 'boolean' &&
@@ -993,7 +1715,7 @@ export function isWorkspaceToolResult(
   return (
     hasOnlyKeys(result, WORKSPACE_SEARCH_RESULT_KEYS) &&
     result.matches.length <= maxResults &&
-    result.matches.every((match) => {
+        result.matches.every(match => {
       if (typeof match !== 'object' || match === null) return false;
       const candidate = match as Record<string, unknown>;
       return (
@@ -1005,7 +1727,8 @@ export function isWorkspaceToolResult(
         Number.isSafeInteger(candidate.column) &&
         Number(candidate.column) >= 1 &&
         typeof candidate.text === 'string' &&
-        candidate.text.length <= BRIDGE_WORKSPACE_SEARCH_TEXT_MAX_LENGTH &&
+                candidate.text.length <=
+                    BRIDGE_WORKSPACE_SEARCH_TEXT_MAX_LENGTH &&
         candidate.text.includes(request.query)
       );
     })
@@ -1023,7 +1746,7 @@ export function isValidBridgeWorkspaceToolCapabilities(
     capabilities.operations.length < 1 ||
     capabilities.operations.length > 7 ||
     !capabilities.operations.every(
-      (operation) =>
+            operation =>
         operation === 'read_file' ||
         operation === 'search_text' ||
         operation === 'list_files' ||
@@ -1032,7 +1755,8 @@ export function isValidBridgeWorkspaceToolCapabilities(
         operation === 'edit_file' ||
         operation === 'execute_command',
     ) ||
-    new Set(capabilities.operations).size !== capabilities.operations.length ||
+        new Set(capabilities.operations).size !==
+            capabilities.operations.length ||
     !Array.isArray(capabilities.workspaces) ||
     capabilities.workspaces.length < 1 ||
     capabilities.workspaces.length > BRIDGE_WORKSPACE_MAX_COUNT
@@ -1047,7 +1771,7 @@ export function isValidBridgeWorkspaceToolCapabilities(
       capabilities.writeFileModes.length > 2 ||
       !capabilities.operations.includes('write_file') ||
       !capabilities.writeFileModes.every(
-        (mode) => mode === 'replace' || mode === 'create',
+                mode => mode === 'replace' || mode === 'create',
       ) ||
       new Set(capabilities.writeFileModes).size !==
         capabilities.writeFileModes.length)
@@ -1063,7 +1787,7 @@ export function isValidBridgeWorkspaceToolCapabilities(
       (!capabilities.operations.includes('edit_file') &&
         !capabilities.operations.includes('preview_edit')) ||
       !capabilities.editFileModes.every(
-        (mode) => mode === 'single' || mode === 'batch',
+                mode => mode === 'single' || mode === 'batch',
       ) ||
       new Set(capabilities.editFileModes).size !==
         capabilities.editFileModes.length)
@@ -1074,9 +1798,20 @@ export function isValidBridgeWorkspaceToolCapabilities(
   if (
     capabilities.editFileFeatures !== undefined &&
     (!Array.isArray(capabilities.editFileFeatures) ||
-      capabilities.editFileFeatures.length !== 1 ||
-      !capabilities.operations.includes('edit_file') ||
-      capabilities.editFileFeatures[0] !== 'expected_base_sha256')
+      capabilities.editFileFeatures.length < 1 ||
+      capabilities.editFileFeatures.length >
+        WORKSPACE_EDIT_FILE_FEATURES.length ||
+      (!capabilities.operations.includes('edit_file') &&
+        !capabilities.operations.includes('preview_edit')) ||
+      !capabilities.editFileFeatures.every((feature: unknown) =>
+        WORKSPACE_EDIT_FILE_FEATURES.includes(
+          feature as WorkspaceEditFileFeature,
+        ) &&
+        (feature !== 'expected_base_sha256' ||
+          (capabilities.operations as string[]).includes('edit_file')),
+      ) ||
+      new Set(capabilities.editFileFeatures).size !==
+        capabilities.editFileFeatures.length)
   ) {
     return false;
   }
@@ -1091,37 +1826,100 @@ export function isValidBridgeWorkspaceToolCapabilities(
     return false;
   }
 
+  if (
+    capabilities.programmaticLanguages !== undefined &&
+    (!Array.isArray(capabilities.programmaticLanguages) ||
+      capabilities.programmaticLanguages.length !== 1 ||
+      !capabilities.operations.includes('execute_command') ||
+      capabilities.programmaticLanguages[0] !== 'bash')
+  ) {
+    return false;
+  }
+
   const workspaceIds = new Set<string>();
-  return capabilities.workspaces.every((workspace) => {
+    return capabilities.workspaces.every(workspace => {
     if (typeof workspace !== 'object' || workspace === null) return false;
     const descriptor = workspace as Record<string, unknown>;
     if (
       Object.keys(descriptor).some(
-        (key) => key !== 'id' && key !== 'name' && key !== 'operations',
+                key =>
+                    key !== 'id' &&
+                    key !== 'name' &&
+                    key !== 'operations' &&
+                    key !== 'workspaceInstances' &&
+                    key !== 'workspaceScopes' &&
+                    key !== 'instructions' &&
+                    key !== 'environment',
       ) ||
       typeof descriptor.id !== 'string' ||
       !isValidBridgeWorkerId(descriptor.id) ||
       workspaceIds.has(descriptor.id) ||
+      (descriptor.workspaceInstances !== undefined &&
+        (!Array.isArray(descriptor.workspaceInstances) ||
+          descriptor.workspaceInstances.length !== 1 ||
+          descriptor.workspaceInstances[0] !== 'git_worktree')) ||
+      (descriptor.workspaceScopes !== undefined &&
+        (!Array.isArray(descriptor.workspaceScopes) ||
+          descriptor.workspaceScopes.length !== 1 ||
+          descriptor.workspaceScopes[0] !== 'git_linked_worktree')) ||
+      (descriptor.instructions !== undefined && (!Array.isArray(descriptor.instructions) || descriptor.instructions.length > 1 || !descriptor.instructions.every(isRepositoryInstructionDescriptor))) ||
+            (descriptor.environment !== undefined &&
+                !isValidCodeEnvironmentDescriptor(descriptor.environment)) ||
       (descriptor.name !== undefined &&
         (typeof descriptor.name !== 'string' ||
           descriptor.name.trim().length === 0 ||
-          descriptor.name.length > BRIDGE_WORKSPACE_NAME_MAX_LENGTH)) ||
+                    descriptor.name.length >
+                        BRIDGE_WORKSPACE_NAME_MAX_LENGTH)) ||
       (descriptor.operations !== undefined &&
         (!Array.isArray(descriptor.operations) ||
           descriptor.operations.length < 1 ||
           descriptor.operations.length >
             (capabilities.operations as unknown[]).length ||
           descriptor.operations.some(
-            (operation) =>
-              !(capabilities.operations as unknown[]).includes(operation),
+                        operation =>
+                            !(capabilities.operations as unknown[]).includes(
+                                operation,
+                            ),
           ) ||
-          new Set(descriptor.operations).size !== descriptor.operations.length))
+                    new Set(descriptor.operations).size !==
+                        descriptor.operations.length))
     ) {
       return false;
     }
     workspaceIds.add(descriptor.id);
     return true;
   });
+}
+
+export function isValidCodeEnvironmentDescriptor(
+    value: unknown,
+): value is NonNullable<BridgeWorkspaceDescriptor['environment']> {
+    if (typeof value !== 'object' || value === null) return false;
+    const environment = value as Record<string, unknown>;
+    return (
+        Object.keys(environment).every(key =>
+            ['fingerprint', 'repo', 'ref', 'actions'].includes(key),
+        ) &&
+        typeof environment.fingerprint === 'string' &&
+        /^[a-f0-9]{64}$/.test(environment.fingerprint) &&
+        (environment.repo === undefined ||
+            (typeof environment.repo === 'string' &&
+                environment.repo.length <= 256 &&
+                /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(environment.repo))) &&
+        (environment.ref === undefined ||
+            (typeof environment.ref === 'string' &&
+                environment.ref.trim().length > 0 &&
+                environment.ref.length <= 256 &&
+                !/[\0\r\n]/.test(environment.ref))) &&
+        Array.isArray(environment.actions) &&
+        environment.actions.length <= 32 &&
+        environment.actions.every(
+            name =>
+                typeof name === 'string' &&
+                /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name),
+        ) &&
+        new Set(environment.actions).size === environment.actions.length
+    );
 }
 
 export function isValidBridgeWorkerCapabilities(
@@ -1137,11 +1935,12 @@ export function isValidBridgeWorkerCapabilities(
     typeof capabilities.statefulWorkspace === 'boolean' &&
     typeof capabilities.sandboxProfile === 'string' &&
     capabilities.sandboxProfile.trim().length > 0 &&
-    capabilities.sandboxProfile.length <= BRIDGE_SANDBOX_PROFILE_MAX_LENGTH &&
+        capabilities.sandboxProfile.length <=
+            BRIDGE_SANDBOX_PROFILE_MAX_LENGTH &&
     Array.isArray(capabilities.runtimes) &&
     capabilities.runtimes.length <= BRIDGE_RUNTIME_MAX_COUNT &&
     capabilities.runtimes.every(
-      (runtime) =>
+            runtime =>
         typeof runtime === 'string' &&
         runtime.length > 0 &&
         runtime.length <= BRIDGE_RUNTIME_MAX_LENGTH,

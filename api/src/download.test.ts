@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, spyOn } from 'bun:test';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
+import { createHash, randomUUID } from 'node:crypto';
+import { SESSION_INPUT_CACHE_DIR } from './session-inputs';
 import * as semver from 'semver';
 import { Job, SessionWorkspaceDirtyError, type TFile } from './job';
 import type { Runtime } from './runtime';
@@ -16,12 +18,8 @@ import {
 
 /**
  * Integration tests for `Job.downloadAndWriteFile` against a real HTTP
- * listener. These exercise the cross-repo round-trip: the file-server
- * (codeapi/service) emits `Content-Disposition: attachment;
- * filename*=UTF-8''<percent-encoded-path>` for nested artifacts, and the
- * sandbox-side parser must recover the path so the file lands at the same
- * nested location on the next prime(). Hitting a real listener (not a
- * mocked Response) catches anything fetch-level that a unit test would miss.
+ * listener. Hitting a real listener verifies that response metadata cannot
+ * redirect a caller-validated sandbox destination.
  */
 
 interface DownloadInternals {
@@ -55,6 +53,7 @@ function makeRuntime(): Runtime {
 function makeJob(files: TFile[] = [], session?: SessionWorkspace): Job {
   return new Job({
     session_id: 'test-session',
+    egress_grant: 'test-grant',
     runtime: makeRuntime(),
     files,
     args: [],
@@ -173,21 +172,16 @@ afterEach(async () => {
   await fsp.rm(tmpDir, { recursive: true, force: true });
 });
 
-describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
-  it('writes a nested-path artifact at the encoded location', async () => {
-    /* Simulates the matplotlib-bug shape: codeapi previously returned a
-     * flat `file.name` and the original path was carried only by the
-     * server's `filename*=` header. The fix is: parser recovers the path,
-     * `mkdir { recursive: true }` creates the parent dir, file ends up
-     * where the user expects to `cat` it on the next turn. */
+describe('downloadAndWriteFile destinations', () => {
+  it('writes a nested-path artifact at the requested location', async () => {
     const file: TFile = {
       id: 'nested-id',
       storage_session_id: 'prev-session',
-      name: 'flat-fallback.txt',
+      name: 'proj/notes.txt',
     };
     routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
-      contentDisposition: "attachment; filename*=UTF-8''proj%2Fnotes.txt",
+      contentDisposition: "attachment; filename*=UTF-8''stored-original.txt",
       body: 'hello from a nested artifact\n',
     });
 
@@ -209,7 +203,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     const file: TFile = {
       id: 'opaque-object-handle',
       storage_session_id: 'opaque-session-handle',
-      name: 'gateway-fallback.txt',
+      name: 'gateway.txt',
     };
     let sawGrantHeader = false;
     let sawRelayToken = false;
@@ -272,14 +266,11 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect((await fsp.stat(path.join(tmpDir, 'readonly.txt'))).mode & 0o777).toBe(SANDBOX_READONLY_FILE_MODE);
   });
 
-  it('falls back to the legacy filename= form when filename*= is absent', async () => {
-    /* Backwards-compat: older file-servers (or proxies that strip RFC
-     * 5987 extended-form headers) still send the legacy quoted form. The
-     * parser must still find a name and write the file. */
+  it('downloads when a legacy filename header matches the requested name', async () => {
     const file: TFile = {
       id: 'legacy-id',
       storage_session_id: 'prev-session',
-      name: 'ignored.txt',
+      name: 'legacy.txt',
     };
     routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
@@ -320,7 +311,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect(await fsp.stat(path.join(tmpDir, 'opaque-storage-id.xlsx')).catch(() => null)).toBeNull();
   });
 
-  it('resolves concurrent header destinations without provisional-name false conflicts', async () => {
+  it('keeps concurrent inputs at their requested destinations', async () => {
     const renamed: TFile = {
       id: 'renamed-id',
       storage_session_id: 'prev-session',
@@ -335,8 +326,6 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
       status: 200,
       contentDisposition: 'attachment; filename="actual.txt"',
       body: 'renamed bytes',
-      /* Make the other ref resolve `vacated.txt` while this ref's requested
-       * name would still be provisional under the old reservation scheme. */
       delayMs: 75,
     });
     routes.set(`/sessions/${encodeURIComponent(replacement.storage_session_id!)}/objects/${encodeURIComponent(replacement.id!)}`, {
@@ -353,75 +342,62 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
       await job.prime();
       const submissionDir = asInternals(job).submissionDir;
       expect(await fsp.readFile(path.join(submissionDir, 'actual.txt'), 'utf8'))
-        .toBe('renamed bytes');
-      expect(await fsp.readFile(path.join(submissionDir, 'vacated.txt'), 'utf8'))
         .toBe('replacement bytes');
+      expect(await fsp.readFile(path.join(submissionDir, 'vacated.txt'), 'utf8'))
+        .toBe('renamed bytes');
     } finally {
       config.prime_concurrency = originalPrimeConcurrency;
       await job.cleanup();
     }
   });
 
-  it('rejects concurrent refs that resolve to the same destination before either can overwrite', async () => {
-    const slower: TFile = {
-      id: 'same-slower-id',
+  it('keeps distinct requested names when stored objects share an original filename', async () => {
+    const original: TFile = {
+      id: 'original-id',
       storage_session_id: 'prev-session',
-      name: 'slower-fallback.txt',
+      name: 'data.xlsx',
     };
-    const faster: TFile = {
-      id: 'same-faster-id',
+    const aliased: TFile = {
+      id: 'aliased-id',
       storage_session_id: 'prev-session',
-      name: 'faster-fallback.txt',
+      name: 'data-3f9a2c.xlsx',
     };
-    routes.set(`/sessions/${encodeURIComponent(slower.storage_session_id!)}/objects/${encodeURIComponent(slower.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(original.storage_session_id!)}/objects/${encodeURIComponent(original.id!)}`, {
       status: 200,
-      contentDisposition: 'attachment; filename="same.txt"',
-      body: 'slower bytes',
+      contentDisposition: 'attachment; filename="data.xlsx"',
+      body: 'original bytes',
       delayMs: 75,
     });
-    routes.set(`/sessions/${encodeURIComponent(faster.storage_session_id!)}/objects/${encodeURIComponent(faster.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(aliased.storage_session_id!)}/objects/${encodeURIComponent(aliased.id!)}`, {
       status: 200,
-      contentDisposition: 'attachment; filename="same.txt"',
-      body: 'faster bytes',
+      contentDisposition: 'attachment; filename="data.xlsx"',
+      body: 'aliased bytes',
     });
 
-    let dirty = false;
     const job = makeJob(
-      [slower, faster],
-      sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination', () => { dirty = true; }),
+      [original, aliased],
+      sessionWorkspaceAt(tmpDir, 'rt_shared_original_filename'),
     );
     const originalPrimeConcurrency = config.prime_concurrency;
     config.prime_concurrency = 2;
-    let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const outcome = await Promise.race([
-        job.prime().then(
-          () => ({ status: 'fulfilled' as const }),
-          error => ({ status: 'rejected' as const, error }),
-        ),
-        new Promise<{ status: 'timeout' }>(resolve => {
-          deadlockTimer = setTimeout(() => resolve({ status: 'timeout' }), 2_000);
-        }),
-      ]);
-      if (deadlockTimer) clearTimeout(deadlockTimer);
-      expect(outcome.status).toBe('rejected');
-      if (outcome.status === 'rejected') {
-        expect(outcome.error).toBeInstanceOf(SessionWorkspaceDirtyError);
-      }
-      expect(dirty).toBe(true);
-      expect(await fsp.readFile(path.join(tmpDir, 'same.txt'), 'utf8')).toBe('faster bytes');
+      await job.prime();
+      const submissionDir = asInternals(job).submissionDir;
+      expect(await fsp.readFile(path.join(submissionDir, 'data.xlsx'), 'utf8'))
+        .toBe('original bytes');
+      expect(await fsp.readFile(path.join(submissionDir, 'data-3f9a2c.xlsx'), 'utf8'))
+        .toBe('aliased bytes');
     } finally {
-      if (deadlockTimer) clearTimeout(deadlockTimer);
       config.prime_concurrency = originalPrimeConcurrency;
       await job.cleanup();
     }
   });
 
-  it('decodes UTF-8 percent-encoded names with non-ASCII characters', async () => {
+  it('keeps a Unicode requested name when the header is percent encoded', async () => {
     const file: TFile = {
       id: 'utf8-id',
       storage_session_id: 'prev-session',
-      name: 'ignored.txt',
+      name: '你好.txt',
     };
     routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
@@ -437,6 +413,192 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect(writtenName).toBe('你好.txt');
     const contents = await fsp.readFile(path.join(tmpDir, '你好.txt'), 'utf8');
     expect(contents).toBe('hi');
+  });
+
+  it.each([401, 403])('does not retry an HTTP %i authorization denial', async status => {
+    config.egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    const file: TFile = { id: 'denied', storage_session_id: 'previous', name: 'denied.txt' };
+    let requests = 0;
+    routes.set('/sessions/previous/objects/denied', {
+      status,
+      headers: { 'X-CodeAPI-Error-Code': 'scope_mismatch' },
+      onRequest: () => { requests++; },
+    });
+    const job = makeJob([file]);
+    asInternals(job).submissionDir = tmpDir;
+
+    await expect(job.downloadAndWriteFile(file, 5, 1)).rejects.toThrow(`HTTP error: ${status}`);
+    expect(requests).toBe(1);
+    expect(await fsp.readdir(tmpDir)).toEqual([]);
+  });
+
+  it.each([403, 404, 408, 429, 503])('still retries transient HTTP %i responses', async status => {
+    config.egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    const file: TFile = { id: 'transient', storage_session_id: 'previous', name: 'ready.txt' };
+    let requests = 0;
+    const route: Route = {
+      status,
+      body: 'ready',
+      onRequest: () => { if (++requests === 2) route.status = 200; },
+    };
+    routes.set('/sessions/previous/objects/transient', route);
+    const job = makeJob([file]);
+    asInternals(job).submissionDir = tmpDir;
+
+    await expect(job.downloadAndWriteFile(file, 5, 1)).resolves.toBe('ready.txt');
+    expect(requests).toBe(2);
+    expect(await fsp.readFile(path.join(tmpDir, 'ready.txt'), 'utf8')).toBe('ready');
+  });
+
+  it.each([false, true])('honors conflict retry hints with cancellation=%s', async cancel => {
+    config.egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    const controller = new AbortController();
+    const timestamps: number[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const route: Route = {
+      status: 503, body: 'ready',
+      headers: { 'X-CodeAPI-Error-Code': 'ledger_conflict', 'Retry-After': '1' },
+      onRequest: () => {
+        timestamps.push(performance.now());
+        if (timestamps.length === 2) route.status = 200;
+        else if (cancel) timer = setTimeout(() => controller.abort(new Error('cancelled retry')), 25);
+      },
+    };
+    routes.set('/sessions/previous/objects/retry-hint', route);
+    const file: TFile = { id: 'retry-hint', storage_session_id: 'previous', name: 'ready.txt' };
+    const job = makeJob([file]);
+    asInternals(job).submissionDir = tmpDir;
+    try {
+      const result = job.downloadAndWriteFile(file, 5, 1, {
+        submissionDir: tmpDir, identity: fallbackSandboxIdentity(), signal: controller.signal,
+      });
+      if (cancel) {
+        await expect(result).rejects.toThrow('cancelled retry');
+        expect(timestamps).toHaveLength(1);
+        expect(await fsp.readdir(tmpDir)).toEqual([]);
+      } else {
+        await expect(result).resolves.toBe('ready.txt');
+        expect(timestamps).toHaveLength(2);
+        expect(timestamps[1] - timestamps[0]).toBeGreaterThanOrEqual(900);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it('reuses versioned bytes in fresh workspaces without bypassing a later denial', async () => {
+    const previousCache = config.http_input_cache_enabled;
+    const version = randomUUID();
+    const cacheKey = createHash('sha256').update(version).digest('hex');
+    const otherDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codeapi-cache-second-'));
+    config.http_input_cache_enabled = true;
+    config.egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    let reads = 0;
+    let checks = 0;
+    const meta: Route = { status: 200, body: JSON.stringify({ cacheable: true, cacheKey, version, size: 8, readOnly: false }),
+      onRequest: () => { checks++; },
+    };
+    routes.set('/sessions/previous/objects/cached/metadata', meta);
+    routes.set('/sessions/previous/objects/cached', { status: 200, body: 'original',
+      headers: { 'X-CodeAPI-Input-Version': version },
+      onRequest: request => { reads++; expect(request.headers.get('x-codeapi-input-version')).toBe(version); },
+    });
+    const file: TFile = { id: 'cached', storage_session_id: 'previous', name: 'data.txt', input_cache_key: cacheKey };
+    try {
+      const first = makeJob([file]);
+      asInternals(first).submissionDir = tmpDir;
+      await first.downloadAndWriteFile(file);
+      await fsp.writeFile(path.join(tmpDir, 'data.txt'), 'sandbox changed this');
+      const second = makeJob([file]);
+      asInternals(second).submissionDir = otherDir;
+      await second.downloadAndWriteFile(file);
+      expect(await fsp.readFile(path.join(otherDir, 'data.txt'), 'utf8')).toBe('original');
+      expect(reads).toBe(1);
+      expect(checks).toBe(2);
+      meta.status = 403;
+      meta.headers = { 'X-CodeAPI-Error-Code': 'scope_mismatch' };
+      await expect(second.downloadAndWriteFile(file)).rejects.toThrow('HTTP error: 403');
+      expect(checks).toBe(3);
+      expect(reads).toBe(1);
+    } finally {
+      config.http_input_cache_enabled = previousCache;
+      await fsp.rm(otherDir, { recursive: true, force: true });
+      await fsp.rm(path.join(SESSION_INPUT_CACHE_DIR, cacheKey), { force: true });
+      await fsp.rm(path.join(SESSION_INPUT_CACHE_DIR, `${cacheKey}.json`), { force: true });
+    }
+  });
+
+  it('does not retry an unclassified direct file-server denial', async () => {
+    config.egress_gateway_url = '';
+    let requests = 0;
+    const file: TFile = { id: 'denied', storage_session_id: 'previous', name: 'denied.txt' };
+    routes.set('/sessions/previous/objects/denied', {
+      status: 403, onRequest: () => { requests++; },
+    });
+    const job = makeJob([file]);
+    asInternals(job).submissionDir = tmpDir;
+    await expect(job.downloadAndWriteFile(file, 5, 1)).rejects.toThrow('HTTP error: 403');
+    expect(requests).toBe(1);
+  });
+
+  it.each(['legacy', 'classified', 'direct'])('handles %s marker denials before priming', async mode => {
+    config.egress_gateway_url = mode === 'direct' ? '' : `http://127.0.0.1:${serverPort}`;
+    let requests = 0;
+    const route: Route = {
+      status: 403, body: '[]',
+      headers: mode === 'classified' ? { 'X-CodeAPI-Error-Code': 'scope_mismatch' } : {},
+      onRequest: () => { if (++requests === 2) route.status = 200; },
+    };
+    routes.set('/sessions/previous/objects', route);
+    const file: TFile = { id: 'ready', storage_session_id: 'previous', name: 'ready.txt' };
+    routes.set('/sessions/previous/objects/ready', { status: 200, body: 'ready' });
+    const job = makeJob([file], sessionWorkspaceAt(tmpDir, 'marker-retry'));
+    if (mode === 'legacy') {
+      await job.prime();
+      expect(requests).toBe(2);
+      expect(await fsp.readFile(path.join(tmpDir, 'ready.txt'), 'utf8')).toBe('ready');
+    } else {
+      await expect(job.prime()).rejects.toThrow('HTTP error loading .dirkeep markers: 403');
+      expect(requests).toBe(1);
+    }
+  });
+
+  it('accounts for a denied 240-file batch once and stops queued downloads', async () => {
+    config.egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    const files: TFile[] = Array.from({ length: 240 }, (_, index) => ({
+      id: `file-${index}`, storage_session_id: 'previous', name: `file-${index}.txt`,
+    }));
+    let requests = 0;
+    routes.set('/sessions/previous/objects', { status: 200, body: '[]' });
+    for (const file of files) {
+      routes.set(`/sessions/previous/objects/${file.id}`, {
+        status: 403,
+        headers: { 'X-CodeAPI-Error-Code': 'scope_mismatch' },
+        delayMs: file.id === 'file-0' ? 0 : 30,
+        onRequest: () => { requests++; },
+      });
+    }
+    let dirty = false;
+    const job = makeJob(files, sessionWorkspaceAt(tmpDir, 'batch-test', () => { dirty = true; }));
+    const log = (job as unknown as { log: import('pino').Logger }).log;
+    const errorLog = spyOn(log, 'error');
+    const originalConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 8;
+    try {
+      await expect(job.prime()).rejects.toBeInstanceOf(SessionWorkspaceDirtyError);
+      expect(dirty).toBe(true);
+      expect(requests).toBeGreaterThan(0);
+      expect(requests).toBeLessThanOrEqual(8);
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(errorLog).toHaveBeenCalledWith(expect.objectContaining({
+        inputCount: 240, completed: 0, failed: 1, cancelled: 7, notStarted: 232,
+      }), 'Input preparation batch failed');
+      expect(await fsp.readdir(tmpDir)).toEqual([]);
+    } finally {
+      errorLog.mockRestore();
+      config.prime_concurrency = originalConcurrency;
+      await job.cleanup();
+    }
   });
 
   it('fails when the server keeps 404-ing past the retry cap (no phantom write)', async () => {
@@ -456,11 +618,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     await expect(fsp.access(path.join(tmpDir, 'should-not-exist.txt'))).rejects.toThrow();
   });
 
-  it('rejects a server-supplied filename that escapes the submission dir', async () => {
-    /* Companion guarantee for the path-preserving sanitizer on the
-     * LibreChat side: if a malicious / misconfigured server tries to
-     * smuggle a `..` traversal via Content-Disposition, the codeapi-side
-     * `validateFilePath` aborts before any write happens. */
+  it('ignores a server-supplied filename that escapes the submission dir', async () => {
     const file: TFile = {
       id: 'evil-id',
       storage_session_id: 'prev-session',
@@ -469,16 +627,14 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
       contentDisposition: "attachment; filename*=UTF-8''..%2F..%2Fescape.txt",
-      body: 'should never be written',
+      body: 'safe bytes',
     });
 
     const job = makeJob([file]);
     asInternals(job).submissionDir = tmpDir;
 
-    /* downloadAndWriteFile rethrows ValidationError fast (no retries) so
-     * `expect(...).rejects` is the right assertion. */
-    await expect(job.downloadAndWriteFile(file)).rejects.toThrow();
-    /* Defensive: nothing escaped to a parent dir. */
+    await expect(job.downloadAndWriteFile(file)).resolves.toBe('innocent.txt');
+    expect(await fsp.readFile(path.join(tmpDir, 'innocent.txt'), 'utf8')).toBe('safe bytes');
     const parent = path.dirname(tmpDir);
     await expect(fsp.access(path.join(parent, 'escape.txt'))).rejects.toThrow();
   });
