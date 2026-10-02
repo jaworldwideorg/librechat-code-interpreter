@@ -32,6 +32,7 @@ import {
   removePrivateStorageAcl,
 } from './private-storage.js';
 import { WorkspaceToolError } from './workspace.js';
+import { OutputBuffer, renderCommandOutput } from './output.js';
 import { restoreScratchTraversal } from './native-scratch.js';
 import { writeLinkedWorktreeGitGuard } from './linked-worktree-git-guard.js';
 
@@ -1301,28 +1302,10 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
         }
         let settled = false;
         let timedOut = false;
-        let outputBytes = 0;
-        let truncated = false;
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        const append = (target: Buffer[], chunk: Buffer): void => {
-          const remaining = outputLimit - outputBytes;
-          if (remaining <= 0) {
-            truncated = true;
-            return;
-          }
-          const accepted = chunk.subarray(0, remaining);
-          target.push(accepted);
-          outputBytes += accepted.byteLength;
-                    if (accepted.byteLength !== chunk.byteLength)
-                        truncated = true;
-        };
-                child.stdout.on('data', (chunk: Buffer) =>
-                    append(stdout, chunk),
-                );
-                child.stderr.on('data', (chunk: Buffer) =>
-                    append(stderr, chunk),
-                );
+        const stdout = new OutputBuffer(outputLimit);
+        const stderr = new OutputBuffer(outputLimit);
+        child.stdout.on('data', (chunk: Buffer) => stdout.append(chunk));
+        child.stderr.on('data', (chunk: Buffer) => stderr.append(chunk));
         const abort = (): void => {
           if (settled) return;
           this.killCommandTree(child);
@@ -1371,29 +1354,17 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
             );
             return;
           }
-                    const stdoutValue = boundedUtf8(
-                        Buffer.concat(stdout),
-                        outputLimit,
-                    );
-          const stderrBudget = Math.max(
-            0,
-            outputLimit - Buffer.byteLength(stdoutValue),
-          );
-          const rawStderr = Buffer.concat(stderr).toString('utf8');
-          let annotatedStderr = rawStderr;
           try {
-                        annotatedStderr =
-                            this.manager.annotateStderrWithSandboxFailures(
-              commandId,
-              rawStderr,
+            // SRT appends violations to its input. Capture them in the same bounded stderr window.
+            stderr.append(
+              Buffer.from(
+                this.manager.annotateStderrWithSandboxFailures(commandId, ''),
+              ),
             );
           } catch {
             // Preserve the bounded child error if optional violation annotation fails.
           }
-          const stderrValue = boundedUtf8(
-            Buffer.from(annotatedStderr),
-            stderrBudget,
-          );
+          const output = renderCommandOutput(stdout, stderr, outputLimit);
           resolvePromise({
             protocolVersion: BRIDGE_PROTOCOL_VERSION,
             operation: 'execute_command',
@@ -1403,11 +1374,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
                                 ? null
                                 : this.protocolExitCode(code),
             ...(childSignal ? { signal: childSignal } : {}),
-            stdout: stdoutValue,
-            stderr: stderrValue,
-            truncated:
-                            truncated ||
-                            Buffer.byteLength(annotatedStderr) > stderrBudget,
+            ...output,
             timedOut,
           });
         });
