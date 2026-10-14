@@ -10,10 +10,10 @@ import {
 
 export const languageConfig: Record<Languages | string, t.LanguageConfig | undefined> = {
   [Languages.bash]: { language: 'bash', version: '5.2.0', fileName: 'script.sh' },
-  [Languages.js]: { language: 'bun-js', version: '1.3.14', fileName: 'index.js' },
+  [Languages.js]: { language: 'bun-js', version: '1.4.2', fileName: 'index.js' },
   [Languages.node]: { language: 'node', version: '24.15.0', fileName: 'index.js' },
   [Languages.py]: { language: 'python', version: '3.14.4', fileName: 'main.py' },
-  [Languages.ts]: { language: 'bun-ts', version: '1.3.14', fileName: 'main.ts' },
+  [Languages.ts]: { language: 'bun-ts', version: '1.4.2', fileName: 'main.ts' },
 };
 
 const languageAliases: Record<string, Languages> = {
@@ -420,6 +420,11 @@ export const env = {
   BRIDGE_MAX_WORKSPACE_LEASE_SLOTS: Number(
     process.env.CODEAPI_BRIDGE_MAX_WORKSPACE_LEASE_SLOTS ?? 1,
   ),
+  /**
+   * Offer `lane_git` to workers and accept `laneGit` (`{ branch, head }`) on command results.
+   * Off by default: enable only after the LibreChat talking to this service accepts the field.
+   */
+  BRIDGE_LANE_GIT: process.env.CODEAPI_BRIDGE_LANE_GIT === 'true',
   /** Outbound worker selected by the remote-bridge backend. */
   BRIDGE_WORKER_ID: process.env.CODEAPI_BRIDGE_WORKER_ID ?? '',
   /** Static compatibility auth or short-lived proof-of-possession credentials. */

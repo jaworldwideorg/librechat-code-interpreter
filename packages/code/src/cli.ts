@@ -13,6 +13,8 @@ import {
     EnvironmentWorkspaceTools,
 } from './environment.js';
 import { prepareCodeEnvironment } from './environment-preparation.js';
+import { assertEnvironmentResourceIsolation } from './environment-resources.js';
+import { pruneDependencySnapshots } from './snapshot-lifecycle.js';
 import { startFileRelay } from './relay.js';
 import { DockerFileRelaySupervisor } from './relay-runtime.js';
 import {
@@ -39,8 +41,13 @@ import { RuntimeWorkspaceCommandSandbox } from './workspace-runtime.js';
 import { NativeProcessWorkspaceCommandSandbox } from './native-process.js';
 import { NativeWorkspaceCommandPool } from './native-pool.js';
 import { GitWorktreeWorkspaceTools, internalWorkspaceId } from './workspace-instances.js';
-import { LINKED_WORKTREE_DIRECTORY, LinkedWorktreeWorkspaceTools } from './linked-worktrees.js';
+import { LaneGitWorkspaceTools, ownsGitMetadata, ownsLinkedWorktreeMetadata } from './lane-git.js';
+import { LINKED_WORKTREE_DIRECTORY, LinkedWorktreeWorkspaceTools, verifyLinkedWorktree } from './linked-worktrees.js';
 import { GitWorktreeManager } from './worktrees.js';
+import {
+  WorktreeRetirementScheduler,
+  worktreeRetirementSettings,
+} from './worktree-retirement.js';
 import { captureWorkspaceRootIdentity } from './root-identity.js';
 import {
   resolveNativeSrtCommandPolicy,
@@ -810,6 +817,13 @@ async function run(
   if (linkedWorktreeLanes && process.platform === 'win32') {
     throw new Error('Linked worktree Git guard requires a POSIX host');
   }
+  const worktreeRetirement = worktreeRetirementSettings({
+    optOut: args.includes('--no-worktree-retirement'),
+    enabled: process.env.LIBRECHAT_CODE_WORKTREE_RETIREMENT,
+    idleDays:
+      option(args, '--worktree-idle-days') ??
+      process.env.LIBRECHAT_CODE_WORKTREE_IDLE_DAYS,
+  });
   if (
     roots.length > 1 &&
     process.env.LIBRECHAT_CODE_WORKSPACE_QUARANTINE_FILE?.trim()
@@ -837,6 +851,23 @@ async function run(
       definition: { name: 'preparation-state', root: preparationDirectory }, fingerprint: '',
     }], roots);
   }
+  // Cache contents may be shared explicitly; their grants must never authorize source or control state.
+  const resourceRoots = environments.flatMap(environment => (environment.resources ?? []).map(resource => ({
+    path: resource.path, sourceParents: resource.controlPaths,
+    definition: { name: 'shared-resource', root: resource.path }, fingerprint: '',
+  })));
+  await assertEnvironmentResourceIsolation(environments.flatMap(environment => environment.resources ?? []), roots.map(root => root.root), [
+    identityPath, preparationDirectory, github.privateKeyPath,
+    ...environments.map(environment => environment.path), ...rootQuarantinePaths.values(),
+  ].filter((path): path is string => path != null));
+  await assertEnvironmentDefinitionsOutsideRoots(resourceRoots, roots);
+  const snapshotStores = environments.flatMap(environment => environment.snapshotStore ? [environment.snapshotStore] : []);
+  await assertEnvironmentResourceIsolation(snapshotStores.map(store => ({ kind: 'npm-cache' as const, path: store.store, access: 'read-only' as const })), roots.map(root => root.root), [
+    identityPath, preparationDirectory, github.privateKeyPath, ...environments.map(environment => environment.path),
+    ...rootQuarantinePaths.values(), ...environments.flatMap(environment => (environment.resources ?? []).map(resource => resource.path)),
+  ].filter((path): path is string => path != null));
+  await assertEnvironmentDefinitionsOutsideRoots(snapshotStores.map(store => ({ path: store.store, sourceParents: store.controlPaths,
+    definition: { name: 'dependency-store', root: store.store }, fingerprint: '' })), roots);
   const preparationReceipt = (root: string) => join(preparationDirectory,
     `${createHash('sha256').update(JSON.stringify([codeApiUrl, workerId, root])).digest('hex')}.json`);
   // Keep an admission boundary even when trusted-VM checkout routing uses a
@@ -1062,6 +1093,7 @@ async function run(
     protectedPaths: [
       identityPath,
       ...(environments.some(environment => environment.definition.setup?.reuse) ? [preparationDirectory] : []),
+      ...snapshotStores.map(store => store.store),
             ...environments.map(environment => environment.path),
       ...rootQuarantinePaths.values(),
       github.privateKeyPath,
@@ -1110,6 +1142,10 @@ async function run(
         }
       : {}),
   };
+  const nativeOptionsForWorkspace = (workspaceId: string): NativeProcessSandboxOptions => ({
+    ...nativeOptions,
+    resources: environments.find(environment => environment.definition.name === workspaceId)?.resources,
+  });
   const nativeCommandSandbox =
     allowWorkspaceCommands && commandSandboxMode === 'native-srt'
       ? roots.length > 1 || workspaceLeaseSlots > 1 || conversationWorktreeRoot || linkedWorktreeLanes
@@ -1117,12 +1153,12 @@ async function run(
             new Map(
                           roots.map(root => [
                 root.id,
-                { ...nativeOptions, workspaceRoot: root.root, workspaceIdentity: root.identity },
+                { ...nativeOptionsForWorkspace(root.id), workspaceRoot: root.root, workspaceIdentity: root.identity },
               ]),
             ),
             workspaceLeaseSlots,
           )
-        : new NativeProcessWorkspaceCommandSandbox(nativeOptions)
+        : new NativeProcessWorkspaceCommandSandbox(nativeOptionsForWorkspace(roots[0].id))
       : undefined;
   if (allowWorkspaceCommands && workspaceTools) {
     workspaceTools = new SandboxWorkspaceTools({
@@ -1148,10 +1184,11 @@ async function run(
         ...(nativeCommandSandbox instanceof NativeWorkspaceCommandPool
           ? {
               prepareInstance: async (instance, signal) => {
-                const setup = environments.find(
+                const environment = environments.find(
                   (environment) =>
                     environment.definition.name === instance.sourceWorkspaceId,
-                )?.definition.setup;
+                );
+                const setup = environment?.definition.setup;
                 if (!setup) return;
                 if (admittedGitHubRepositories) {
                   admittedGitHubRepositories.set(
@@ -1161,14 +1198,18 @@ async function run(
                 }
                 const id = internalWorkspaceId(instance.sourceWorkspaceId, instance.id);
                 await nativeCommandSandbox.registerRoot(id, {
-                  ...nativeOptions,
+                  ...nativeOptionsForWorkspace(instance.sourceWorkspaceId),
                   workspaceIdentity: instance.identity,
                   workspaceRoot: instance.root,
                 });
                 await prepareCodeEnvironment({
+                  snapshotStore: environment!.snapshotStore,
+                  storage: environment!.definition.storage,
+                  snapshotScope: environment!.definition.repo ?? environment!.definition.name,
                   root: instance.root, identity: instance.identity, setup,
                   receiptPath: preparationReceipt(instance.root),
-                  context: JSON.stringify([serializeNativeSrtCommandPolicy(commandPolicy), commandAllowedDomains, github.policyIdentity]),
+                  context: JSON.stringify([serializeNativeSrtCommandPolicy(commandPolicy), commandAllowedDomains, github.policyIdentity,
+                    nativeOptionsForWorkspace(instance.sourceWorkspaceId).resources]),
                   signal,
                   execute: (command, timeoutMs) => nativeCommandSandbox.execute({
                     protocolVersion: 1,
@@ -1225,7 +1266,7 @@ async function run(
           root.id,
           {
             command: {
-              ...nativeOptions,
+              ...nativeOptionsForWorkspace(root.id),
               workspaceIdentity: root.identity,
               workspaceRoot: root.root,
             },
@@ -1263,7 +1304,7 @@ async function run(
           {
             root: root.root,
             identity: root.identity,
-            command: nativeOptions,
+            command: nativeOptionsForWorkspace(root.id),
             repositoryInstructions: args.includes('--repository-instructions'),
             writable: root.writable ?? false,
           },
@@ -1272,6 +1313,63 @@ async function run(
     });
     workspaceTools = linkedWorktreeTools;
   }
+  // Probe Git only while the active registration advertises lane_git, which the worker decides.
+  let laneGitWorker: BridgeWorker | undefined;
+  if (workspaceTools?.capabilities.operations.includes('execute_command')) {
+    workspaceTools = new LaneGitWorkspaceTools({
+      delegate: workspaceTools,
+      isEnabled: () => laneGitWorker?.commandResultFeatureActive('lane_git') === true,
+      async resolveRoot(request, signal) {
+        const source = roots.find((root) => root.id === request.workspaceId);
+        if (!source) return undefined;
+        if (request.workspaceInstanceId != null) {
+          const root = await conversationWorktrees?.plannedRoot(request.workspaceId, request.workspaceInstanceId);
+          return root != null && (await ownsGitMetadata(root, signal)) ? root : undefined;
+        }
+        if (request.worktree != null) {
+          signal?.throwIfAborted();
+          const lane = await verifyLinkedWorktree(source.root, request.worktree, source.identity);
+          return (await ownsLinkedWorktreeMetadata(lane.commonGitDir, request.worktree, signal)) ? lane.root : undefined;
+        }
+        return (await ownsGitMetadata(source.root, signal)) ? source.root : undefined;
+      },
+    });
+  }
+  const retirementSources = roots.filter((root) => root.writable);
+  const debugLogs =
+    process.env.LIBRECHAT_CODE_LOG_LEVEL?.trim().toLowerCase() === 'debug';
+  const worktreeRetirementScheduler =
+    linkedWorktreeTools &&
+    worktreeRetirement.enabled &&
+    retirementSources.length > 0 &&
+    option(args, '--reset-workspace-quarantine') == null
+      ? new WorktreeRetirementScheduler({
+          activity: linkedWorktreeTools,
+          idleMs: worktreeRetirement.idleMs,
+          sources: retirementSources.map((root) => ({
+            workspaceId: root.id,
+            root: root.root,
+            identity: root.identity,
+          })),
+          async isQuarantined(selectedWorkspaceId, worktree) {
+            const source = roots.find((root) => root.id === selectedWorkspaceId);
+            if (!source) return true;
+            const path =
+              worktree == null
+                ? rootQuarantinePaths.get(selectedWorkspaceId)!
+                : defaultWorkspaceQuarantinePath({
+                    codeApiUrl,
+                    workerId,
+                    workspaceRoot: join(source.root, LINKED_WORKTREE_DIRECTORY, worktree),
+                  });
+            return (await loadWorkspaceMutationQuarantine(path)) != null;
+          },
+          log(level, message) {
+            if (level === 'debug' && !debugLogs) return;
+            process.stdout.write(`librechat-code: ${message}\n`);
+          },
+        })
+      : undefined;
     if (workspaceTools && environments.length) {
         workspaceTools = new EnvironmentWorkspaceTools(
             workspaceTools,
@@ -1337,10 +1435,20 @@ async function run(
             await guard.assertAvailable();
             let armed = false;
             const preparation = await prepareCodeEnvironment({
+                snapshotStore: environment.snapshotStore,
+                storage: environment.definition.storage,
+                snapshotScope: environment.definition.repo ?? environment.definition.name,
+                beforeMutation: async () => {
+                  if (!armed) { await guard.arm('Dependency restoration did not settle', 'setup'); armed = true; }
+                },
                 root: environment.definition.root,
                 identity: roots.find(root => root.id === id)!.identity!,
                 setup, receiptPath: preparationReceipt(environment.definition.root),
-                context: JSON.stringify([serializeNativeSrtCommandPolicy(commandPolicy), commandAllowedDomains, github.policyIdentity]),
+                reclaimSpace: worktreeRetirementScheduler
+                  ? () => worktreeRetirementScheduler.runNow()
+                  : undefined,
+                context: JSON.stringify([serializeNativeSrtCommandPolicy(commandPolicy), commandAllowedDomains, github.policyIdentity,
+                  nativeOptionsForWorkspace(id).resources]),
                 signal: controller.signal,
                 execute: async (command, timeoutMs) => {
                   if (!armed) {
@@ -1368,10 +1476,12 @@ async function run(
             );
         }
   } catch (error) {
+    await worktreeRetirementScheduler?.stop().catch(() => undefined);
     await nativeCommandSandbox?.close().catch(() => undefined);
     await fileRelaySupervisor?.stop().catch(() => undefined);
     throw error;
   }
+  worktreeRetirementScheduler?.start();
   try {
     const worker = new BridgeWorker({
       instructionDescriptors: () => localWorkspaceTools?.instructionDescriptors() ?? Promise.resolve(undefined),
@@ -1546,6 +1656,7 @@ async function run(
                 );
       },
     });
+    laneGitWorker = worker;
     if (runtimeSessionId !== undefined) {
       await worker.refreshCredential(controller.signal);
       await worker.register(controller.signal);
@@ -1581,6 +1692,7 @@ async function run(
     await worker.run(controller.signal);
   } finally {
     try {
+      await worktreeRetirementScheduler?.stop();
       await nativeCommandSandbox?.close();
     } finally {
       await fileRelaySupervisor?.stop();
@@ -1654,6 +1766,28 @@ async function clearMutationQuarantine(args: string[]): Promise<void> {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] === 'prune-environment-storage') {
+    const paths: string[] = [];
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--apply') continue;
+      if (args[i] !== '--environment' || !args[i + 1] || args[i + 1].startsWith('--'))
+        throw new Error('Usage: librechat-code prune-environment-storage --environment <file> [--environment <file> ...] [--apply]');
+      paths.push(args[++i]);
+    }
+    if (!paths.length || paths.length > 32) throw new Error('Supply between one and 32 environment definitions');
+    const loaded = await Promise.all(paths.map(loadCodeEnvironment));
+    const roots = loaded.map(environment => ({ id: environment.definition.name, root: environment.definition.root }));
+    const stores = loaded.flatMap(environment => environment.snapshotStore ? [environment.snapshotStore] : []);
+    if (!stores.length) throw new Error('No dependency snapshot stores configured');
+    await assertEnvironmentDefinitionsOutsideRoots(loaded, roots);
+    await assertEnvironmentDefinitionsOutsideRoots(stores.map(store => ({ path: store.store, sourceParents: store.controlPaths,
+      definition: { name: 'dependency-store', root: store.store }, fingerprint: '' })), roots);
+    await assertEnvironmentResourceIsolation(stores.map(store => ({ kind: 'npm-cache' as const, path: store.store, access: 'read-only' as const })),
+      roots.map(root => root.root), [...loaded.map(environment => environment.path),
+        ...loaded.flatMap(environment => (environment.resources ?? []).map(resource => resource.path))]);
+    for (const store of stores) process.stdout.write(`${JSON.stringify(await pruneDependencySnapshots(store, { dryRun: !args.includes('--apply') }))}\n`);
+    return;
+  }
   if (args[0] === 'projects') {
     const root = option(args, '--root');
     if (!root || args.slice(1).some((arg, index, rest) =>

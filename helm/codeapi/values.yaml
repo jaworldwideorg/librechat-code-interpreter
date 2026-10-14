@@ -306,11 +306,12 @@ workerSandbox:
       forceRebuild: false
       image:
         repository: codeapi-package-init
+        # Pin this tag to the same immutable release as the runner in production.
         tag: latest
-        pullPolicy: IfNotPresent
+        pullPolicy: Always
       pythonVersion: "3.14.4"
       nodeVersion: "24.15.0"
-      bunVersion: "1.3.14"
+      bunVersion: "1.4.2"
       bashPackageVersion: "5.2.0"
       backoffLimit: 2
       ttlSecondsAfterFinished: 3600

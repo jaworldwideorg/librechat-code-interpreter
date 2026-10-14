@@ -3,6 +3,12 @@ import { constants } from 'node:fs';
 import { open, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { parseDocument } from 'yaml';
+import { parseEnvironmentResources, loadEnvironmentResource } from './environment-resources.js';
+import { parseDependencySnapshot, loadDependencySnapshot } from './dependency-snapshots.js';
+import type { DependencySnapshotConfig, DependencySnapshotStore } from './dependency-snapshots.js';
+import { parseEnvironmentStorage } from './snapshot-lifecycle.js';
+import type { EnvironmentStoragePolicy } from './snapshot-lifecycle.js';
+import type { EnvironmentResource, LoadedEnvironmentResource } from './environment-resources.js';
 import {
     assertPrivateStorageAcl,
     assertPrivateStorageAncestors,
@@ -30,9 +36,11 @@ export interface CodeEnvironmentDefinition {
         command: string;
         timeoutMs: number;
         /** Explicit readiness contract; absent preserves startup setup behavior. */
-        reuse?: { inputs: string[]; checkCommand: string; checkTimeoutMs: number };
+        reuse?: { inputs: string[]; checkCommand: string; checkTimeoutMs: number; snapshot?: DependencySnapshotConfig };
     };
     actions?: { name: string; command: string; timeoutMs: number }[];
+    resources?: EnvironmentResource[];
+    storage?: EnvironmentStoragePolicy;
 }
 
 export interface LoadedCodeEnvironment {
@@ -41,6 +49,8 @@ export interface LoadedCodeEnvironment {
     rootPaths?: string[];
     definition: CodeEnvironmentDefinition;
     fingerprint: string;
+    resources?: LoadedEnvironmentResource[];
+    snapshotStore?: DependencySnapshotStore;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -73,7 +83,7 @@ export function parseCodeEnvironment(
         !record(value) ||
         Object.keys(value).some(
             key =>
-                !['name', 'root', 'repo', 'ref', 'setup', 'actions'].includes(
+                !['name', 'root', 'repo', 'ref', 'setup', 'actions', 'resources', 'storage'].includes(
                     key,
                 ),
         ) ||
@@ -120,7 +130,7 @@ export function parseCodeEnvironment(
             const candidate = value.setup.reuse;
             if (
                 !record(candidate) ||
-                Object.keys(candidate).some(key => !['inputs', 'checkCommand', 'checkTimeoutMs'].includes(key)) ||
+                Object.keys(candidate).some(key => !['inputs', 'checkCommand', 'checkTimeoutMs', 'snapshot'].includes(key)) ||
                 !Array.isArray(candidate.inputs) ||
                 candidate.inputs.length < 1 || candidate.inputs.length > 32 ||
                 candidate.inputs.some(path => typeof path !== 'string' || !isSafePortableRelativePath(path) || path === '.') ||
@@ -131,7 +141,8 @@ export function parseCodeEnvironment(
             const checkTimeoutMs = candidate.checkTimeoutMs ?? 10_000;
             if (typeof checkTimeoutMs !== 'number' || !Number.isSafeInteger(checkTimeoutMs) || checkTimeoutMs < 1 || checkTimeoutMs > BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS)
                 throw new Error('Invalid environment readiness check timeout');
-            reuse = { inputs: candidate.inputs as string[], checkCommand: candidate.checkCommand, checkTimeoutMs };
+            reuse = { inputs: candidate.inputs as string[], checkCommand: candidate.checkCommand, checkTimeoutMs,
+                ...(candidate.snapshot !== undefined ? { snapshot: parseDependencySnapshot(candidate.snapshot) } : {}) };
         }
         setup = { command: value.setup.command, timeoutMs, ...(reuse ? { reuse } : {}) };
     }
@@ -173,6 +184,8 @@ export function parseCodeEnvironment(
         ...(typeof value.ref === 'string' ? { ref: value.ref } : {}),
         ...(setup ? { setup } : {}),
         ...(actions ? { actions } : {}),
+        ...(value.resources !== undefined ? { resources: parseEnvironmentResources(value.resources) } : {}),
+        ...(value.storage !== undefined ? { storage: parseEnvironmentStorage(value.storage) } : {}),
     };
 }
 
@@ -224,12 +237,13 @@ export class EnvironmentWorkspaceTools implements WorkspaceToolExecutor {
     async execute(
         request: WorkspaceToolRequest,
         signal?: AbortSignal,
+        context?: { deadlineAtMs?: number },
     ): Promise<WorkspaceToolResult> {
         if (
             request.operation !== 'execute_command' ||
             !request.environmentAction
         ) {
-            return this.delegate.execute(request, signal);
+            return this.delegate.execute(request, signal, context);
         }
         const environment = this.environments.get(request.workspaceId);
         const action = environment?.definition.actions?.find(
@@ -258,6 +272,7 @@ export class EnvironmentWorkspaceTools implements WorkspaceToolExecutor {
                 cwd: '.',
             },
             signal,
+            context,
         );
     }
 }
@@ -328,6 +343,8 @@ export async function loadCodeEnvironment(
         sourceParents,
         rootPaths,
         definition,
+        ...(definition.resources ? { resources: await Promise.all(definition.resources.map(loadEnvironmentResource)) } : {}),
+        ...(definition.setup?.reuse?.snapshot ? { snapshotStore: await loadDependencySnapshot(definition.setup.reuse.snapshot) } : {}),
         fingerprint: createHash('sha256')
             .update(JSON.stringify(definition))
             .digest('hex'),

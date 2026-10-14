@@ -11,12 +11,14 @@ import {
   workspaceIsolationKey,
   workspaceIsolationKeysConflict,
   workspaceIsolationParent,
+  WORKSPACE_TOOL_ERROR_CODE_FALLBACKS,
 } from './protocol.js';
 import { EndpointRuntimeSupervisor } from './runtime.js';
 import { signBridgeRequest } from './identity.js';
 import { isWorkspaceToolRequest, WorkspaceToolError } from './workspace.js';
 
 import type {
+  WorkspaceCommandResultFeature,
   BridgeAssignment,
   BridgeLeaseResponse,
   BridgeSandboxRequest,
@@ -28,6 +30,7 @@ import type {
   BridgeWorkspaceToolOperation,
   BridgeWorkspaceProgrammaticRequest,
   RepositoryInstructionDescriptor,
+  WorkspaceToolErrorCode,
 } from './protocol.js';
 import type { RuntimeLease, RuntimeSupervisor } from './runtime.js';
 import type { WorkspaceToolExecutor } from './workspace.js';
@@ -216,6 +219,11 @@ function workspaceCapabilitiesMatch(
       (feature, index) => feature === executor.listFileFeatures?.[index],
     ) ??
       executor.listFileFeatures == null) &&
+    advertised.commandResultFeatures?.length === executor.commandResultFeatures?.length &&
+    (advertised.commandResultFeatures?.every(
+      (feature, index) => feature === executor.commandResultFeatures?.[index],
+    ) ??
+      executor.commandResultFeatures == null) &&
     advertised.programmaticLanguages?.length ===
       executor.programmaticLanguages?.length &&
     (advertised.programmaticLanguages?.every(
@@ -312,6 +320,7 @@ function registrationCompatibleCapabilities(
     editFileModes: _editFileModes,
     editFileFeatures: _editFileFeatures,
     listFileFeatures: _listFileFeatures,
+    commandResultFeatures: _commandResultFeatures,
     programmaticLanguages: _programmaticLanguages,
     ...compatibleWorkspaceTools
   } = workspaceTools;
@@ -407,6 +416,9 @@ function supportedWorkspaceCapabilities(
   const listFileFeatures = desired.listFileFeatures?.filter((feature) =>
     registration.supportedWorkspaceListFileFeatures?.includes(feature),
   );
+  const commandResultFeatures = desired.commandResultFeatures?.filter((feature) =>
+    registration.supportedWorkspaceCommandResultFeatures?.includes(feature),
+  );
   const programmaticLanguages = desired.programmaticLanguages?.filter(
     (language) =>
       registration.supportedWorkspaceProgrammaticLanguages?.includes(language),
@@ -416,6 +428,7 @@ function supportedWorkspaceCapabilities(
     editFileModes: _editFileModes,
     editFileFeatures: _editFileFeatures,
     listFileFeatures: _listFileFeatures,
+    commandResultFeatures: _commandResultFeatures,
     programmaticLanguages: _programmaticLanguages,
     ...compatibleDesired
   } = desired;
@@ -436,6 +449,9 @@ function supportedWorkspaceCapabilities(
         : {}),
       ...(operations.includes('list_files') && listFileFeatures?.length
         ? { listFileFeatures }
+        : {}),
+      ...(operations.includes('execute_command') && commandResultFeatures?.length
+        ? { commandResultFeatures }
         : {}),
       ...(operations.includes('execute_command') &&
       programmaticLanguages?.length
@@ -464,6 +480,13 @@ export class BridgeWorker {
   private registrationCapabilities: BridgeWorkerCapabilities;
   private activeCapabilities: BridgeWorkerCapabilities;
   private instructionMetadataSupported = true;
+  /** Added error codes the current Code API registration accepts in settlements. */
+  private settlementErrorCodes: ReadonlySet<WorkspaceToolErrorCode> = new Set();
+  /** Whether the registration that is actually active advertised this command result feature. */
+  commandResultFeatureActive(feature: WorkspaceCommandResultFeature): boolean {
+    return this.activeCapabilities.workspaceTools?.commandResultFeatures?.includes(feature) === true;
+  }
+
   private registrationTtlMs = DEFAULT_REGISTRATION_TTL_MS;
   private lastRegisteredAtMs = 0;
   private maintenanceOnly = false;
@@ -803,6 +826,11 @@ export class BridgeWorker {
     }
     this.registrationTtlMs = registration.leaseTtlMs;
     this.activeCapabilities = this.registrationCapabilities;
+    this.settlementErrorCodes = new Set(
+      Array.isArray(registration.supportedWorkspaceToolErrorCodes)
+        ? registration.supportedWorkspaceToolErrorCodes
+        : [],
+    );
     await this.options.onRegistered?.(registration);
     if (
       !this.maintenanceOnly &&
@@ -1845,6 +1873,7 @@ export class BridgeWorker {
         payload = await this.options.workspaceTools.execute(
           workspaceRequest,
           executionController.signal,
+          { deadlineAtMs: localDeadlineAtMs },
         );
         if (
           workspaceRequest.operation === 'list_files' &&
@@ -1853,6 +1882,14 @@ export class BridgeWorker {
         ) {
           const { nextAfterPath: _nextAfterPath, ...compatiblePayload } =
             payload;
+          payload = compatiblePayload;
+        }
+        if (
+          workspaceRequest.operation === 'execute_command' &&
+          !advertised.commandResultFeatures?.includes('lane_git') &&
+          'laneGit' in payload
+        ) {
+          const { laneGit: _laneGit, ...compatiblePayload } = payload;
           payload = compatiblePayload;
         }
         workspaceMutationApplied = isMutation;
@@ -2085,7 +2122,7 @@ export class BridgeWorker {
         ...((assignment.executionKind === 'workspace_tool' ||
           assignment.executionKind === 'workspace_programmatic') &&
         error instanceof WorkspaceToolError
-          ? { errorCode: error.code }
+          ? { errorCode: this.settlementErrorCode(error.code) }
           : {}),
         error: (assignment.executionKind === 'workspace_tool' &&
           isWorkspaceToolRequest(assignment.request) &&
@@ -2474,6 +2511,12 @@ export class BridgeWorker {
     );
   }
 
+  /** An older Code API refuses a settlement carrying a code it does not know. */
+  private settlementErrorCode(code: WorkspaceToolErrorCode): WorkspaceToolErrorCode {
+    if (this.settlementErrorCodes.has(code)) return code;
+    return WORKSPACE_TOOL_ERROR_CODE_FALLBACKS[code] ?? code;
+  }
+
   private async settleWithRetry(
     assignment: BridgeAssignment,
     settlement: BridgeSettlement,
@@ -2525,6 +2568,20 @@ export class BridgeWorker {
         } catch (error) {
           lastError = error;
           if (signal?.aborted) break;
+          const legacyErrorCode =
+            settlement.status === 'rejected' && settlement.errorCode != null
+              ? WORKSPACE_TOOL_ERROR_CODE_FALLBACKS[settlement.errorCode]
+              : undefined;
+          if (
+            settlement.status === 'rejected' &&
+            legacyErrorCode != null &&
+            error instanceof BridgeProtocolError &&
+            error.status === 400
+          ) {
+            /** A replica that predates the added code can still serve this settlement. */
+            settlement = { ...settlement, errorCode: legacyErrorCode };
+            continue;
+          }
           if (
             error instanceof BridgeProtocolError &&
             error.status != null &&

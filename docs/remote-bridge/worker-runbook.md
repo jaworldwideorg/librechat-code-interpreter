@@ -119,7 +119,7 @@ a separate machine.
 
 Install:
 
--   Node.js 20.11 or newer (Node.js 24 is supported);
+-   Node.js 22.21 or newer (Node.js 24 is supported);
 -   Git;
 -   `bubblewrap`, `socat`, and `ripgrep` on Linux;
 -   Bash 5.2 or newer and `jq` when Bash Programmatic Tool Calling is enabled;
@@ -521,6 +521,35 @@ replace the local clear command.
 Never clear quarantine merely to make the worker start. It represents a setup,
 command, cancellation, or settlement whose effects may be incomplete.
 
+### Disk filled by task worktrees
+
+Agents that create one linked worktree per task under `<checkout>/.worktrees/`
+leave each one behind with its own dependencies and build output. A worker with
+`--linked-worktree-lanes` retires stale ones automatically: two minutes after
+startup, every six hours, and before managed setup would be deferred for low
+space. Only verified linked worktrees in writable roots that are idle for seven
+days, clean, unlocked, outside any merge or rebase, unquarantined, and whose
+`HEAD` is on a remote-tracking ref or already in the default branch by content
+(a squash- or rebase-merged branch whose remote branch was deleted) are
+removed, with `git worktree remove` without `--force`. Merged content is judged
+against the checkout's last fetch of the default branch; the worker never
+fetches. Branches are kept; restore one with
+`git worktree add .worktrees/<name> <branch>`. The
+[worker package guide](../../packages/code/README.md#retiring-stale-linked-worktrees)
+lists every condition.
+
+Each pass logs `worktree retirement: retired N, kept M (reason counts)`. To see
+why a particular worktree is kept, restart once with
+`LIBRECHAT_CODE_LOG_LEVEL=debug`. Worktrees kept as `dirty` or `unpushed` hold
+work nobody has published; push or discard it from the checkout before removing
+them by hand, never with `rm -rf`. If the disk is already full and setup keeps
+failing, free space by hand first: retirement runs only after the worker starts,
+or during setup that has a `storage` floor configured.
+
+To keep every worktree, add `--no-worktree-retirement` (or
+`LIBRECHAT_CODE_WORKTREE_RETIREMENT=false`). To keep them longer, set
+`--worktree-idle-days <n>` (or `LIBRECHAT_CODE_WORKTREE_IDLE_DAYS`).
+
 ## 15. Common failures
 
 -   **`--environment cannot be combined...`:** remove old workspace flags and
@@ -533,7 +562,26 @@ command, cancellation, or settlement whose effects may be incomplete.
 -   **Worker online but not ready:** check native sandbox preparation, definition
     validation, setup, quarantine, and readiness logs.
 -   **Setup repeats on restart:** setup is intentionally per-start; make it
-    idempotent or remove it.
+    idempotent, remove it, or opt in to the bounded `setup.reuse` readiness
+    contract in the [worker package guide](../../packages/code/README.md#reusing-a-prepared-checkout).
+-   **Dependency copies fill the disk:** declare shared npm/uv/browser resources
+    instead of per-worktree downloads. On a verified clone-capable filesystem,
+    configure private copy-on-write snapshots and their lifecycle budget. Do not
+    symlink another branch's mutable `node_modules` or hardlink writable installs.
+-   **Managed preparation deferred for low space:** `storage.minFreeBytes` plus
+    `setupReserveBytes` is a soft pre-setup floor, not a hard quota. A worker
+    with linked worktree lanes first retires stale task worktrees and measures
+    again. If space is still short, expand the volume or clean reproducible
+    artifacts; do not clear quarantine as a disk fix.
+-   **Many `.worktrees/*` directories remain:** see
+    [Disk filled by task worktrees](#disk-filled-by-task-worktrees). Count the
+    kept reasons in the retirement summary before removing anything by hand.
+-   **Snapshot maintenance:** preview with `prune-environment-storage
+    --environment <file>` and use `--apply` only after reviewing its JSON. Active,
+    unknown and unmarked data stays intact. Include all environment definitions
+    for root-isolation checks. This does not archive source worktrees or prune
+    mutable tool caches. Keep control state on separate storage when hard
+    protection from arbitrary build writes is required.
 -   **Git works on the host but not in tools:** verify the App installation,
     permissions, private-key mode/owner, and allowed GitHub domains.
 -   **Repository label is present but files are absent:** `repo`/`ref` are

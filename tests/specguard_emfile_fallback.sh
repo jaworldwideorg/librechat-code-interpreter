@@ -7,14 +7,14 @@ set -euo pipefail
 # Run in a Linux image with static libc support, for example:
 #   docker run --rm -v "$PWD:/work" -w /work alpine:latest sh -lc \
 #     'apk add --no-cache bash build-base linux-headers >/dev/null && \
-#      services/codeapi/tests/specguard_emfile_fallback.sh'
+#      tests/specguard_emfile_fallback.sh'
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 CC="${CC:-gcc}"
-SPEC_GUARD_SRC="$ROOT/services/codeapi/api/src/spec-guard.c"
+SPEC_GUARD_SRC="$ROOT/api/src/spec-guard.c"
 
 cat > "$TMP_DIR/fd_poison.c" <<'C'
 #define _GNU_SOURCE

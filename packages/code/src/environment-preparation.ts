@@ -8,6 +8,14 @@ import {
 } from './storage.js';
 import type { CodeEnvironmentDefinition } from './environment.js';
 import type { WorkspaceRootIdentity } from './root-identity.js';
+import {
+    withDependencySnapshot,
+    restoreDependencySnapshot,
+    publishDependencySnapshot,
+} from './dependency-snapshots.js';
+import type { DependencySnapshotStore } from './dependency-snapshots.js';
+import { assertPreparationSpace } from './snapshot-lifecycle.js';
+import type { EnvironmentStoragePolicy } from './snapshot-lifecycle.js';
 
 // Safety bounds on operator-declared hashing, not a dependency-store quota.
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
@@ -25,12 +33,43 @@ export interface EnvironmentPreparationOptions {
         timeoutMs: number,
     ): Promise<{ exitCode: number | null; timedOut: boolean }>;
     signal?: AbortSignal;
+    snapshotStore?: DependencySnapshotStore;
+    snapshotScope?: string;
+    beforeMutation?(): Promise<void>;
+    storage?: EnvironmentStoragePolicy;
+    /** Frees reproducible storage when the storage floor would defer setup. */
+    reclaimSpace?(): Promise<unknown>;
 }
 
 /** Checkout-local reuse. Never transfers mutable installations between worktrees. */
 export async function prepareCodeEnvironment(
     options: EnvironmentPreparationOptions,
-): Promise<'prepared' | 'reused'> {
+): Promise<'prepared' | 'reused' | 'restored'> {
+    if (options.snapshotStore) {
+        if (!options.setup.reuse?.snapshot || !options.snapshotScope)
+            throw new Error(
+                'Dependency snapshot requires an explicit preparation scope',
+            );
+        if (options.snapshotStore.identity.dev !== options.identity.dev)
+            throw new Error(
+                'Dependency snapshots and checkouts must use the same clone-capable filesystem',
+            );
+        const portable = await preparationKey(options, true);
+        return withDependencySnapshot(
+            options.snapshotStore,
+            portable!,
+            () => prepareInLock(options, portable),
+            options.signal,
+            true,
+        );
+    }
+    return prepareInLock(options);
+}
+
+async function prepareInLock(
+    options: EnvironmentPreparationOptions,
+    portable?: string,
+): Promise<'prepared' | 'reused' | 'restored'> {
     options.signal?.throwIfAborted();
     const key = await preparationKey(options);
     if (
@@ -48,6 +87,50 @@ export async function prepareCodeEnvironment(
         if (check.exitCode === 0 && (await preparationKey(options)) === key)
             return 'reused';
     }
+    if (options.snapshotStore && portable) {
+        if (options.storage)
+            await assertPreparationSpace(
+                options.root,
+                options.storage,
+                undefined,
+                options.reclaimSpace,
+            );
+        await options.beforeMutation?.();
+        if (
+            await restoreDependencySnapshot(
+                options.snapshotStore,
+                portable,
+                options.root,
+                options.identity,
+                options.signal,
+            )
+        ) {
+            const reuse = options.setup.reuse!;
+            const check = await options.execute(
+                reuse.checkCommand,
+                reuse.checkTimeoutMs,
+            );
+            options.signal?.throwIfAborted();
+            if (check.timedOut || check.exitCode === null)
+                throw new Error(
+                    'Restored dependency readiness check did not settle',
+                );
+            if (
+                check.exitCode === 0 &&
+                (await preparationKey(options)) === key
+            ) {
+                await saveEnvironmentPreparationKey(options.receiptPath, key!);
+                return 'restored';
+            }
+        }
+    }
+    if (options.storage)
+        await assertPreparationSpace(
+            options.root,
+            options.storage,
+            undefined,
+            options.reclaimSpace,
+        );
     const result = await options.execute(
         options.setup.command,
         options.setup.timeoutMs,
@@ -74,19 +157,28 @@ export async function prepareCodeEnvironment(
                 'Environment preparation inputs changed during readiness check',
             );
         await saveEnvironmentPreparationKey(options.receiptPath, key);
+        if (options.snapshotStore && portable)
+            await publishDependencySnapshot(
+                options.snapshotStore,
+                portable,
+                options.root,
+                options.identity,
+                options.signal,
+            );
     }
     return 'prepared';
 }
 
 async function preparationKey(
     options: EnvironmentPreparationOptions,
+    portable = false,
 ): Promise<string | undefined> {
     if (!options.setup.reuse) return undefined;
     return withWorkspaceRoot(options.root, options.identity, async () => {
         const hash = createHash('sha256').update(
             JSON.stringify({
                 version: 1,
-                root: options.identity,
+                root: portable ? options.snapshotScope : options.identity,
                 setup: options.setup,
                 context: options.context,
                 node: process.version,

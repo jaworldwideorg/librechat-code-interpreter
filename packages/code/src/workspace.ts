@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, open, realpath, rename, stat, unlink, spawn, withWorkspaceRoot, WorkspaceRootAccessError } from './root-access.js';
+import { deferWorkspaceRootCleanup, holdsWorkspaceRoot, link, lstat, mkdir, open, realpath, rename, stat, unlink, spawn, withWorkspaceRoot, WorkspaceRootAccessError } from './root-access.js';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { FileHandle } from 'node:fs/promises';
@@ -100,6 +100,8 @@ export interface WorkspaceToolExecutor {
   execute(
     request: WorkspaceToolRequest,
     signal?: AbortSignal,
+    /** Local epoch ms after which the worker aborts this execution. Advisory work must finish well before it. */
+    context?: { deadlineAtMs?: number },
   ): Promise<WorkspaceToolResult>;
 }
 
@@ -133,6 +135,8 @@ const MAX_SEARCH_CANDIDATE_BYTES = 1024 * 1024;
 const MAX_SEARCH_CANDIDATES = 20_000;
 const SEARCH_TIMEOUT_MS = 10_000;
 const LIST_TIMEOUT_MS = 10_000;
+const READ_TIMEOUT_MS = 10_000;
+const READ_CHUNK_BYTES = 64 * 1024;
 
 const READ_OPERATIONS = [
   'read_file',
@@ -273,10 +277,18 @@ function resolveWorkspacePath(root: string, requestedPath: string): string {
   return candidate;
 }
 
-async function readConfinedFileBuffer(
+interface WorkspaceReadControl {
+  signal?: AbortSignal;
+  deadline: number;
+  interrupted: boolean;
+}
+
+async function withConfinedFile<T>(
   root: string,
   requestedPath: string,
-): Promise<Buffer> {
+  read: (handle: FileHandle, size: number) => Promise<T>,
+  control?: WorkspaceReadControl,
+): Promise<T> {
   const candidate = resolveWorkspacePath(root, requestedPath);
   let handle: FileHandle | undefined;
   try {
@@ -297,7 +309,31 @@ async function readConfinedFileBuffer(
     ) {
       throw new Error('Invalid workspace path');
     }
-    if (openedFile.size > BRIDGE_WORKSPACE_READ_MAX_BYTES) {
+    return await read(handle, openedFile.size);
+  } catch (error) {
+    if (error instanceof WorkspaceToolError) throw error;
+    if (isMissingEntry(error)) {
+      throw await classifyMissingWorkspacePath(root, candidate);
+    }
+    throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
+  } finally {
+    if (handle) {
+      const closing = handle.close();
+      if (control?.interrupted) {
+        // Node retains the descriptor and buffer until outstanding I/O drains.
+        deferWorkspaceRootCleanup();
+        void closing.catch(() => {});
+      } else await closing;
+    }
+  }
+}
+
+async function readConfinedFileBuffer(
+  root: string,
+  requestedPath: string,
+): Promise<Buffer> {
+  return withConfinedFile(root, requestedPath, async (handle, size) => {
+    if (size > BRIDGE_WORKSPACE_READ_MAX_BYTES) {
       throw new WorkspaceToolError(
         'Workspace file exceeds read limit',
         'READ_LIMIT_EXCEEDED',
@@ -322,28 +358,222 @@ async function readConfinedFileBuffer(
       );
     }
     return buffer.subarray(0, bytesRead);
-  } catch (error) {
-    if (error instanceof WorkspaceToolError) throw error;
-    throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
+  });
+}
+
+function interruptRead(
+  control: WorkspaceReadControl,
+  message: string,
+  code: 'EXECUTION_ABORTED' | 'READ_LIMIT_EXCEEDED',
+): WorkspaceToolError {
+  control.interrupted = true;
+  return new WorkspaceToolError(message, code);
+}
+
+function checkReadDeadline(control: WorkspaceReadControl): void {
+  if (control.signal?.aborted) {
+    throw interruptRead(
+      control,
+      'Workspace tool execution aborted',
+      'EXECUTION_ABORTED',
+    );
+  }
+  if (performance.now() >= control.deadline) {
+    throw interruptRead(
+      control,
+      'Workspace read exceeded its scan time limit; request an earlier startLine or use search_text to locate content',
+      'READ_LIMIT_EXCEEDED',
+    );
+  }
+}
+
+async function readWorkspaceChunk(
+  handle: FileHandle,
+  buffer: Buffer,
+  length: number,
+  position: number,
+  control: WorkspaceReadControl,
+): Promise<number> {
+  checkReadDeadline(control);
+  const { signal, deadline } = control;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      handle
+        .read(buffer, 0, length, position)
+        .then((result) => result.bytesRead),
+      new Promise<never>((_, reject) => {
+        abort = () =>
+          reject(
+            interruptRead(
+              control,
+              'Workspace tool execution aborted',
+              'EXECUTION_ABORTED',
+            ),
+          );
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+        timer = setTimeout(
+          () =>
+            reject(
+              interruptRead(
+                control,
+                'Workspace read exceeded its scan time limit; retry with an earlier startLine',
+                'READ_LIMIT_EXCEEDED',
+              ),
+            ),
+          Math.max(0, deadline - performance.now()),
+        );
+      }),
+    ]);
   } finally {
-    await handle?.close();
+    if (timer !== undefined) clearTimeout(timer);
+    if (abort) signal?.removeEventListener('abort', abort);
   }
 }
 
 async function readConfinedFile(
   root: string,
-  requestedPath: string,
-): Promise<string> {
-  const decoded = decodeWorkspaceText(
-    await readConfinedFileBuffer(root, requestedPath),
-  );
-  if (Buffer.byteLength(decoded, 'utf8') > BRIDGE_WORKSPACE_READ_MAX_BYTES) {
-    throw new WorkspaceToolError(
-      'Workspace file exceeds read limit',
-      'READ_LIMIT_EXCEEDED',
+  request: WorkspaceReadFileRequest,
+  signal?: AbortSignal,
+): Promise<WorkspaceReadFileResult> {
+  const startLine = request.startLine ?? 1;
+  const maxLines = request.maxLines ?? 200;
+  const control: WorkspaceReadControl = {
+    signal,
+    deadline: performance.now() + READ_TIMEOUT_MS,
+    interrupted: false,
+  };
+  const read = async (
+    handle: FileHandle,
+    size: number,
+  ): Promise<WorkspaceReadFileResult> => {
+    const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    // Fix the read extent at admission so an appending writer cannot extend the scan.
+    let position = 0;
+    const header = Buffer.alloc(3);
+    let headerBytes = 0;
+    while (headerBytes < header.length && position < size) {
+      const bytes = await readWorkspaceChunk(
+        handle,
+        buffer,
+        Math.min(header.length - headerBytes, size - position),
+        position,
+        control,
+      );
+      checkReadDeadline(control);
+      if (bytes === 0) break;
+      buffer.copy(header, headerBytes, 0, bytes);
+      headerBytes += bytes;
+      position += bytes;
+    }
+    const utf16le =
+      headerBytes >= 2 && header[0] === 0xff && header[1] === 0xfe;
+    const utf16be =
+      headerBytes >= 2 && header[0] === 0xfe && header[1] === 0xff;
+    const bomBytes =
+      utf16le || utf16be
+        ? 2
+        : headerBytes === 3 &&
+          header[0] === 0xef &&
+          header[1] === 0xbb &&
+          header[2] === 0xbf
+        ? 3
+        : 0;
+    // Preserve ordinary reads' replacement decoding and BOM-marked UTF-16 support.
+    const decoder = new TextDecoder(
+      utf16le ? 'utf-16le' : utf16be ? 'utf-16be' : 'utf-8',
+      { ignoreBOM: true },
     );
-  }
-  return decoded;
+    const lines: string[] = [];
+    let fragments: string[] = [];
+    let line = 1;
+    let lineBytes = 0;
+    let returnedBytes = 0;
+    let hasText = false;
+    let truncated = false;
+    const consume = (text: string): void => {
+      let offset = 0;
+      while (offset < text.length) {
+        checkReadDeadline(control);
+        const newline = text.indexOf('\n', offset);
+        const end = newline < 0 ? text.length : newline;
+        if (line >= startLine) {
+          if (lines.length === maxLines) {
+            truncated = true;
+            return;
+          }
+          const fragment = text.slice(offset, end);
+          const bytes = Buffer.byteLength(fragment, 'utf8');
+          if (
+            returnedBytes + (lines.length > 0 ? 1 : 0) + lineBytes + bytes >
+            BRIDGE_WORKSPACE_READ_MAX_BYTES
+          ) {
+            if (lines.length === 0) {
+              throw new WorkspaceToolError(
+                `Workspace file exceeds read limit: line ${line} cannot fit within ${BRIDGE_WORKSPACE_READ_MAX_BYTES} UTF-8 bytes; request a later startLine or use search_text`,
+                'READ_LIMIT_EXCEEDED',
+              );
+            }
+            truncated = true;
+            return;
+          }
+          if (fragment.length > 0) fragments.push(fragment);
+          lineBytes += bytes;
+        }
+        hasText ||= end > offset;
+        if (newline < 0) return;
+        if (line >= startLine) {
+          lines.push(fragments.join(''));
+          returnedBytes += (lines.length > 1 ? 1 : 0) + lineBytes;
+          fragments = [];
+          lineBytes = 0;
+        }
+        line += 1;
+        hasText = false;
+        offset = newline + 1;
+      }
+    };
+    consume(
+      decoder.decode(header.subarray(bomBytes, headerBytes), {
+        stream: true,
+      }),
+    );
+    while (!truncated && position < size) {
+      const bytes = await readWorkspaceChunk(
+        handle,
+        buffer,
+        Math.min(buffer.length, size - position),
+        position,
+        control,
+      );
+      checkReadDeadline(control);
+      if (bytes === 0) break;
+      position += bytes;
+      consume(decoder.decode(buffer.subarray(0, bytes), { stream: true }));
+    }
+    if (!truncated) {
+      consume(decoder.decode());
+      if (!truncated && line >= startLine && (hasText || line === 1)) {
+        lines.push(fragments.join(''));
+      }
+    }
+    checkReadDeadline(control);
+    const endLine = startLine + lines.length - 1;
+    return {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'read_file',
+      workspaceId: request.workspaceId,
+      path: request.path,
+      content: lines.join('\n'),
+      startLine,
+      endLine,
+      truncated,
+      ...(truncated ? { nextStartLine: endLine + 1 } : {}),
+    };
+  };
+  return withConfinedFile(root, request.path, read, control);
 }
 
 interface WorkspaceRoot {
@@ -367,6 +597,147 @@ async function verifyDirectoryPathHasNoSymlinks(
     }
   }
   return currentIdentity;
+}
+
+function isMissingEntry(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+}
+
+interface DirectoryIdentity {
+  path: string;
+  dev: bigint | number;
+  ino: bigint | number;
+}
+
+/** Whether each ancestor observed before a miss is still the same real directory. */
+async function ancestorsUnchanged(ancestors: readonly DirectoryIdentity[]): Promise<boolean> {
+  for (const ancestor of ancestors) {
+    try {
+      const current = await lstat(ancestor.path);
+      if (
+        current.isSymbolicLink() ||
+        !current.isDirectory() ||
+        current.dev !== ancestor.dev ||
+        current.ino !== ancestor.ino
+      ) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Reports an absent target as `NOT_FOUND` only when the walk from the root
+ * reaches the missing entry through real directories, the root included, that
+ * are unchanged after the miss. A symlink, a file used as a directory, or an ancestor replaced
+ * during the walk stays a path-safety rejection, so the distinction never
+ * describes a path beyond the root.
+ */
+async function classifyMissingWorkspacePath(
+  root: string,
+  candidate: string,
+): Promise<WorkspaceToolError> {
+  const invalid = new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
+  const segments = relative(root, candidate).split(sep).filter(Boolean);
+  const ancestors: DirectoryIdentity[] = [];
+  try {
+    const rootEntry = await lstat(root);
+    if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) return invalid;
+    ancestors.push({ path: root, dev: rootEntry.dev, ino: rootEntry.ino });
+  } catch {
+    return invalid;
+  }
+  let current = root;
+  for (const [index, segment] of segments.entries()) {
+    current = resolve(current, segment);
+    let entry: Awaited<ReturnType<typeof lstat>>;
+    try {
+      entry = await lstat(current);
+    } catch (error) {
+      return isMissingEntry(error) && (await ancestorsUnchanged(ancestors))
+        ? new WorkspaceToolError('Workspace path does not exist', 'NOT_FOUND')
+        : invalid;
+    }
+    if (index === segments.length - 1) return invalid;
+    if (entry.isSymbolicLink() || !entry.isDirectory()) return invalid;
+    ancestors.push({ path: current, dev: entry.dev, ino: entry.ino });
+  }
+  return invalid;
+}
+
+/**
+ * Creates each missing ancestor of a write target as a real directory beneath
+ * the root, one verified level at a time, and syncs each new entry into its
+ * parent. Creation needs a held root descriptor, so `mkdirat` is anchored to
+ * the root; a pathname-only root creates nothing and its write reports the
+ * missing parent. An existing symlink or file stops the walk.
+ *
+ * Created directories are a committed side effect, never rolled back: once one
+ * exists, a later failure of this write is reported as a possible mutation, so
+ * the worker quarantines rather than claiming an atomic rejection.
+ */
+async function createMissingParentDirectories(
+  root: string,
+  candidate: string,
+): Promise<string[]> {
+  const created: string[] = [];
+  if (!holdsWorkspaceRoot()) return created;
+  const segments = relative(root, dirname(candidate)).split(sep).filter(Boolean);
+  let current = root;
+  try {
+    for (const segment of segments) {
+      current = resolve(current, segment);
+      let entry: Awaited<ReturnType<typeof lstat>> | undefined;
+      try {
+        entry = await lstat(current);
+      } catch (error) {
+        if (!isMissingEntry(error)) throw error;
+      }
+      let createdHere = false;
+      if (entry == null) {
+        try {
+          await mkdir(current, 0o777);
+          created.push(current);
+          createdHere = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        entry = await lstat(current);
+        /** Also after a raced `EEXIST`: the write relies on that entry too. */
+        await syncWorkspaceDirectory(dirname(current));
+      }
+      if (
+        entry.isSymbolicLink() ||
+        !entry.isDirectory() ||
+        (createdHere && !isWithinRoot(root, await realpath(current)))
+      ) {
+        throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
+      }
+    }
+    return created;
+  } catch (error) {
+    throw afterCreatedDirectories(created, classifyWritePathValidationError(error));
+  }
+}
+
+function afterCreatedDirectories(
+  created: readonly string[],
+  error: WorkspaceToolError,
+): WorkspaceToolError {
+  if (created.length === 0 || error.mutationMayHaveCommitted) return error;
+  return new WorkspaceToolError(error.message, error.code, true);
+}
+
+function assertWithinWriteLimit(content: Buffer): void {
+  if (content.byteLength > BRIDGE_WORKSPACE_WRITE_MAX_BYTES) {
+    throw new WorkspaceToolError(
+      'Workspace file exceeds write limit',
+      'WRITE_LIMIT_EXCEEDED',
+    );
+  }
 }
 
 function classifyWritePathValidationError(error: unknown): WorkspaceToolError {
@@ -481,12 +852,7 @@ async function atomicWriteConfinedFile(
   allowOverwrite = true,
 ): Promise<{ created: boolean }> {
   throwIfAborted(signal);
-  if (content.byteLength > BRIDGE_WORKSPACE_WRITE_MAX_BYTES) {
-    throw new WorkspaceToolError(
-      'Workspace file exceeds write limit',
-      'WRITE_LIMIT_EXCEEDED',
-    );
-  }
+  assertWithinWriteLimit(content);
   const candidate = resolveWorkspacePath(root, requestedPath);
   const parent = dirname(candidate);
   let canonicalParent: string;
@@ -498,6 +864,9 @@ async function atomicWriteConfinedFile(
       throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
     }
   } catch (error) {
+    if (isMissingEntry(error)) {
+      throw await classifyMissingWorkspacePath(root, parent);
+    }
     throw classifyWritePathValidationError(error);
   }
 
@@ -671,14 +1040,26 @@ async function writeWorkspaceFile(
   signal?: AbortSignal,
 ): Promise<WorkspaceWriteFileResult> {
   const content = Buffer.from(request.content, 'utf8');
-  const { created } = await atomicWriteConfinedFile(
+  throwIfAborted(signal);
+  assertWithinWriteLimit(content);
+  const directories = await createMissingParentDirectories(
     root,
-    request.path,
-    content,
-    signal,
-    undefined,
-    request.overwrite !== false,
+    resolveWorkspacePath(root, request.path),
   );
+  let created: boolean;
+  try {
+    /** Once parents exist, finish the write rather than abandon them to a cancellation. */
+    ({ created } = await atomicWriteConfinedFile(
+      root,
+      request.path,
+      content,
+      directories.length === 0 ? signal : undefined,
+      undefined,
+      request.overwrite !== false,
+    ));
+  } catch (error) {
+    throw afterCreatedDirectories(directories, classifyWritePathValidationError(error));
+  }
   return {
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     operation: 'write_file',
@@ -757,6 +1138,9 @@ async function editWorkspaceFile(
     };
   } catch (error) {
     if (error instanceof WorkspaceToolError) throw error;
+    if (isMissingEntry(error)) {
+      throw await classifyMissingWorkspacePath(root, candidate);
+    }
     throw classifyWritePathValidationError(error);
   } finally {
     await opened?.close().catch(() => undefined);
@@ -1009,7 +1393,10 @@ async function searchWorkspace(
   let canonicalTarget: string;
   try {
     canonicalTarget = await realpath(target);
-  } catch {
+  } catch (error) {
+    if (isMissingEntry(error)) {
+      throw await classifyMissingWorkspacePath(root, target);
+    }
     throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
   }
   if (!isWithinRoot(root, canonicalTarget))
@@ -1060,7 +1447,9 @@ async function searchWorkspace(
     } catch (error) {
       if (
         error instanceof WorkspaceToolError &&
-        (error.code === 'INVALID_PATH' || error.code === 'READ_LIMIT_EXCEEDED')
+        (error.code === 'INVALID_PATH' ||
+          error.code === 'NOT_FOUND' ||
+          error.code === 'READ_LIMIT_EXCEEDED')
       ) {
         continue;
       }
@@ -1167,6 +1556,13 @@ async function listWorkspaceFiles(
     );
   } catch (error) {
     if (error instanceof WorkspaceToolError) throw error;
+    if (isMissingEntry(error)) {
+      throw await withinListDeadline(
+        classifyMissingWorkspacePath(root, target),
+        signal,
+        deadline,
+      );
+    }
     throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
   }
   if (!isWithinRoot(root, canonicalTarget)) {
@@ -1181,6 +1577,13 @@ async function listWorkspaceFiles(
     ).isDirectory();
   } catch (error) {
     if (error instanceof WorkspaceToolError) throw error;
+    if (isMissingEntry(error)) {
+      throw await withinListDeadline(
+        classifyMissingWorkspacePath(root, target),
+        signal,
+        deadline,
+      );
+    }
     throw new WorkspaceToolError('Invalid workspace path', 'INVALID_PATH');
   }
   const normalizedRequestedResultPath = request.path
@@ -1655,31 +2058,7 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
     ) {
       throw new WorkspaceToolError('Invalid workspace read', 'INVALID_REQUEST');
     }
-    const content = await readConfinedFile(root, request.path);
-    if (signal?.aborted) {
-      throw new WorkspaceToolError(
-        'Workspace tool execution aborted',
-        'EXECUTION_ABORTED',
-      );
-    }
-    const lines = content.endsWith('\n')
-      ? content.slice(0, -1).split('\n')
-      : content.split('\n');
-    const selected = lines.slice(startLine - 1, startLine - 1 + maxLines);
-    const endLine = startLine + selected.length - 1;
-    const truncated = endLine < lines.length;
-
-    return {
-      protocolVersion: BRIDGE_PROTOCOL_VERSION,
-      operation: 'read_file',
-      workspaceId: request.workspaceId,
-      path: request.path,
-      content: selected.join('\n'),
-      startLine,
-      endLine,
-      truncated,
-      ...(truncated ? { nextStartLine: endLine + 1 } : {}),
-    };
+    return readConfinedFile(root, request, signal);
   }
 }
 
