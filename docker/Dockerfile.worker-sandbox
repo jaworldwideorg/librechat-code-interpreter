@@ -391,6 +391,9 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 RUN curl -fsSL https://bun.sh/install | bash
 
 ENV PATH="/root/.bun/bin:${PATH}"
+# COPY --from=sandbox-rootfs carries files, not the stage's environment.
+# Direct mode inherits this final image environment when entering the rootfs.
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 
 # --- Launcher (runs on host, boots microVM) ---
 COPY --from=launcher-builder \

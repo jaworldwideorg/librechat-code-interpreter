@@ -29,6 +29,14 @@ if (process.argv[2] === '--client') {
   console.log('PASS: image Node/broker/bridge/NsJail/guard pipe round trip');
 } else {
   (async () => {
+    // Check the final image environment too: COPY of a guest rootfs must not
+    // silently discard the path required by the bundled sandbox API.
+    assert(process.env.SANDBOX_PIPE_ADDON, 'final image must configure SANDBOX_PIPE_ADDON');
+    const addon = require(process.env.SANDBOX_PIPE_ADDON);
+    for (const fd of addon.createPipe()) {
+      assert(fs.fstatSync(fd).isFIFO());
+      fs.closeSync(fd);
+    }
     const upstream = http.createServer(async (req, res) => {
       assert.equal(req.url, '/tool-call');
       assert.equal(req.headers['x-callback-token'], 'image-token');

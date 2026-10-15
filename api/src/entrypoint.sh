@@ -3,6 +3,23 @@ set -e
 
 echo "Starting NsJail sandbox API..."
 
+# The combined direct runner does not inherit intermediate Docker-stage ENV,
+# and the microVM launcher forwards only an allowlisted guest environment.
+# Resolve the packaged addon here instead of falling back to a build-time path.
+export SANDBOX_PIPE_ADDON="${SANDBOX_PIPE_ADDON:-/usr/local/lib/anonymous-pipes.node}"
+if ! /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/bun -e '
+  const fs = require("node:fs");
+  const addon = require(process.env.SANDBOX_PIPE_ADDON);
+  const fds = addon.createPipe();
+  for (const fd of fds) {
+    if (!fs.fstatSync(fd).isFIFO()) throw new Error("Expected an anonymous pipe");
+    fs.closeSync(fd);
+  }
+'; then
+    echo "FATAL: sandbox pipe addon could not be loaded: ${SANDBOX_PIPE_ADDON}" >&2
+    exit 1
+fi
+
 # Raise the RLIMIT_NOFILE limits so per-job nsjail can set its own soft
 # limit (SANDBOX_MAX_OPEN_FILES) without EPERM. The AWS Lambda MicroVM base
 # image ships a 1024 hard cap, below the sandbox default of 2048; nsjail

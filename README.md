@@ -302,6 +302,13 @@ OpenShell. Keep `KVM_ENABLED=false`, `CODEAPI_SANDBOX_BACKEND=http`,
 `CODEAPI_EXECUTION_PROFILE=default`, and `CODEAPI_RUNTIME_SESSION_MODE=stateless`
 for the existing JA deployment. Keep the external Nginx body limit at `25m`.
 
+If an older combined direct-mode image reports that
+`/app/.build/anonymous-pipes.node` is missing, temporarily set
+`SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node` on `worker-sandbox` and
+recreate the workers. Updated images set this in the final image and validate
+the addon before starting the sandbox API. This path-only correction requires
+an updated worker image, not another package-tree rebuild.
+
 Standard Python asyncio and explicit spawn/fork multiprocessing use patched
 pipes; arbitrary socketpair-dependent libraries, forkserver, and multiprocessing
 managers remain unsupported. Basic Bun JavaScript/TypeScript works, but Bun
