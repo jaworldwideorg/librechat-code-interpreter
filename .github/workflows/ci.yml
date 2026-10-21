@@ -187,6 +187,14 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE/tests,target=/tests,readonly" \
             --entrypoint /usr/local/bin/node \
             launcher-guest-test /tests/pipe_runtime_image.cjs
+      - name: Execute through the packaged guest API without build-stage ENV
+        run: |
+          for addon_path in unset empty override; do
+            docker run --rm --privileged --network none \
+              --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work,readonly" \
+              --entrypoint bun launcher-guest-test \
+              /work/tests/sandbox_pipe_addon_image.ts "$addon_path"
+          done
       - name: Load legacy netfilter modules for hosted-app isolation
         run: sudo modprobe -a ip_tables ip6_tables iptable_filter ip6table_filter xt_conntrack xt_owner ipt_REJECT ip6t_REJECT
       - name: Verify supervisor filter and anonymous stdio
@@ -233,6 +241,33 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE/tests,target=/tests,readonly" \
             nsjail-ipc-test \
             python3 /tests/tool_call_pipes.py /policy /broker.cjs /client.py
+
+  guest-api-image-tests:
+    name: Guest API Execution (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: api/Dockerfile
+            target: sandbox-build
+          - dockerfile: docker/Dockerfile.worker-sandbox
+            target: sandbox-rootfs
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Build the production guest rootfs
+        run: docker build --target "${{ matrix.target }}" -t guest-api-test -f "${{ matrix.dockerfile }}" .
+      - name: Execute through the packaged guest API without build-stage ENV
+        # Test the roots copied into the direct/KVM runners, removing the
+        # Docker ENV metadata that does not survive that COPY/VM boundary.
+        run: |
+          for addon_path in unset empty override; do
+            docker run --rm --privileged --network none \
+              --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work,readonly" \
+              --entrypoint bun guest-api-test \
+              /work/tests/sandbox_pipe_addon_image.ts "$addon_path"
+          done
 
   service-unit-tests:
     name: Service Unit Tests
