@@ -1,0 +1,87 @@
+name: JA verified Code API release
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+        description: Publish verified images without changing deployments
+permissions:
+  contents: read
+concurrency:
+  group: ja-codeapi-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.repository == 'jaworldwideorg/librechat-code-interpreter'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install test prerequisites and locked dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y redis-server jq
+          cd service
+          bun install --frozen-lockfile
+      - name: Verify API types, authorization and replay behavior
+        working-directory: service
+        run: |
+          bunx tsc --noEmit -p tsconfig.esm.json
+          bun test ./src/*.test.ts ./src/*.spec.ts ./src/**/*.test.ts ./src/**/*.spec.ts
+          bun run test:ptc
+  images:
+    needs: verify
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            file: service/Dockerfile.api
+            target: production
+          - name: file-server
+            file: service/Dockerfile
+            target: production
+          - name: tool-call-server
+            file: service/Dockerfile.tool-call-server
+            target: production
+          - name: worker-sandbox
+            file: docker/Dockerfile.worker-sandbox
+            target: worker-sandbox-false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - uses: docker/build-push-action@v7
+        id: image
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ secrets.ACR_LOGIN_SERVER }}/librechat/code-interpreter/${{ matrix.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/jaworldwideorg/librechat-code-interpreter
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=code-interpreter-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=code-interpreter-${{ matrix.name }}
+      - name: Save digest-pinned reference
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: printf '%s/librechat/code-interpreter/%s@%s\n' "$REGISTRY" '${{ matrix.name }}' "$DIGEST" > image-reference.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: codeapi-image-${{ matrix.name }}
+          path: image-reference.txt
