@@ -75,9 +75,35 @@ jobs:
           echo "checkout_sha=$checkout_sha" >> "$GITHUB_OUTPUT"
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
 
+  verify:
+    name: Verify Linux service before publication
+    needs: sync
+    if: needs.sync.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.checkout_sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install locked dependencies and Redis test prerequisite
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y redis-server jq
+          cd service
+          bun install --frozen-lockfile
+      - name: Test types, authorization and replay
+        working-directory: service
+        run: |
+          bunx tsc --noEmit -p tsconfig.esm.json
+          bun test ./src/*.test.ts ./src/*.spec.ts ./src/**/*.test.ts ./src/**/*.spec.ts
+          bun run test:ptc
+
   publish:
     name: Publish ${{ matrix.image }}
-    needs: sync
+    needs: [sync, verify]
     if: needs.sync.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -120,6 +146,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Build and publish image
+        id: image
         uses: docker/build-push-action@v7.3.0
         with:
           context: .
@@ -130,5 +157,19 @@ jobs:
           tags: |
             ${{ secrets.ACR_LOGIN_SERVER }}/${{ matrix.image }}:latest
             ${{ secrets.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ needs.sync.outputs.upstream_sha }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ matrix.image }}:sha-${{ needs.sync.outputs.checkout_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/jaworldwideorg/librechat-code-interpreter
+            org.opencontainers.image.revision=${{ needs.sync.outputs.checkout_sha }}
           cache-from: type=gha,scope=${{ matrix.cache_scope }}
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Save digest-pinned image reference
+        env:
+          REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: printf '%s/%s@%s\n' "$REGISTRY" '${{ matrix.image }}' "$DIGEST" > image-reference.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.cache_scope }}-reference
+          path: image-reference.txt
