@@ -120,7 +120,7 @@ does not mount. The namespace-disabled native policy tests cover those APIs
 when shared memory exists, not their availability in the default jail.
 
 With runtime packages built by `build-packages.sh` (or a compatible `/pkgs`
-tree containing Python 3.14.4 and Bun 1.4.2), run from the repository root:
+tree containing Python 3.14.4 and Bun 1.4.4), run from the repository root:
 
 ```sh
 bun service/scripts/dump-pipe-preamble.ts > /tmp/codeapi-pipe-client.py
@@ -180,7 +180,7 @@ Remaining service audit findings at this change:
 - `braces` (GHSA-vfj7-8cjw-p6xm): development-only dependency with no published
   fix. Do not feed untrusted patterns to build tooling; track an upstream fix.
 
-Bun 1.4.2 subprocess spawning with piped stdio also uses socketpairs and is
+Bun 1.4.4 subprocess spawning with piped stdio also uses socketpairs and is
 denied by this policy. Basic JS/TS execution remains supported. Replacing Bun
 subprocess IPC requires a separate runtime change; do not re-enable socketpairs
 to provide that compatibility.

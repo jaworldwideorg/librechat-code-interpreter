@@ -1812,55 +1812,67 @@ test('writes create missing parent directories inside a held workspace root', as
   assert.equal((await stat(join(root, 'src', 'feature', 'deep'))).isDirectory(), true);
 });
 
-test('parent creation never follows symlinks, crosses files, or leaves the workspace', async (t) => {
-  const parent = await realpath(
-    await mkdtemp(join(tmpdir(), 'librechat-code-workspace-parent-')),
-  );
-  t.after(() => rm(parent, { recursive: true, force: true }));
-  const root = join(parent, 'root');
-  const outside = join(parent, 'outside');
-  await mkdir(join(root, 'src'), { recursive: true });
-  await mkdir(outside);
-  await writeFile(join(root, 'file.txt'), 'file');
-  await symlink(outside, join(root, 'linked-outside'));
-  await symlink(join(root, 'src'), join(root, 'alias'));
-  await symlink(join(parent, 'missing-target'), join(root, 'dangling'));
-  const tools = await heldRootTools(root);
+/** A root registered by path alone, as `--worker-dir`, `--workspace` and `--environment` do. */
+async function pathnameRootTools(root: string): Promise<LocalWorkspaceTools> {
+  return LocalWorkspaceTools.create({
+    workspaces: [{ id: 'primary', root, writable: true }],
+  });
+}
 
-  for (const [path, code] of [
-    ['linked-outside/new/notes.txt', 'INVALID_PATH'],
-    ['alias/new/notes.txt', 'INVALID_PATH'],
-    ['dangling/new/notes.txt', 'INVALID_PATH'],
-    ['file.txt/new/notes.txt', 'INVALID_PATH'],
-    ['../outside/new/notes.txt', 'INVALID_REQUEST'],
-    ['new/../../outside/notes.txt', 'INVALID_REQUEST'],
-  ] as const) {
-    await assert.rejects(
-      tools.execute({
-        protocolVersion: 1,
-        operation: 'write_file',
-        workspaceId: 'primary',
-        path,
-        content: 'blocked',
-      }),
-      (error: unknown) =>
-        error instanceof WorkspaceToolError &&
-        error.code === code &&
-        !error.mutationMayHaveCommitted,
-      path,
+for (const [kind, createTools] of [
+  ['held', heldRootTools],
+  ['pathname-only', pathnameRootTools],
+] as const) {
+  test(`parent creation never follows symlinks, crosses files, or leaves a ${kind} workspace`, async (t) => {
+    const parent = await realpath(
+      await mkdtemp(join(tmpdir(), 'librechat-code-workspace-parent-')),
     );
-  }
-  assert.deepEqual(await readdir(outside), []);
-  assert.deepEqual(await readdir(join(root, 'src')), []);
-  assert.deepEqual((await readdir(root)).sort(), [
-    'alias',
-    'dangling',
-    'file.txt',
-    'linked-outside',
-    'src',
-  ]);
-  await assert.rejects(stat(join(parent, 'missing-target')));
-});
+    t.after(() => rm(parent, { recursive: true, force: true }));
+    const root = join(parent, 'root');
+    const outside = join(parent, 'outside');
+    await mkdir(join(root, 'src'), { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(root, 'file.txt'), 'file');
+    await symlink(outside, join(root, 'linked-outside'));
+    await symlink(join(root, 'src'), join(root, 'alias'));
+    await symlink(join(parent, 'missing-target'), join(root, 'dangling'));
+    const tools = await createTools(root);
+
+    for (const [path, code] of [
+      ['linked-outside/new/notes.txt', 'INVALID_PATH'],
+      ['alias/new/notes.txt', 'INVALID_PATH'],
+      ['dangling/new/notes.txt', 'INVALID_PATH'],
+      ['file.txt/new/notes.txt', 'INVALID_PATH'],
+      ['../outside/new/notes.txt', 'INVALID_REQUEST'],
+      ['new/../../outside/notes.txt', 'INVALID_REQUEST'],
+    ] as const) {
+      await assert.rejects(
+        tools.execute({
+          protocolVersion: 1,
+          operation: 'write_file',
+          workspaceId: 'primary',
+          path,
+          content: 'blocked',
+        }),
+        (error: unknown) =>
+          error instanceof WorkspaceToolError &&
+          error.code === code &&
+          !error.mutationMayHaveCommitted,
+        path,
+      );
+    }
+    assert.deepEqual(await readdir(outside), []);
+    assert.deepEqual(await readdir(join(root, 'src')), []);
+    assert.deepEqual((await readdir(root)).sort(), [
+      'alias',
+      'dangling',
+      'file.txt',
+      'linked-outside',
+      'src',
+    ]);
+    await assert.rejects(stat(join(parent, 'missing-target')));
+  });
+}
 
 test('a write finishes once it has created parents, even if cancelled', async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'librechat-code-workspace-')));
@@ -1914,12 +1926,65 @@ test('a write cancelled before creating parents leaves the workspace unchanged',
   assert.deepEqual(await readdir(root), []);
 });
 
-test('a pathname-only workspace root reports a missing parent instead of creating it', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'librechat-code-workspace-'));
+test('a pathname-only workspace root creates missing parents like a held root', async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'librechat-code-workspace-')));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const tools = await LocalWorkspaceTools.create({
-    workspaces: [{ id: 'primary', root, writable: true }],
-  });
+  const tools = await pathnameRootTools(root);
+
+  for (const [path, overwrite] of [
+    ['.librechat/attachments/.gitignore', false],
+    ['missing/deep/notes.txt', undefined],
+  ] as const) {
+    const result = await tools.execute({
+      protocolVersion: 1,
+      operation: 'write_file',
+      workspaceId: 'primary',
+      path,
+      content: '*\n',
+      ...(overwrite === undefined ? {} : { overwrite }),
+    });
+    assert.deepEqual(result, {
+      protocolVersion: 1,
+      operation: 'write_file',
+      workspaceId: 'primary',
+      path,
+      created: true,
+      bytesWritten: 2,
+    });
+    assert.equal(await readFile(join(root, ...path.split('/')), 'utf8'), '*\n');
+  }
+  assert.equal((await stat(join(root, '.librechat', 'attachments'))).isDirectory(), true);
+
+  await assert.rejects(
+    tools.execute({
+      protocolVersion: 1,
+      operation: 'write_file',
+      workspaceId: 'primary',
+      path: '.librechat/attachments/.gitignore',
+      content: '!keep\n',
+      overwrite: false,
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError &&
+      error.code === 'EDIT_CONFLICT' &&
+      !error.mutationMayHaveCommitted,
+    'a create never replaces a file in a folder it just created',
+  );
+  assert.equal(await readFile(join(root, '.librechat', 'attachments', '.gitignore'), 'utf8'), '*\n');
+});
+
+test('a pathname-only root that has been replaced by a symlink creates nothing', async (t) => {
+  const parent = await realpath(
+    await mkdtemp(join(tmpdir(), 'librechat-code-workspace-parent-')),
+  );
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'root');
+  const elsewhere = join(parent, 'elsewhere');
+  await mkdir(root);
+  await mkdir(elsewhere);
+  const tools = await pathnameRootTools(root);
+  await rm(root, { recursive: true });
+  await symlink(elsewhere, root);
 
   await assert.rejects(
     tools.execute({
@@ -1931,10 +1996,10 @@ test('a pathname-only workspace root reports a missing parent instead of creatin
     }),
     (error: unknown) =>
       error instanceof WorkspaceToolError &&
-      error.code === 'NOT_FOUND' &&
-      error.message === 'Workspace path does not exist',
+      error.code === 'INVALID_PATH' &&
+      !error.mutationMayHaveCommitted,
   );
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(elsewhere), []);
 });
 
 test('a missing workspace path is NOT_FOUND only when reached through the workspace', async (t) => {
@@ -2603,7 +2668,8 @@ test('fails closed on invalid or failed sandbox command results', async (t) => {
   for (const execute of [
     async () => ({ ...request, exitCode: 0, stdout: 'ok', stderr: '' }),
     async () => { throw new Error('container details'); },
-    async () => { throw new WorkspaceToolError('untrusted clean claim', 'COMMAND_UNAVAILABLE'); },
+    async () => { throw new WorkspaceToolError('untrusted clean claim', 'COMMAND_UNAVAILABLE', false, false,
+      { stage: 'command_wrapping', reason: 'wrapping_failed' }); },
   ]) {
     const tools = new SandboxWorkspaceTools({
       workspaceTools: local,
@@ -2616,6 +2682,7 @@ test('fails closed on invalid or failed sandbox command results', async (t) => {
         error instanceof WorkspaceToolError &&
         error.code === 'COMMAND_UNAVAILABLE' &&
         error.mutationMayHaveCommitted === true &&
+        (error.message !== 'untrusted clean claim' || error.commandDiagnostic?.stage === 'command_wrapping') &&
         !error.message.includes('container details'),
     );
     assert.equal(tools.mutationFailuresAreAtomic, undefined);

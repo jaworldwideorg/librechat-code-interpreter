@@ -48,7 +48,7 @@ COPY api/src/spec-guard.c /tmp/spec-guard.c
 COPY api/src/tool-call-pipe-bridge.c /tmp/tool-call-pipe-bridge.c
 COPY api/src/anonymous-pipes.c /tmp/anonymous-pipes.c
 COPY api/src/supervisor-policy.c /tmp/supervisor-policy.c
-COPY --from=node:22-slim /usr/local/include/node /usr/local/include/node
+COPY --from=node:22.23.4-slim /usr/local/include/node /usr/local/include/node
 COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
 RUN gcc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/local/include/node -o /usr/local/lib/anonymous-pipes.node /tmp/anonymous-pipes.c \
     && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-supervisor-policy /tmp/supervisor-policy.c \
@@ -65,7 +65,7 @@ FROM buildpack-deps:bookworm AS package-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHON_VERSION=3.14.4
-ENV BUN_VERSION=1.4.2
+ENV BUN_VERSION=1.4.4
 
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
@@ -118,7 +118,7 @@ RUN chmod +x /package-init.sh \
 # ============================================================================
 # Stage 2: Build worker
 # ============================================================================
-FROM oven/bun:1.4.2 AS worker-builder
+FROM oven/bun:1.4.4 AS worker-builder
 WORKDIR /app
 
 COPY service/package.json service/bun.lock ./
@@ -139,7 +139,7 @@ RUN bun build ./src/worker-server.ts \
 # ============================================================================
 # Stage 3: Build sandbox API
 # ============================================================================
-FROM oven/bun:1.4.2 AS sandbox-builder
+FROM oven/bun:1.4.4 AS sandbox-builder
 WORKDIR /app
 
 COPY api/package.json ./
@@ -154,7 +154,7 @@ RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@
 # ============================================================================
 # Stage 4: Build Debian sandbox rootfs
 # ============================================================================
-FROM oven/bun:1.4.2-debian AS sandbox-rootfs
+FROM oven/bun:1.4.4-debian AS sandbox-rootfs
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -275,7 +275,7 @@ COPY --from=nsjail-builder-debian /usr/local/bin/sandbox-supervisor-policy /usr/
 COPY --from=nsjail-builder-debian /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
 ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 RUN chmod +x /usr/sbin/nsjail
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 

@@ -30,6 +30,7 @@ export function getWorkspaceToolOutcome(res: Response, route = '/workspace-tools
   if (existing != null) return existing;
   const startedAt = performance.now();
   let responseEndedAt: number | undefined;
+  let responseFinished = false;
   let logged = false;
   const outcome: WorkspaceToolOutcome = {
     dispatchPending: false,
@@ -37,7 +38,7 @@ export function getWorkspaceToolOutcome(res: Response, route = '/workspace-tools
       if (logged || responseEndedAt == null || outcome.dispatchPending) return;
       logged = true;
       outcomes.delete(res);
-      const finished = res.writableFinished;
+      const finished = responseFinished;
       logger.log(finished && res.statusCode < 400 ? 'info' : 'warn', 'Workspace tool request completed', {
         route,
         operation: outcome.operation,
@@ -55,6 +56,8 @@ export function getWorkspaceToolOutcome(res: Response, route = '/workspace-tools
     res.removeListener('finish', onResponseEnd);
     res.removeListener('close', onResponseEnd);
     responseEndedAt = performance.now();
+    // Late dispatch settlement can write to a closed response. Preserve its state at close.
+    responseFinished = res.writableFinished;
     outcome.flush();
   };
   outcomes.set(res, outcome);

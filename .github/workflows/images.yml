@@ -33,6 +33,7 @@ on:
       - javascript-packages.txt
       - launcher/**
       - packages/code/src/**
+      - packages/extraction/**
       - service/**
       - shared/**
   pull_request:
@@ -70,6 +71,8 @@ jobs:
         run: |
           images=$(jq -c . <<'JSON'
           [
+            {"image": "code-interpreter-extraction", "dockerfile": "packages/extraction/Dockerfile", "target": "runtime",
+             "description": "Authenticated isolated PDF/DOCX extraction service", "timeout": 15},
             {"image": "code-interpreter-api", "dockerfile": "service/Dockerfile", "target": "api",
              "description": "Code API HTTP server (Compose service api)", "timeout": 30},
             {"image": "code-interpreter-worker", "dockerfile": "service/Dockerfile", "target": "worker",

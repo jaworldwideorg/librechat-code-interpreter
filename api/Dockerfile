@@ -35,7 +35,7 @@ COPY api/src/spec-guard.c /tmp/spec-guard.c
 COPY api/src/tool-call-pipe-bridge.c /tmp/tool-call-pipe-bridge.c
 COPY api/src/anonymous-pipes.c /tmp/anonymous-pipes.c
 COPY api/src/supervisor-policy.c /tmp/supervisor-policy.c
-COPY --from=node:22-slim /usr/local/include/node /usr/local/include/node
+COPY --from=node:22.23.4-slim /usr/local/include/node /usr/local/include/node
 COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
 RUN gcc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/local/include/node -o /usr/local/lib/anonymous-pipes.node /tmp/anonymous-pipes.c \
     && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-supervisor-policy /tmp/supervisor-policy.c \
@@ -49,8 +49,8 @@ FROM nsjail-builder AS nsjail-ipc-test
 ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 COPY docker/python-runtime /python-runtime
 RUN python3 /python-runtime/install.py
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=oven/bun:1.4.2-debian /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=oven/bun:1.4.4-debian /usr/local/bin/bun /usr/local/bin/bun
 
 # ============================================================================
 # Stage 1b: Build language runtime packages (only consumed by sandbox-runner-baked)
@@ -64,7 +64,7 @@ FROM buildpack-deps:bookworm AS package-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHON_VERSION=3.14.4
-ENV BUN_VERSION=1.4.2
+ENV BUN_VERSION=1.4.4
 
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
@@ -89,7 +89,7 @@ RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
 # ============================================================================
 # Stage 2: Build sandbox rootfs
 # ============================================================================
-FROM oven/bun:1.4.2-debian AS sandbox-build
+FROM oven/bun:1.4.4-debian AS sandbox-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -218,7 +218,7 @@ RUN chmod +x /usr/sbin/nsjail
 # The per-invocation broker starts Node after restore, so its OpenSSL process
 # state is not captured in the MicroVM snapshot. Pulling the Node binary
 # is ~30 MB and avoids inheriting npm/node_modules from a full apt install.
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 
