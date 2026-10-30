@@ -1,11 +1,10 @@
 import IORedis from 'ioredis';
-import type { CommonRedisOptions } from 'ioredis';
 import type * as tls from 'tls';
 import { env } from './config';
 import type { EgressGrantClaims } from './egress-grant';
 import { EgressGrantError } from './egress-grant';
 import logger from './logger';
-import { redisKeepAliveOptions } from './redis-options';
+import { redisKeepAliveOptions, redisReconnectDelay } from './redis-options';
 import { EGRESS_LEDGER_SCRIPT } from './egress-ledger-script';
 
 type LedgerStatus = 'active' | 'revoked';
@@ -37,6 +36,7 @@ export interface EgressLedgerRecord {
 export const EGRESS_LEDGER_REDIS_RETRY_OPTIONS = {
   autoResendUnfulfilledCommands: false,
   maxRetriesPerRequest: 0,
+  retryStrategy: redisReconnectDelay,
 } as const;
 
 let redis: IORedis | null = null;
@@ -55,16 +55,11 @@ function ttlSeconds(exp: number): number {
 
 function redisConnection(): IORedis {
   if (redis) return redis;
-  const retryStrategy: CommonRedisOptions['retryStrategy'] = times => {
-    if (times > 5) return null;
-    return 2000;
-  };
   redis = new IORedis({
     host: process.env.REDIS_HOST ?? 'redis',
     port: Number(process.env.REDIS_PORT) || 6379,
     password: process.env.REDIS_PASSWORD,
     ...EGRESS_LEDGER_REDIS_RETRY_OPTIONS,
-    retryStrategy,
     enableReadyCheck: true,
     connectTimeout: 10000,
     ...redisKeepAliveOptions(),
