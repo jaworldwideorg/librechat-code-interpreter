@@ -40,6 +40,7 @@ import { SandboxBackendError } from './types';
 import { Jobs } from '../enum';
 import { checkpointPipelineBudgetMs } from '../config';
 import logger from '../logger';
+import { admissionLease, MicrovmAdmission, MicrovmAdmissionError } from '../runtime-session/admission';
 
 /** Header that opts a proxied /execute into the runner's persistent session
  *  workspace (see api/src/session-workspace.ts). Session mode is delivered
@@ -199,6 +200,7 @@ interface LambdaMicrovmBackendDeps {
   pollIntervalMs?: number;
   /** Injected in session+checkpoint mode; undefined disables checkpoints. */
   checkpointStore?: CheckpointStore;
+  admission?: MicrovmAdmission;
 }
 
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
@@ -259,12 +261,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   private readonly clientFactory: () => Promise<LambdaMicrovmClient>;
   private readonly pollIntervalMs: number;
   private readonly checkpointStore: CheckpointStore | undefined;
+  private readonly admission: MicrovmAdmission | undefined;
 
   constructor(deps: LambdaMicrovmBackendDeps) {
     this.clientFactory = deps.clientFactory;
     this.config = deps.config;
     this.pollIntervalMs = deps.pollIntervalMs ?? 500;
     this.checkpointStore = deps.checkpointStore;
+    this.admission = deps.admission;
   }
 
   private checkpointsActive(): boolean {
@@ -809,12 +813,25 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       && !likelyIdleTerminated
       && (record.hard_deadline_at == null || record.hard_deadline_at - Date.now() > deadlineHeadroomMs);
     if (reusable && record) {
-      /* Reuse the warm VM. If AWS auto-suspended it, the proxy request
-       * transparently auto-resumes it (idlePolicy.autoResume). */
-      return {
-        vm: { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint },
-        restored: false,
-      };
+      // Redis describes the last successful call, not current provider state.
+      // Detect externally terminated VMs before using their stale endpoint so
+      // the first replacement request restores the committed checkpoint.
+      try {
+        const current = await client.getMicrovm(record.microvm_id as string, ctx.signal);
+        if (current.state !== 'TERMINATED' && current.state !== 'TERMINATING') {
+          // The proxy can still auto-resume a suspended VM without a separate
+          // preflight HTTP probe or loss of its warm workspace.
+          return {
+            vm: { ...current, endpoint: current.endpoint ?? record.endpoint },
+            restored: false,
+          };
+        }
+      } catch (error) {
+        if (!(error instanceof LambdaMicrovmApiError) || error.kind !== 'not_found') {
+          // An inconclusive provider read must not recycle a healthy session.
+          throw error;
+        }
+      }
     }
 
     /* We're relaunching. Always terminate a recorded VM before replacing it.
@@ -969,7 +986,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
     const launchedRecord: RuntimeSessionRecord = {
       ...launchIntent,
-      launch_client_token: launchIntent.launch_client_token ?? launchClientToken,
+      launch_client_token: vm.launchClientToken ?? launchIntent.launch_client_token ?? launchClientToken,
       launch_request_fingerprint: launchIntent.launch_request_fingerprint ?? launchRequestFingerprint,
       microvm_id: vm.microvmId,
       endpoint: vm.endpoint,
@@ -1466,6 +1483,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       signal: AbortSignal.any([ctx.signal, deadlineSignal]),
     };
     const normalizeBudgetFailure = (error: unknown): unknown =>
+      error instanceof SandboxBackendError && error.code === 'MICROVM_LAUNCH_THROTTLED' ? error :
       !ctx.signal.aborted && this.launchBudgetExpired(budget)
         ? this.launchTimeoutError()
         : error;
@@ -1528,6 +1546,37 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   ): Promise<MicrovmDescription> {
     const endLaunchTimer = microvmLaunchDuration.startTimer();
     this.assertLaunchBudget(ctx, budget);
+    const request = {
+        imageIdentifier: this.config.imageArn,
+        imageVersion: this.config.imageVersion,
+        executionRoleArn: this.config.executionRoleArn,
+        logGroup: this.config.logGroup,
+        ingressConnectorArns: this.config.ingressConnectorArns,
+        egressConnectorArns: this.config.egressConnectorArns,
+        maximumDurationSeconds: opts.maxDurationSeconds,
+        idlePolicy: opts.idlePolicy,
+        clientToken: opts.clientToken,
+      };
+    let lease: Awaited<ReturnType<MicrovmAdmission['reserve']>> | undefined;
+    if (this.admission) {
+      try {
+        await this.admission.reconcile(client, {
+          signal: budget.signal, minimumAgeMs: 2 * this.config.launchTimeoutMs + 120_000,
+          beforeRun: () => acquireOpBudget('run', { limitPerSecond: this.config.launchTps,
+            budgetMs: Math.max(1, budget.deadlineAtMs - Date.now()), deadlineAtMs: budget.deadlineAtMs, signal: budget.signal }),
+        });
+        lease = await this.admission.reserveWhenAvailable(admissionLease({ tenant: ctx.tenantId ?? '', user: ctx.canonicalUserId ?? '',
+          kind: 'coding', lane: ctx.runtimeSessionId && ctx.runtimeSessionMode !== 'stateless' ? 'workspace' : 'execution', request }), client, {
+          signal: budget.signal, minimumAgeMs: 2 * this.config.launchTimeoutMs + 120_000,
+          beforeRun: () => acquireOpBudget('run', { limitPerSecond: this.config.launchTps,
+            budgetMs: Math.max(1, budget.deadlineAtMs - Date.now()), deadlineAtMs: budget.deadlineAtMs, signal: budget.signal }),
+        });
+      } catch (error) {
+        ctx.signal.throwIfAborted();
+        throw new SandboxBackendError(error instanceof MicrovmAdmissionError && error.code === 'OWNER_BUSY'
+          ? 'RUNTIME_SESSION_BUSY' : 'MICROVM_LAUNCH_THROTTLED', error instanceof Error ? error.message : 'VM admission unavailable', error);
+      }
+    }
     try {
       await acquireOpBudget('run', {
         limitPerSecond: this.config.launchTps,
@@ -1547,17 +1596,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
     let vm: MicrovmDescription;
     try {
-      vm = await client.runMicrovm({
-        imageIdentifier: this.config.imageArn,
-        imageVersion: this.config.imageVersion,
-        executionRoleArn: this.config.executionRoleArn,
-        logGroup: this.config.logGroup,
-        ingressConnectorArns: this.config.ingressConnectorArns,
-        egressConnectorArns: this.config.egressConnectorArns,
-        maximumDurationSeconds: opts.maxDurationSeconds,
-        idlePolicy: opts.idlePolicy,
-        clientToken: opts.clientToken,
-      }, budget.signal, budget.deadlineSignal);
+      vm = await client.runMicrovm(lease?.request ?? request, budget.signal, budget.deadlineSignal);
+      if (lease && this.admission) {
+        try { await this.admission.bind(lease, vm.microvmId, budget.signal); }
+        catch (error) {
+          await this.terminate(client, vm.microvmId, 'admission-binding');
+          throw error;
+        }
+      }
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
         await poisonOpBucket('run', undefined, {
@@ -1580,7 +1626,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const ready = await this.waitUntilRunning(client, vm, ctx, budget);
       microvmLaunches.inc({ outcome: 'ok' });
       endLaunchTimer();
-      return ready;
+      return { ...ready, launchClientToken: (lease?.request ?? request).clientToken };
     } catch (error) {
       microvmLaunches.inc({ outcome: 'failed' });
       const terminated = await this.terminate(client, vm.microvmId, 'error');
@@ -1672,6 +1718,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         microvmId,
         AbortSignal.timeout(this.config.launchTimeoutMs),
       );
+      if (this.admission) {
+        const signal = AbortSignal.timeout(Math.min(5_000, this.config.launchTimeoutMs));
+        try {
+          while (!await this.admission.releaseVmIfTerminated(microvmId, client, signal)) await sleep(100, signal);
+        } catch { /* Retain the slot; the next admission reconciles it. */ }
+      }
       microvmTerminations.inc({ reason });
       return true;
     } catch (error) {

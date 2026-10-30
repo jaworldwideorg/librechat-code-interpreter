@@ -1,4 +1,6 @@
 import { env } from '../config';
+import { MicrovmAdmission } from '../runtime-session/admission';
+import { DynamoMicrovmAdmissionStore } from '../runtime-session/admission-dynamodb-aws';
 import { checkpointSession, restoreSession } from '../runtime-session/checkpoint';
 import { MinioCheckpointStore } from '../runtime-session/checkpoint-store';
 import { AwsLambdaMicrovmClient } from '../runtime-session/lambda-client-aws';
@@ -53,6 +55,10 @@ export function getHostedAppControlPlane(): HostedAppControlPlane {
     appStartTimeoutMs: env.HOSTED_APP_START_TIMEOUT_MS,
     launchTps: env.LAMBDA_MICROVM_LAUNCH_TPS,
     tokenTps: env.LAMBDA_MICROVM_TOKEN_TPS,
+  }, {
+    admission: env.MICROVM_ADMISSION_TABLE ? new MicrovmAdmission(new DynamoMicrovmAdmissionStore(
+      env.MICROVM_ADMISSION_TABLE, { region: env.LAMBDA_MICROVM_REGION },
+    )) : undefined,
   });
   const store = new MinioCheckpointStore();
   const checkpointConfig = {

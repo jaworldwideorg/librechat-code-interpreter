@@ -1,7 +1,7 @@
 /**
  * Thin, fakeable wrapper over the AWS Lambda MicroVM control plane.
- * `lambda-client-aws.ts` is the ONLY module allowed to import `@aws-sdk/*`;
- * everything else (backend, sweeper, tests) programs against this interface.
+ * `lambda-client-aws.ts` confines MicroVM SDK imports; the admission AWS
+ * adapter confines DynamoDB SDK imports. Backends use these fakeable interfaces.
  */
 
 export type MicrovmLifecycleState =
@@ -19,6 +19,8 @@ export interface MicrovmDescription {
   imageArn?: string;
   imageVersion?: string;
   maximumDurationSeconds?: number;
+  /** Actual owned provider token after a recovered boot retry. Control-plane only. */
+  launchClientToken?: string;
   startedAtMs?: number;
   stateReason?: string;
 }

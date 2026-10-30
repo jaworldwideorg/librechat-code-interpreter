@@ -30,7 +30,7 @@ docker-compose*.yaml
 Dockerfile*
 
 # Build artifacts
-node_modules/
+**/node_modules/
 dist/
 build/
 *.log

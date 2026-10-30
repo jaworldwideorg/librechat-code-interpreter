@@ -13,6 +13,7 @@ import {
 } from '../runtime-session/throttle';
 import type { ResidentHostedAppSpec } from './spec';
 import { createHash } from 'node:crypto';
+import { admissionLease, MicrovmAdmission, MicrovmAdmissionError } from '../runtime-session/admission';
 
 export interface HostedAppMicrovmConfig {
   imageArn: string;
@@ -111,6 +112,7 @@ export class HostedAppMicrovmError extends Error {
 }
 
 interface HostedAppMicrovmDeps {
+  admission?: MicrovmAdmission;
   reserveOp: (
     op: ThrottledOp,
     args: { limitPerSecond: number; deadlineAtMs: number; signal: AbortSignal },
@@ -192,7 +194,7 @@ export class HostedAppMicrovmRuntime {
     };
   }
 
-  async launch(clientToken: string, callerSignal: AbortSignal): Promise<{
+  async launch(clientToken: string, callerSignal: AbortSignal, owner?: { tenantId: string; canonicalUserId: string }): Promise<{
     vm: MicrovmDescription;
     clientToken: string;
   }> {
@@ -200,8 +202,8 @@ export class HostedAppMicrovmRuntime {
     const deadlineSignal = AbortSignal.timeout(this.config.launchTimeoutMs);
     const signal = AbortSignal.any([callerSignal, deadlineSignal]);
     try {
-      const first = await this.launchOnce(clientToken, deadlineAtMs, signal, deadlineSignal);
-      return { vm: first, clientToken };
+      const first = await this.launchOnce(clientToken, deadlineAtMs, signal, deadlineSignal, owner);
+      return { vm: first, clientToken: first.launchClientToken ?? clientToken };
     } catch (error) {
       const failure = signal.aborted
         ? new HostedAppMicrovmError(
@@ -216,7 +218,7 @@ export class HostedAppMicrovmRuntime {
        * can replay and recover the provider resource. */
       if (failure.code !== 'hosted_app_boot_failed' || callerSignal.aborted) throw failure;
       const retryToken = `${clientToken}-r1`;
-      const vm = await this.launchOnce(retryToken, deadlineAtMs, signal, deadlineSignal)
+      const vm = await this.launchOnce(retryToken, deadlineAtMs, signal, deadlineSignal, owner)
         .catch(second => {
           if (signal.aborted) {
             throw new HostedAppMicrovmError('hosted_app_launch_timeout',
@@ -224,7 +226,7 @@ export class HostedAppMicrovmRuntime {
           }
           throw launchFailure(second);
         });
-      return { vm, clientToken: retryToken };
+      return { vm, clientToken: vm.launchClientToken ?? retryToken };
     }
   }
 
@@ -233,7 +235,42 @@ export class HostedAppMicrovmRuntime {
     deadlineAtMs: number,
     signal: AbortSignal,
     reconcileSignal: AbortSignal,
+    owner?: { tenantId: string; canonicalUserId: string },
   ): Promise<MicrovmDescription> {
+    const request = {
+        imageIdentifier: this.config.imageArn,
+        imageVersion: this.config.imageVersion,
+        executionRoleArn: this.config.executionRoleArn,
+        logGroup: this.config.logGroup,
+        ingressConnectorArns: this.config.ingressConnectorArns,
+        /* No egress connector is passed. The app-host runner additionally
+         * blocks all new OUTPUT traffic from the untrusted app UID. */
+        maximumDurationSeconds: this.config.maximumDurationSeconds,
+        idlePolicy: {
+          maxIdleSeconds: this.config.idleSeconds,
+          suspendedSeconds: this.config.suspendedSeconds,
+          autoResume: true,
+        },
+        clientToken,
+      };
+    let lease: Awaited<ReturnType<MicrovmAdmission['reserve']>> | undefined;
+    if (this.deps.admission) {
+      try {
+        await this.deps.admission.reconcile(this.client, {
+          signal, minimumAgeMs: 2 * this.config.launchTimeoutMs + 120_000,
+          beforeRun: () => this.deps.reserveOp('run', { limitPerSecond: this.config.launchTps, deadlineAtMs, signal }),
+        });
+        lease = await this.deps.admission.reserveWhenAvailable(admissionLease({ tenant: owner?.tenantId ?? '', user: owner?.canonicalUserId ?? '',
+          kind: 'app', lane: 'app', request }), this.client, {
+          signal, minimumAgeMs: 2 * this.config.launchTimeoutMs + 120_000,
+          beforeRun: () => this.deps.reserveOp('run', { limitPerSecond: this.config.launchTps, deadlineAtMs, signal }),
+        });
+      } catch (error) {
+        const ownerBusy = error instanceof MicrovmAdmissionError && error.code === 'OWNER_BUSY';
+        throw new HostedAppMicrovmError(ownerBusy ? 'hosted_app_owner_busy' : 'hosted_app_launch_throttled',
+          error instanceof Error ? error.message : 'App VM admission unavailable', !ownerBusy, error, ownerBusy ? 409 : 503);
+      }
+    }
     try {
       await this.deps.reserveOp('run', {
         limitPerSecond: this.config.launchTps,
@@ -254,22 +291,11 @@ export class HostedAppMicrovmRuntime {
 
     let vm: MicrovmDescription;
     try {
-      vm = await this.client.runMicrovm({
-        imageIdentifier: this.config.imageArn,
-        imageVersion: this.config.imageVersion,
-        executionRoleArn: this.config.executionRoleArn,
-        logGroup: this.config.logGroup,
-        ingressConnectorArns: this.config.ingressConnectorArns,
-        /* No egress connector is passed. The app-host runner additionally
-         * blocks all new OUTPUT traffic from the untrusted app UID. */
-        maximumDurationSeconds: this.config.maximumDurationSeconds,
-        idlePolicy: {
-          maxIdleSeconds: this.config.idleSeconds,
-          suspendedSeconds: this.config.suspendedSeconds,
-          autoResume: true,
-        },
-        clientToken,
-      }, signal, reconcileSignal);
+      vm = await this.client.runMicrovm(lease?.request ?? request, signal, reconcileSignal);
+      if (lease && this.deps.admission) {
+        try { await this.deps.admission.bind(lease, vm.microvmId, signal); }
+        catch (error) { await this.terminate(vm.microvmId); throw error; }
+      }
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
         await this.deps.poisonOp('run', deadlineAtMs, signal).catch(() => {});
@@ -287,7 +313,7 @@ export class HostedAppMicrovmRuntime {
           true,
         );
       }
-      if (current.state === 'RUNNING' && current.endpoint) return current;
+      if (current.state === 'RUNNING' && current.endpoint) return { ...current, launchClientToken: (lease?.request ?? request).clientToken };
       if (current.state === 'TERMINATING' || current.state === 'TERMINATED') {
         throw new HostedAppMicrovmError(
           'hosted_app_boot_failed',
@@ -490,6 +516,12 @@ export class HostedAppMicrovmRuntime {
         microvmId,
         AbortSignal.timeout(this.config.launchTimeoutMs),
       );
+      if (this.deps.admission) {
+        const signal = AbortSignal.timeout(Math.min(5_000, this.config.launchTimeoutMs));
+        try {
+          while (!await this.deps.admission.releaseVmIfTerminated(microvmId, this.client, signal)) await this.deps.sleep(100, signal);
+        } catch { /* Retain until later provider-state reconciliation. */ }
+      }
       return true;
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'not_found') return true;

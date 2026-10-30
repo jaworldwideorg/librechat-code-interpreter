@@ -490,6 +490,7 @@ export const env = {
    * config AND an executionRoleArn is set — pairs with the role above. */
   LAMBDA_MICROVM_LOG_GROUP: process.env.LAMBDA_MICROVM_LOG_GROUP || undefined,
   LAMBDA_MICROVM_REGION: process.env.LAMBDA_MICROVM_REGION || undefined,
+  MICROVM_ADMISSION_TABLE: process.env.CODEAPI_MICROVM_ADMISSION_TABLE || undefined,
   LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS),
   LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS),
   ...lambdaMicrovmNumericConfig,

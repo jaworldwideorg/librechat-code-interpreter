@@ -34,7 +34,7 @@ const redis = new IORedis({
   password: process.env.REDIS_PASSWORD,
   enableReadyCheck: false,
   tls: process.env.REDIS_TLS === 'true' ? {
-    rejectUnauthorized: false
+    rejectUnauthorized: true, servername: process.env.REDIS_HOST ?? 'redis'
   } as tls.ConnectionOptions : undefined,
   connectTimeout: 10000,
   ...redisKeepAliveOptions(),
