@@ -58,6 +58,8 @@ spec:
               value: {{ .Values.workerSandbox.config.jobTimeout | quote }}
             {{- end }}
             # Redis connection
+            - name: REDIS_TLS
+              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT

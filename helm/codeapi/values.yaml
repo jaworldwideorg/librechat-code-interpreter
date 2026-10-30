@@ -25,6 +25,8 @@ generatedSecrets:
 # External Secrets must supply only each component's required keys.
 existingSecrets: {}
 
+redisConnectionTls: false
+
 hardenedSandboxMode: true
 
 # Stable identity advertised by this API/worker deployment. Leave empty for a

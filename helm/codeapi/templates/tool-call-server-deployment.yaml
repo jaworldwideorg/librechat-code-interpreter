@@ -35,6 +35,8 @@ spec:
           env:
 {{ include "codeapi.otel.env" (dict "root" . "serviceName" "aiml-codeapi-tool-call-server") | nindent 12 }}
             # Redis connection
+            - name: REDIS_TLS
+              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -56,6 +58,9 @@ spec:
               value: {{ .Values.toolCallServer.config.requestTimeout | quote }}
             - name: TOOL_CALL_SESSION_EXPIRY
               value: {{ .Values.toolCallServer.config.sessionExpiry | quote }}
+            {{- with .Values.toolCallServer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

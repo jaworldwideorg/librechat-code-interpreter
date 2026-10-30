@@ -179,6 +179,8 @@ spec:
               value: {{ .Values.egressGateway.externalUrl | default (printf "http://%s-egress-gateway:%v" (include "codeapi.fullname" .) .Values.egressGateway.service.port) | quote }}
             - name: FILE_SERVER_URL
               value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
+            - name: REDIS_TLS
+              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT

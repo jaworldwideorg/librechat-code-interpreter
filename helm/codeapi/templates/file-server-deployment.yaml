@@ -105,6 +105,8 @@ spec:
                   key: minio-secret-key
             {{- end }}
             # Redis connection
+            - name: REDIS_TLS
+              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -122,6 +124,9 @@ spec:
             # Server config
             - name: FILE_SERVER_PORT
               value: {{ .Values.fileServer.service.port | quote }}
+            {{- with .Values.fileServer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

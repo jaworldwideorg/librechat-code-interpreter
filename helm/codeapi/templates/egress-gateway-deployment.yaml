@@ -74,6 +74,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.componentSecret" (dict "root" . "component" "egressGateway") }}
                   key: codeapi-internal-service-token
+            - name: REDIS_TLS
+              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -83,6 +85,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.componentSecret" (dict "root" . "component" "egressGateway") }}
                   key: redis-password
+            {{- with .Values.egressGateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /live
