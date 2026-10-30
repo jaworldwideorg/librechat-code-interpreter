@@ -195,8 +195,11 @@ if [ "$SANDBOX_USE_CGROUPV2" = "true" ]; then
     NSJAIL_CGROUP_ARGS=(--use_cgroupv2)
 fi
 
-if timeout 10 /usr/local/bin/sandbox-supervisor-policy "${NSJAIL_PATH:-/usr/sbin/nsjail}" --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
-    "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" \
+# Cold MicroVM startup runs the complete document-toolchain verifier. Give this
+# trusted, bounded probe its own budget instead of sandbox.cfg's six-second
+# user-execution default; request execution limits remain unchanged.
+if timeout 45 /usr/local/bin/sandbox-supervisor-policy "${NSJAIL_PATH:-/usr/sbin/nsjail}" --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
+    "${NSJAIL_CGROUP_ARGS[@]}" --time_limit 30 --log "$SMOKE_LOG" \
     --user "65534:${SMOKE_OUTSIDE_UID}:1" --group "65534:${SMOKE_OUTSIDE_GID}:1" \
     -s /usr/bin:/bin -s /usr/lib:/lib -s /usr/lib64:/lib64 \
     -B "$SMOKE_DIR:/mnt/data" \
