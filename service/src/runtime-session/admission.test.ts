@@ -5,6 +5,7 @@ import { LambdaMicrovmApiError, type LambdaMicrovmClient } from './lambda-client
 class Store implements MicrovmAdmissionStore {
   records = new Map<string,AdmissionLease>();
   configured: AdmissionPolicy | undefined = {revision:'approved-v1',total:2,coding:10,app:4};
+  async leases() { return [...this.records.values()]; }
   async policy() { return this.configured; }
   async get(id:string) { return this.records.get(id); }
   async reserve(lease:AdmissionLease,policy:AdmissionPolicy):Promise<AdmissionDecision> {
@@ -15,14 +16,19 @@ class Store implements MicrovmAdmissionStore {
     }
     if(this.configured?.revision!==policy.revision) return 'policy_changed';
     const all=[...this.records.values()];
-    if(all.some(e=>e.owner===lease.owner && e.kind===lease.kind && e.lane===lease.lane)) return 'owner_busy';
+    if(lease.lane!=='execution' && all.some(e=>e.owner===lease.owner && e.kind===lease.kind && e.lane===lease.lane)) return 'owner_busy';
     if(all.length>=policy.total || all.filter(e=>e.kind===lease.kind).length>=policy[lease.kind]) return 'full';
     this.records.set(lease.id,{...lease});
     return 'reserved';
   }
-  async bind(id:string,fingerprint:string,vmId:string) {
+  async beginRetirement(id:string,fingerprint:string) {
     const e=this.records.get(id);
-    if(!e || e.fingerprint!==fingerprint || e.vmId && e.vmId!==vmId) throw new MicrovmAdmissionError('CONFLICT','binding');
+    if(!e || e.fingerprint!==fingerprint || e.vmId && !e.retiring) return false;
+    this.records.set(id,{...e,retiring:true});return true;
+  }
+  async bind(id:string,fingerprint:string,vmId:string,_signal?:AbortSignal,retiring=false) {
+    const e=this.records.get(id);
+    if(!e || e.fingerprint!==fingerprint || e.vmId && e.vmId!==vmId || Boolean(e.retiring)!==retiring) throw new MicrovmAdmissionError('CONFLICT','binding');
     this.records.set(id,{...e,vmId});
   }
   async release(lease:AdmissionLease,expected:string) {
@@ -70,8 +76,9 @@ describe('durable MicroVM admission domain',()=>{
     await a.reserve(lease(),signal());
     await expect(a.reserve(lease('one','second-workspace'),signal())).rejects.toMatchObject({code:'OWNER_BUSY'});
     await a.reserve(lease('one','execution','coding','execution'),signal());
+    await a.reserve(lease('one','execution-two','coding','execution'),signal());
     await a.reserve(lease('one','app','app'),signal());
-    expect(store.records.size).toBe(3);
+    expect(store.records.size).toBe(4);
   });
   test('cannot change the provider VM bound to an accepted reservation',async()=>{
     const store=new Store(),a=new MicrovmAdmission(store),e=await a.reserve(lease(),signal());

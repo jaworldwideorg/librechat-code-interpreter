@@ -27,6 +27,14 @@ jobs:
           sudo apt-get install -y redis-server jq
           cd service
           bun install --frozen-lockfile
+      - name: Start isolated DynamoDB transaction tests
+        run: |
+          docker run --detach --rm --name codeapi-admission-tests --memory 512m --cpus 1 \
+            -p 127.0.0.1::8000 \
+            amazon/dynamodb-local@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86 \
+            -jar DynamoDBLocal.jar -inMemory -sharedDb
+          ddb_test_port=$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' codeapi-admission-tests)
+          echo "CODEAPI_ADMISSION_TEST_ENDPOINT=http://127.0.0.1:$ddb_test_port" >> "$GITHUB_ENV"
       - name: Verify API types, authorization and replay behavior
         working-directory: service
         run: |

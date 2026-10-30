@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          git remote add upstream https://github.com/ClickHouse/code-interpreter.git
+          git remote add upstream https://github.com/LibreChat-AI/code-interpreter.git
           git fetch --no-tags upstream main
 
           upstream_sha=$(git rev-parse upstream/main)

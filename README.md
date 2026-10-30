@@ -356,3 +356,7 @@ session-management routes stay unauthenticated for backwards compatibility.
 - Worker: `GET /health` and `GET /ready`
 - File Server: `GET /health` and `GET /ready`
 - Tool Call Server: `GET /health`
+
+## OneJA AWS deployment maintenance
+
+See [the OneJA patch inventory and upstream merge/test runbook](docs/oneja/aws-maintenance.md). Deployment charts, values, immutable image receipts and rollback procedures live in [oneja-ai-infrastructure](https://github.com/jaworldwideorg/oneja-ai-infrastructure).

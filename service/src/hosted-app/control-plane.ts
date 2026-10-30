@@ -401,7 +401,7 @@ export class HostedAppControlPlane {
 
       let vm: MicrovmDescription | undefined;
       try {
-        const launched = await this.deps.runtime.launch(clientToken, signal);
+        const launched = await this.deps.runtime.launch(clientToken, signal, { tenantId: input.tenantId, canonicalUserId: input.canonicalUserId });
         vm = launched.vm;
         const providerStartedAt = Number.isFinite(vm.startedAtMs)
           ? vm.startedAtMs
@@ -533,6 +533,7 @@ export class HostedAppControlPlane {
         const launched = await this.deps.runtime.launch(
           record.launch_client_token as string,
           leaseSignal,
+          owner,
         ).catch(error => {
           if (error instanceof HostedAppMicrovmError && error.code === 'hosted_app_boot_failed') return undefined;
           throw error; // Ambiguous outcomes must keep the pending intent.

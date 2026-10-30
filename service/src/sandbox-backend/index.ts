@@ -76,6 +76,12 @@ class LazyLambdaMicrovmSandboxBackend implements SandboxBackend {
             timeoutMs: env.CHECKPOINT_TIMEOUT_MS,
           },
         },
+        admission: env.MICROVM_ADMISSION_TABLE
+          ? new (await import('../runtime-session/admission')).MicrovmAdmission(
+            new (await import('../runtime-session/admission-dynamodb-aws')).DynamoMicrovmAdmissionStore(
+              env.MICROVM_ADMISSION_TABLE, { region: env.LAMBDA_MICROVM_REGION },
+            ),
+          ) : undefined,
         checkpointStore,
       });
     })();
