@@ -86,8 +86,8 @@ Split runtime deployments:
 {{- $sandboxRunnerAffinity = default .Values.affinity $sandboxRunnerAffinity }}
 {{- $sandboxRunnerTolerations = default .Values.tolerations $sandboxRunnerTolerations }}
 {{- end }}
-{{- $useKvmDevicePlugin := and .Values.workerSandbox.kvmEnabled .Values.workerSandbox.kvmDevicePlugin.enabled }}
-{{- $useKvmHostPath := and .Values.workerSandbox.kvmEnabled (not .Values.workerSandbox.kvmDevicePlugin.enabled) }}
+{{- $useKvmDevicePlugin := and $localRunner .Values.workerSandbox.kvmEnabled .Values.workerSandbox.kvmDevicePlugin.enabled }}
+{{- $useKvmHostPath := and $localRunner .Values.workerSandbox.kvmEnabled (not .Values.workerSandbox.kvmDevicePlugin.enabled) }}
 {{- if and $useKvmDevicePlugin (not .Values.workerSandbox.kvmDevicePlugin.resourceName) }}
 {{- fail "workerSandbox.kvmDevicePlugin.resourceName is required when kvmEnabled and kvmDevicePlugin.enabled are true" }}
 {{- end }}

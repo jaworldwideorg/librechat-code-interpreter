@@ -162,16 +162,10 @@ identity to the worker) through the existing environment hooks, for example:
 
 ```yaml
 executionProfile: stateful
-api:
-  extraEnv:
-    - name: CODEAPI_RUNTIME_SESSION_MODE
-      value: affinity
 workerSandbox:
+  backend: lambda-microvm
+  runtimeSessionMode: affinity
   extraEnv:
-    - name: CODEAPI_SANDBOX_BACKEND
-      value: lambda-microvm
-    - name: CODEAPI_RUNTIME_SESSION_MODE
-      value: affinity
     - name: LAMBDA_MICROVM_IMAGE_ARN
       value: arn:aws:lambda:REGION:ACCOUNT:microvm-image:NAME
     - name: LAMBDA_MICROVM_IMAGE_VERSION
@@ -179,9 +173,8 @@ workerSandbox:
 ```
 
 The worker also needs the remaining Lambda networking, checkpoint-store, and
-hardening variables documented in `docs/lambda-microvm/README.md`. This chart
-still renders its bundled sandbox-runner, though a Lambda worker does not call
-it; a platform-specific stateful deployment may omit that component.
+hardening variables documented in `docs/lambda-microvm/README.md`. Setting `workerSandbox.backend: lambda-microvm` omits the bundled sandbox
+runner and its local package resources.
 
 Resident hosted apps are an opt-in capability of that stateful deployment.
 Configure `CODEAPI_HOSTED_APPS_ENABLED`, the preview origin, and both hosted-app

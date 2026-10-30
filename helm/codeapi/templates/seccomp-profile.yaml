@@ -9,7 +9,7 @@ For production: Use a DaemonSet or node configuration management.
 
 See seccomp/README.md for detailed instructions.
 */}}
-{{- if and .Values.workerSandbox ((.Values.workerSandbox).seccomp) ((.Values.workerSandbox.seccomp).enabled) }}
+{{- if and (eq (.Values.workerSandbox.backend | default "http") "http") .Values.workerSandbox ((.Values.workerSandbox).seccomp) ((.Values.workerSandbox.seccomp).enabled) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
