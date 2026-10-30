@@ -1,3 +1,17 @@
+{{- if eq (.Values.workerSandbox.backend | default "http") "lambda-microvm" }}
+Code Interpreter Lambda deployment: {{ .Release.Name }}
+API replicas: {{ .Values.api.replicaCount }}
+Worker replicas: {{ .Values.workerSandbox.replicaCount }}
+Runtime mode: {{ .Values.workerSandbox.runtimeSessionMode }}
+Execution runs in AWS Lambda MicroVMs; capacity depends on shared fleet admission and applied AWS quotas.
+{{- if .Values.api.ingress.enabled }}
+{{- range .Values.api.ingress.hosts }}
+Configured API host: {{ .host }}
+{{- end }}
+Verify ingress TLS and DNS cutover before using the configured host.
+{{- end }}
+View workers: kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=service-worker
+{{- else }}
 {{- $serviceWorkerReplicas := .Values.workerSandbox.replicaCount }}
 {{- if ne .Values.workerSandbox.serviceWorker.replicaCount nil }}
 {{- $serviceWorkerReplicas = .Values.workerSandbox.serviceWorker.replicaCount }}
@@ -92,3 +106,5 @@ View logs:
   kubectl logs -l app.kubernetes.io/component=egress-gateway -f
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{- end }}
