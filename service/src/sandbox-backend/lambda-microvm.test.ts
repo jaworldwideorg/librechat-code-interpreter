@@ -1027,6 +1027,16 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(1);
   });
 
+  test('an inconclusive provider read does not recycle a healthy warm VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    fake.failNext('getMicrovm', new LambdaMicrovmApiError('throttled', 'GetMicrovm', 'read throttled'));
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow('read throttled');
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+  });
+
   test('a runner non-2xx keeps the warm VM (does not tear down the session)', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -1783,6 +1793,20 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
 
     expect(captured.filter((c) => c.path === '/api/v2/session/restore')).toHaveLength(0);
     expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+  });
+
+  test('the first request after external termination restores its checkpoint', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, cfgOn, store);
+    await backend.execute(request(), sessionContext());
+    const record = await readRuntimeSessionRecord('rt_ckpt_1');
+    expect(record?.microvm_id).toBeDefined();
+    await fake.terminateMicrovm(record!.microvm_id!);
+    captured = [];
+    await backend.execute(request(), sessionContext());
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+    expect(captured.filter((c) => c.path === '/api/v2/session/restore')).toHaveLength(1);
   });
 
   test('disabled checkpoints skip both checkpoint and restore', async () => {

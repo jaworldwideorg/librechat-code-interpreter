@@ -809,12 +809,25 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       && !likelyIdleTerminated
       && (record.hard_deadline_at == null || record.hard_deadline_at - Date.now() > deadlineHeadroomMs);
     if (reusable && record) {
-      /* Reuse the warm VM. If AWS auto-suspended it, the proxy request
-       * transparently auto-resumes it (idlePolicy.autoResume). */
-      return {
-        vm: { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint },
-        restored: false,
-      };
+      // Redis describes the last successful call, not current provider state.
+      // Detect externally terminated VMs before using their stale endpoint so
+      // the first replacement request restores the committed checkpoint.
+      try {
+        const current = await client.getMicrovm(record.microvm_id as string, ctx.signal);
+        if (current.state !== 'TERMINATED' && current.state !== 'TERMINATING') {
+          // The proxy can still auto-resume a suspended VM without a separate
+          // preflight HTTP probe or loss of its warm workspace.
+          return {
+            vm: { ...current, endpoint: current.endpoint ?? record.endpoint },
+            restored: false,
+          };
+        }
+      } catch (error) {
+        if (!(error instanceof LambdaMicrovmApiError) || error.kind !== 'not_found') {
+          // An inconclusive provider read must not recycle a healthy session.
+          throw error;
+        }
+      }
     }
 
     /* We're relaunching. Always terminate a recorded VM before replacing it.
