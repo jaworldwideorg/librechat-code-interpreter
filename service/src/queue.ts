@@ -48,7 +48,7 @@ const connection = new IORedis({
   disconnectTimeout: 2000,
   ...redisKeepAliveOptions(),
   tls: process.env.REDIS_TLS === 'true' ? {
-    rejectUnauthorized: false
+    rejectUnauthorized: true, servername: process.env.REDIS_HOST ?? 'redis'
   } as tls.ConnectionOptions : undefined,
   // Alternative DNS lookup for AWS ElastiCache TLS connections
   ...(env.REDIS_USE_ALTERNATIVE_DNS_LOOKUP

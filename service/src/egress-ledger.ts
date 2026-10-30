@@ -69,7 +69,7 @@ function redisConnection(): IORedis {
     connectTimeout: 10000,
     ...redisKeepAliveOptions(),
     tls: process.env.REDIS_TLS === 'true'
-      ? { rejectUnauthorized: false } as tls.ConnectionOptions
+      ? { rejectUnauthorized: true, servername: process.env.REDIS_HOST ?? 'redis' } as tls.ConnectionOptions
       : undefined,
     ...(env.REDIS_USE_ALTERNATIVE_DNS_LOOKUP
       ? { dnsLookup: (address: string, callback: (err: Error | null, addr: string) => void): void => callback(null, address) }
