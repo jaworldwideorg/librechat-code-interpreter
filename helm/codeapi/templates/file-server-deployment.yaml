@@ -75,12 +75,12 @@ spec:
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: minio-access-key
             - name: MINIO_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: minio-secret-key
             {{- end }}
             {{- else }}
@@ -96,17 +96,15 @@ spec:
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: minio-access-key
             - name: MINIO_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: minio-secret-key
             {{- end }}
             # Redis connection
-            - name: REDIS_TLS
-              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -114,19 +112,16 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: redis-password
             - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "fileServer") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
             # Server config
             - name: FILE_SERVER_PORT
               value: {{ .Values.fileServer.service.port | quote }}
-            {{- with .Values.fileServer.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

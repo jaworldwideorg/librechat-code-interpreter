@@ -67,15 +67,13 @@ spec:
             - name: CODEAPI_EGRESS_GRANT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "egressGateway") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-egress-grant-secret
             - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "egressGateway") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
-            - name: REDIS_TLS
-              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -83,11 +81,8 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "egressGateway") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: redis-password
-            {{- with .Values.egressGateway.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           livenessProbe:
             httpGet:
               path: /live

@@ -20,13 +20,6 @@ global:
 internalServiceAuth:
   token: "changeme-in-production"
 
-generatedSecrets:
-  enabled: true
-# External Secrets must supply only each component's required keys.
-existingSecrets: {}
-
-redisConnectionTls: false
-
 hardenedSandboxMode: true
 
 # Stable identity advertised by this API/worker deployment. Leave empty for a
@@ -140,8 +133,6 @@ api:
 # =============================================================================
 workerSandbox:
   enabled: true
-  backend: http # http | lambda-microvm
-  runtimeSessionMode: stateless # stateless | affinity | strict
   replicaCount: 3
 
   workerImage:
@@ -422,7 +413,6 @@ toolCallServer:
 # =============================================================================
 egressGateway:
   enabled: true
-  externalUrl: "" # Private TLS origin reachable from Lambda VPC egress
   replicaCount: 1
 
   image:
@@ -534,9 +524,6 @@ metrics:
 # =============================================================================
 networkPolicy:
   enabled: true
-  controlPlaneTlsCIDRs: []
-  egressGateway:
-    externalIngressCIDRs: []
   otel:
     enabled: true
     port: 4318

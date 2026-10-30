@@ -43,7 +43,7 @@ spec:
     matchLabels:
       {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 6 }}
 {{- end }}
-{{- if and .Values.workerSandbox.enabled (eq (.Values.workerSandbox.backend | default "http") "http") }}
+{{- if .Values.workerSandbox.enabled }}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor

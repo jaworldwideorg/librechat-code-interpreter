@@ -49,17 +49,7 @@ spec:
             - name: CODEAPI_EXECUTION_PROFILE
               value: {{ . | quote }}
             {{- end }}
-            {{- if eq (.Values.workerSandbox.backend | default "http") "lambda-microvm" }}
-            - name: CODEAPI_SANDBOX_BACKEND
-              value: "lambda-microvm"
-            - name: CODEAPI_RUNTIME_SESSION_MODE
-              value: {{ .Values.workerSandbox.runtimeSessionMode | quote }}
-            - name: JOB_TIMEOUT
-              value: {{ .Values.workerSandbox.config.jobTimeout | quote }}
-            {{- end }}
             # Redis connection
-            - name: REDIS_TLS
-              value: {{ .Values.redisConnectionTls | quote }}
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -67,7 +57,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "api") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: redis-password
             - name: CODEAPI_BRIDGE_PAIRING_ROLLBACK_EPOCH
               valueFrom:
@@ -81,11 +71,11 @@ spec:
             - name: TOOL_CALL_SERVER_URL
               value: "http://{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
             - name: EGRESS_GATEWAY_URL
-              value: {{ .Values.egressGateway.externalUrl | default (printf "http://%s-egress-gateway:%v" (include "codeapi.fullname" .) .Values.egressGateway.service.port) | quote }}
+              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "api") }}
+                  name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
             - name: EGRESS_GRANT_TTL_SECONDS
               value: {{ .Values.egressGrant.ttlSeconds | quote }}

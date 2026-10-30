@@ -36,15 +36,7 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     {{- include "codeapi.redisEgress" . | nindent 4 }}
-    - to:
-        - podSelector:
-            matchLabels:
-              {{- include "codeapi.fileServer.selectorLabels" . | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: {{ .Values.fileServer.service.port }}
     - to:
         - podSelector:
             matchLabels:
@@ -59,7 +51,6 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
-{{- if eq (.Values.workerSandbox.backend | default "http") "http" }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -101,7 +92,6 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     - to:
         - podSelector:
             matchLabels:
@@ -109,7 +99,6 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
-{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -123,16 +112,6 @@ spec:
       {{- include "codeapi.egressGateway.selectorLabels" . | nindent 6 }}
   policyTypes: [Ingress, Egress]
   ingress:
-    {{- with .Values.networkPolicy.egressGateway.externalIngressCIDRs }}
-    - from:
-      {{- range . }}
-        - ipBlock:
-            cidr: {{ . | quote }}
-      {{- end }}
-      ports:
-        - protocol: TCP
-          port: {{ $.Values.egressGateway.service.port }}
-    {{- end }}
     - from:
         - podSelector:
             matchLabels:
@@ -158,7 +137,6 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     - to:
         - podSelector:
             matchLabels:
@@ -202,7 +180,6 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     {{- include "codeapi.redisEgress" . | nindent 4 }}
     - to:
         - podSelector:
@@ -245,9 +222,6 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
-        - podSelector:
-            matchLabels:
-              {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.fileServer.service.port }}
@@ -263,7 +237,6 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     {{- if .Values.minio.enabled }}
     - to:
         - podSelector:
@@ -309,7 +282,6 @@ spec:
         - protocol: TCP
           port: 53
     {{- include "codeapi.otelEgress" . | nindent 4 }}
-    {{- include "codeapi.controlPlaneTlsEgress" . | nindent 4 }}
     {{- include "codeapi.redisEgress" . | nindent 4 }}
     {{- if .Values.networkPolicy.toolCallServer.allowExternalEgress }}
     - to:
