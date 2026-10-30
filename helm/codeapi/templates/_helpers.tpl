@@ -282,3 +282,32 @@ your collector's namespace and pod labels.
       port: {{ .Values.networkPolicy.otel.port }}
 {{- end }}
 {{- end }}
+
+{{/* Per-component external secrets preserve secret ownership boundaries. */}}
+{{- define "codeapi.componentSecret" -}}
+{{- $names := .root.Values.existingSecrets | default dict -}}
+{{- $name := get $names .component -}}
+{{- if $name -}}
+{{- $name -}}
+{{- else if not .root.Values.generatedSecrets.enabled -}}
+{{- fail (printf "generatedSecrets.enabled=false requires existingSecrets.%s" .component) -}}
+{{- else -}}
+{{- printf "%s-secrets" (include "codeapi.fullname" .root) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "codeapi.controlPlaneTlsEgress" -}}
+{{- if eq (.Values.workerSandbox.backend | default "http") "lambda-microvm" -}}
+{{- if not .Values.networkPolicy.controlPlaneTlsCIDRs -}}
+{{- fail "Lambda NetworkPolicy requires networkPolicy.controlPlaneTlsCIDRs for private AWS endpoints and gateway" -}}
+{{- end }}
+- to:
+  {{- range .Values.networkPolicy.controlPlaneTlsCIDRs }}
+    - ipBlock:
+        cidr: {{ . | quote }}
+  {{- end }}
+  ports:
+    - protocol: TCP
+      port: 443
+{{- end -}}
+{{- end -}}

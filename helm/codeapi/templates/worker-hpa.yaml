@@ -1,4 +1,4 @@
-{{- if .Values.workerSandbox.enabled }}
+{{- if and .Values.workerSandbox.enabled (eq (.Values.workerSandbox.backend | default "http") "http") }}
 {{- if .Values.workerSandbox.sandboxRunner.autoscaling.enabled }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

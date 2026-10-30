@@ -13,6 +13,34 @@ Deploy the horizontally-scalable Code Interpreter API stack to Kubernetes.
 
 ## Execution manifest signing keys (required)
 
+### Lambda MicroVM deployment
+
+Set `workerSandbox.backend: lambda-microvm`, `runtimeSessionMode: affinity`
+under `workerSandbox`, and `executionProfile: stateful`. This omits the local
+sandbox runner, its ServiceAccount, package job/PVC, autoscaler and PodMonitor.
+The API and worker advertise the same backend/session mode. HTTP deployments
+retain their existing local sandbox behavior.
+
+Set `generatedSecrets.enabled: false` and provide `existingSecrets.api`,
+`worker`, `fileServer`, `toolCallServer` and `egressGateway`. Each Secret must
+contain only its workload's required keys, using the existing key names. The
+worker Secret supplies `codeapi-execution-manifest-private-key`; the verifier
+is baked into the Lambda image and is not required in chart values.
+
+Use `egressGateway.externalUrl` for the private gateway origin reachable from
+the Lambda VPC connector. With NetworkPolicy enabled, supply scoped
+`networkPolicy.controlPlaneTlsCIDRs` for private AWS endpoints/gateway TLS and
+`networkPolicy.egressGateway.externalIngressCIDRs` for connector/load-balancer
+traffic. Workers can fetch authorized files directly; their file-server path
+is explicitly permitted. Configure the pinned image, connectors, checkpoint
+storage and remaining Lambda settings through `workerSandbox.extraEnv`.
+
+See `docs/lambda-microvm/README.md` for runtime prerequisites. API hosted-app
+settings remain in `api.extraEnv`. The chart does not provision AWS resources.
+
+Verify both execution paths with `HELM_BIN=helm bun test tests/helm-lambda.test.ts`
+after running `helm dependency build helm/codeapi`.
+
 The service-worker signs every sandbox execute request with an Ed25519 private
 key; sandbox-runner only receives the public verifier, so a runner compromise
 cannot mint new manifests. The chart ships **no default keypair** —

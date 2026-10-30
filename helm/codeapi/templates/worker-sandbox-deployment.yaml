@@ -1,3 +1,16 @@
+{{- $backend := .Values.workerSandbox.backend | default "http" }}
+{{- if not (has $backend (list "http" "lambda-microvm")) }}
+{{- fail "workerSandbox.backend must be http or lambda-microvm" }}
+{{- end }}
+{{- $localRunner := eq $backend "http" }}
+{{- if not $localRunner }}
+{{- if not (has .Values.workerSandbox.runtimeSessionMode (list "stateless" "affinity" "strict")) }}
+{{- fail "workerSandbox.runtimeSessionMode must be stateless, affinity or strict" }}
+{{- end }}
+{{- if and (ne .Values.workerSandbox.runtimeSessionMode "stateless") (ne .Values.executionProfile "stateful") }}
+{{- fail "Lambda affinity/strict requires executionProfile=stateful" }}
+{{- end }}
+{{- end }}
 {{/*
 Split runtime deployments:
   - service-worker consumes BullMQ/Redis and calls sandbox-runner.
@@ -13,10 +26,10 @@ Split runtime deployments:
 {{- end }}
 {{- $serviceWorkerServiceAccount := .Values.workerSandbox.serviceAccount.name | default (printf "%s-service-worker" (include "codeapi.fullname" .)) }}
 {{- $sandboxRunnerServiceAccount := .Values.workerSandbox.sandboxServiceAccount.name | default (printf "%s-sandbox-runner" (include "codeapi.fullname" .)) }}
-{{- if not .Values.executionManifest.privateKey }}
+{{- if and (not .Values.executionManifest.privateKey) (not (get (.Values.existingSecrets | default dict) "worker")) }}
 {{- fail "workerSandbox.enabled requires executionManifest.privateKey so service-worker can sign sandbox execute manifests. The chart ships no default keypair; generate your own Ed25519 keypair (see helm/codeapi/README.md 'Execution manifest signing keys') and set it via --set or a values file (base64 DER or PEM with escaped newlines). For minikube local dev use -f values-local.yaml" }}
 {{- end }}
-{{- if not .Values.executionManifest.publicKey }}
+{{- if and $localRunner (not .Values.executionManifest.publicKey) }}
 {{- fail "workerSandbox.enabled requires executionManifest.publicKey so sandbox-runner can verify signed execute manifests without a signing secret. The chart ships no default keypair; derive the public key from your Ed25519 private key (see helm/codeapi/README.md 'Execution manifest signing keys') and set it via --set or a values file (base64 DER or PEM with escaped newlines). For minikube local dev use -f values-local.yaml" }}
 {{- end }}
 {{- $packagesSource := .Values.workerSandbox.packages.source | default "image" }}
@@ -24,7 +37,7 @@ Split runtime deployments:
 {{- fail "workerSandbox.packages.source must be image or pvc" }}
 {{- end }}
 {{- $packagesFromPvc := eq $packagesSource "pvc" }}
-{{- if and (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
+{{- if and $localRunner (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
 {{- fail "workerSandbox.packages.source=image requires workerSandbox.kvmEnabled=true because the baked runner boots from a libkrun block root image" }}
 {{- end }}
 {{- $clockSkewLimitValue := toString .Values.workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds }}
@@ -91,7 +104,7 @@ metadata:
   {{- end }}
 ---
 {{- end }}
-{{- if .Values.workerSandbox.sandboxServiceAccount.create }}
+{{- if and $localRunner .Values.workerSandbox.sandboxServiceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
 automountServiceAccountToken: {{ .Values.workerSandbox.sandboxServiceAccount.automountServiceAccountToken }}
@@ -132,9 +145,11 @@ spec:
         - name: wait-for-redis
           image: busybox:1.36.1
           command: ['sh', '-c', 'until nc -z {{ include "codeapi.redis.host" . }} {{ include "codeapi.redis.port" . }}; do echo waiting for redis; sleep 2; done']
+        {{- if $localRunner }}
         - name: wait-for-sandbox-runner
           image: busybox:1.36.1
           command: ['sh', '-c', 'until nc -z {{ include "codeapi.fullname" . }}-sandbox-runner {{ .Values.workerSandbox.sandbox.port }}; do echo waiting for sandbox-runner; sleep 2; done']
+        {{- end }}
       containers:
         - name: service-worker
           image: "{{ .Values.workerSandbox.workerImage.repository }}:{{ .Values.workerSandbox.workerImage.tag }}"
@@ -151,10 +166,19 @@ spec:
             - name: CODEAPI_EXECUTION_PROFILE
               value: {{ . | quote }}
             {{- end }}
+            {{- if $localRunner }}
             - name: SANDBOX_ENDPOINT
               value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+            {{- else }}
+            - name: CODEAPI_SANDBOX_BACKEND
+              value: "lambda-microvm"
+            - name: CODEAPI_RUNTIME_SESSION_MODE
+              value: {{ .Values.workerSandbox.runtimeSessionMode | quote }}
+            {{- end }}
             - name: EGRESS_GATEWAY_URL
-              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+              value: {{ .Values.egressGateway.externalUrl | default (printf "http://%s-egress-gateway:%v" (include "codeapi.fullname" .) .Values.egressGateway.service.port) | quote }}
+            - name: FILE_SERVER_URL
+              value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -162,17 +186,17 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.fullname" . }}-secrets
+                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "worker") }}
                   key: redis-password
             - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.fullname" . }}-secrets
+                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "worker") }}
                   key: codeapi-internal-service-token
             - name: CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "codeapi.fullname" . }}-secrets
+                  name: {{ include "codeapi.componentSecret" (dict "root" . "component" "worker") }}
                   key: codeapi-execution-manifest-private-key
             - name: EXECUTION_MANIFEST_TTL_SECONDS
               value: {{ .Values.executionManifest.ttlSeconds | quote }}
@@ -223,6 +247,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- if $localRunner }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -283,7 +308,7 @@ spec:
             - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS
               value: {{ $clockSkewJitter | quote }}
             - name: EGRESS_GATEWAY_URL
-              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+              value: {{ .Values.egressGateway.externalUrl | default (printf "http://%s-egress-gateway:%v" (include "codeapi.fullname" .) .Values.egressGateway.service.port) | quote }}
             - name: SANDBOX_LOG_LEVEL
               value: "INFO"
             - name: SANDBOX_PACKAGES_DIRECTORY
@@ -467,4 +492,6 @@ spec:
       name: sandbox
   selector:
     {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 4 }}
+{{- end }}
+
 {{- end }}
